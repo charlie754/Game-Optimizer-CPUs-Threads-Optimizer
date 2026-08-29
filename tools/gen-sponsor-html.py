@@ -1,21 +1,157 @@
+# MAINTAINER TOOLING - NOT part of building Game Optimizer.
+#
 # Extract the ENTIRE sponsor panel from the plugin's widget.js and emit
 #   (a) a reference page, for eyeballing against the operator's target screenshot, and
 #   (b) src\sponsor_html.h - the SAME page as a C++ header the app compiles in.
 #
+# YOU DO NOT NEED TO RUN THIS TO BUILD. src\sponsor_html.h is committed; tools\build.bat
+# compiles it exactly as it stands and never looks at the plugin. This script exists only to
+# REGENERATE that header when the source panel changes, and it needs a copy of the author's
+# browser extension, which is not part of this repository.
+#
 # RE-RUN IT WITH:
 #     python tools\gen-sponsor-html.py
 #
-# (b) is the one the product uses. The app NEVER reads the plugin path at run time; this
-# script is the only thing that ever touches F:\google map plugin, and its output is
+# WHERE IT READS THE PANEL FROM - first match wins:
+#     --widget-js <file>                an explicit path to widget.js
+#     GAME_OPTIMIZER_WIDGET_JS=<file>   the same, as an environment variable
+#     --plugin-dir <dir>                the extension checkout. widget.js is looked for at
+#     GAME_OPTIMIZER_PLUGIN_DIR=<dir>     <dir>\extension\content\, <dir>\content\, <dir>\
+#     DEFAULT_PLUGIN_DIR below          the author's own working copy - the historical path,
+#                                       kept as the default so their workflow is unchanged
+#
+# If none of those resolves, the script stops with an explanation instead of a traceback.
+#
+# WHERE THE TWO SCRATCH PAGES GO - panel-reference.html and panel-app.html, neither committed:
+#     --out-dir <dir>, GAME_OPTIMIZER_PANEL_OUT_DIR, else the author's scratchpad if it is
+#     still on this machine, else <repo>\build\panel. src\sponsor_html.h is ALWAYS written
+#     into this repository and never into that directory.
+#     Note: tools\measure-panel.py carries its own copy of the scratchpad path, so overriding
+#     the out dir here does not move where that script looks.
+#
+# (b) is the one the product uses. The app NEVER reads the plugin path at run time; this script
+# is the only thing in the repository that ever touches the plugin tree, and its output is
 # committed. Re-run it and rebuild whenever the plugin's panel changes.
 #
 # This is the chair's independent check on what the target actually looks like - the lane is
 # writing its own generator, and this one exists so the two can be compared.
 import io, re, os, sys, datetime
 
-S = r"C:/Users/IRP/AppData/Local/Temp/claude/F--Game-Optimizer--claude-worktrees-windows-cpu-sets-tray-c96e1a/68d33dbc-1415-4f46-9fe1-be03413760eb/scratchpad"
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-src = io.open(r"F:/google map plugin/extension/content/widget.js", encoding="utf-8").read()
+
+# ---------------------------------------------------------------------------------------------
+# INPUT AND OUTPUT PATHS
+# ---------------------------------------------------------------------------------------------
+# Both of these were absolute paths on the author's machine, written straight into the code.
+# That works for one person and for nobody else: a fork could not run this script at all, and
+# what it got instead of an explanation was a FileNotFoundError traceback. The defaults below
+# are the SAME two paths, so the maintainer's own workflow is unchanged - they are now the last
+# thing tried rather than the only thing.
+
+DEFAULT_PLUGIN_DIR = r"F:/google map plugin"
+
+# The author's scratchpad. A real directory on the development machine and meaningless anywhere
+# else, so it is used only when it actually exists.
+LEGACY_OUT_DIR = (r"C:/Users/IRP/AppData/Local/Temp/claude/"
+                  r"F--Game-Optimizer--claude-worktrees-windows-cpu-sets-tray-c96e1a/"
+                  r"68d33dbc-1415-4f46-9fe1-be03413760eb/scratchpad")
+
+# widget.js is looked for at these places under the plugin directory, in order. A checkout of
+# the extension may be rooted at its repository, at the extension folder, or at the content
+# folder itself; all three are accepted rather than guessed at.
+WIDGET_JS_CANDIDATES = ("extension/content/widget.js", "content/widget.js", "widget.js")
+
+
+def cli_value(flag):
+    """Read `--flag VALUE` or `--flag=VALUE` off the command line. None if absent."""
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg == flag:
+            if i + 1 >= len(argv):
+                raise SystemExit("*** %s needs a value:  %s <path>" % (flag, flag))
+            return argv[i + 1]
+        if arg.startswith(flag + "="):
+            return arg[len(flag) + 1:]
+    return None
+
+
+def no_plugin(plugin_dir, how, tried):
+    """Stop with something a stranger can act on, rather than a traceback."""
+    raise SystemExit(
+        "\n*** Could not find the sponsor panel's source file, widget.js.\n"
+        "\n"
+        "    Looked under : %s\n"
+        "    Chosen by    : %s\n"
+        "    Tried        :\n"
+        "      %s\n"
+        "\n"
+        "    THIS SCRIPT IS MAINTAINER TOOLING AND A NORMAL BUILD DOES NOT NEED IT.\n"
+        "    src\\sponsor_html.h is already committed to this repository, and tools\\build.bat\n"
+        "    compiles it exactly as it stands. Running this script only REGENERATES that\n"
+        "    header from the author's own browser extension, which is not part of this\n"
+        "    repository and is not redistributed with it. If you are building Game Optimizer,\n"
+        "    nothing is wrong and there is nothing here you need.\n"
+        "\n"
+        "    If you do have a copy of the extension, point this script at it:\n"
+        "      python tools\\gen-sponsor-html.py --plugin-dir <dir>\n"
+        "      python tools\\gen-sponsor-html.py --widget-js <dir>\\content\\widget.js\n"
+        "    or set an environment variable instead:\n"
+        "      set GAME_OPTIMIZER_PLUGIN_DIR=<dir>\n"
+        % (plugin_dir, how, "\n      ".join(tried)))
+
+
+def resolve_widget_js():
+    """Locate widget.js. Returns (absolute path, how it was chosen)."""
+    from_flag = cli_value("--widget-js")
+    explicit = from_flag or os.environ.get("GAME_OPTIMIZER_WIDGET_JS")
+    if explicit:
+        how = "--widget-js" if from_flag else "GAME_OPTIMIZER_WIDGET_JS"
+        path = os.path.abspath(explicit)
+        if not os.path.isfile(path):
+            no_plugin(os.path.dirname(path) or ".", how, [path])
+        return path, how
+
+    plugin_dir, how = cli_value("--plugin-dir"), "--plugin-dir"
+    if not plugin_dir:
+        plugin_dir, how = os.environ.get("GAME_OPTIMIZER_PLUGIN_DIR"), "GAME_OPTIMIZER_PLUGIN_DIR"
+    if not plugin_dir:
+        plugin_dir, how = DEFAULT_PLUGIN_DIR, "DEFAULT_PLUGIN_DIR (the author's working copy)"
+
+    tried = [os.path.abspath(os.path.join(plugin_dir, *rel.split("/")))
+             for rel in WIDGET_JS_CANDIDATES]
+    for path in tried:
+        if os.path.isfile(path):
+            return path, how
+    no_plugin(os.path.abspath(plugin_dir), how, tried)
+
+
+def resolve_out_dir():
+    """Where panel-reference.html and panel-app.html go. Returns (dir, how it was chosen)."""
+    out, how = cli_value("--out-dir"), "--out-dir"
+    if not out:
+        out, how = os.environ.get("GAME_OPTIMIZER_PANEL_OUT_DIR"), "GAME_OPTIMIZER_PANEL_OUT_DIR"
+    if not out:
+        if os.path.isdir(LEGACY_OUT_DIR):
+            out, how = LEGACY_OUT_DIR, "LEGACY_OUT_DIR (present on this machine)"
+        else:
+            out, how = os.path.join(REPO, "build", "panel"), "<repo>\\build\\panel (fallback)"
+    out = os.path.abspath(out)
+    try:
+        os.makedirs(out, exist_ok=True)
+    except OSError as exc:
+        raise SystemExit("*** cannot create the scratch-page directory\n"
+                         "      %s\n    %s\n"
+                         "    Pick another with --out-dir <dir> or GAME_OPTIMIZER_PANEL_OUT_DIR."
+                         % (out, exc))
+    return out, how
+
+
+PLUGIN_JS, PLUGIN_JS_HOW = resolve_widget_js()
+S, OUT_DIR_HOW = resolve_out_dir()
+print("panel source : %s   [%s]" % (PLUGIN_JS, PLUGIN_JS_HOW))
+print("scratch pages: %s   [%s]" % (S, OUT_DIR_HOW))
+
+src = io.open(PLUGIN_JS, encoding="utf-8").read()
 
 # The operator's three destinations. They are substituted into the page HERE, at generation
 # time, so the committed header is self-contained and the running app has no placeholder left
@@ -773,7 +909,7 @@ A("// GENERATED FILE - DO NOT EDIT BY HAND.")
 A("//")
 A("// Produced by tools\\gen-sponsor-html.py on %s from the plugin's OWN file:"
   % datetime.date.today().isoformat())
-A("//   F:\\google map plugin\\extension\\content\\widget.js")
+A("//   %s" % PLUGIN_JS)
 A("//")
 A("// RE-RUN IT WITH:")
 A("//   python tools\\gen-sponsor-html.py")

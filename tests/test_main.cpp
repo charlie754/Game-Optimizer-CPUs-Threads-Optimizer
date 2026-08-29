@@ -1702,6 +1702,26 @@ cd::CpuSetReadback Denied() {
     return r;
 }
 
+// A RECYCLED pid: live, and it would have answered - but the process now holding that number
+// is not the one the caller saw, so there is nothing here we are entitled to report.
+cd::CpuSetReadback Recycled() {
+    cd::CpuSetReadback r;
+    r.ours = false;
+    return r;
+}
+
+// The same, except the read went ahead and came back with ids. The product never builds this
+// - the readback refuses a pid before it asks it - and that is exactly why it is worth
+// asserting: the classifier must reject a stranger on `ours` ALONE, not because the stranger
+// happened to answer with nothing.
+cd::CpuSetReadback RecycledAnswering(const std::vector<ULONG>& ids) {
+    cd::CpuSetReadback r;
+    r.ok = true;
+    r.ours = false;
+    r.ids = ids;
+    return r;
+}
+
 void Test_E1_MaskNameForIds() {
     Case("E1 MaskNameForIds: exact set match, and nothing else");
     cd::Topology t = MakeReference(false);
@@ -1869,6 +1889,222 @@ void Test_E2_ClassifyCpuSetStage() {
     }
 }
 
+void Test_E4_PidReuseGuard() {
+    Case("E4 a recycled pid is not ours and never reaches the verdict");
+    cd::Topology t = MakeReference(false);
+    const std::vector<cd::Mask> m = cd::DeriveMasks(t);
+    const std::vector<ULONG> cache = IdRange(256u, 16, 1u);
+    const std::vector<ULONG> freq = IdRange(272u, 16, 1u);
+
+    // ---- the rule itself ---------------------------------------------------------------
+    // The same non-zero creation time is the ONLY shape that may come back true.
+    CHECK(cd::SameProcessInstance(132000000000000000ull, 132000000000000000ull));
+    CHECK(cd::SameProcessInstance(1ull, 1ull));
+    CHECK(cd::SameProcessInstance(0xFFFFFFFFFFFFFFFFull, 0xFFFFFFFFFFFFFFFFull));
+
+    // Different times: the pid was recycled. One 100ns tick apart is still apart - two
+    // processes cannot hold one pid at the same moment, so any difference at all is proof.
+    CHECK(!cd::SameProcessInstance(132000000000000000ull, 132000000000000001ull));
+    CHECK(!cd::SameProcessInstance(132000000000000001ull, 132000000000000000ull));
+
+    // A zero on EITHER side is not a match: it means nobody could read a creation time, and
+    // an absence of evidence is not evidence of sameness - not even when both are absent.
+    CHECK(!cd::SameProcessInstance(0ull, 132000000000000000ull));
+    CHECK(!cd::SameProcessInstance(132000000000000000ull, 0ull));
+    CHECK(!cd::SameProcessInstance(0ull, 0ull));
+
+    // ---- what the classifier does with one --------------------------------------------
+    // Excluded from the verdict, and counted APART from `failed`, because nothing failed:
+    // we declined to ask.
+    {
+        std::vector<cd::CpuSetReadback> r;
+        r.push_back(Ok(cache));
+        r.push_back(Recycled());
+        r.push_back(Ok(cache));
+        cd::CpuSetStageInfo i = cd::ClassifyCpuSetStage(m, r);
+        CHECK(i.stage == cd::CpuSetStage::Named);
+        CHECK_EQ(i.name, L"Cache");
+        CHECK_EQ(i.probed, 3);
+        CHECK_EQ(i.failed, 0);
+        CHECK_EQ(i.notOurs, 1);
+    }
+
+    // THE ONE THAT MATTERS. A stranger carrying a DIFFERENT mask must not vote, and above all
+    // must not be able to manufacture "Mixed": instances disagreeing is a real finding, and a
+    // process we never touched disagreeing with us is not one.
+    {
+        std::vector<cd::CpuSetReadback> r;
+        r.push_back(Ok(cache));
+        r.push_back(RecycledAnswering(freq));
+        cd::CpuSetStageInfo i = cd::ClassifyCpuSetStage(m, r);
+        CHECK(i.stage == cd::CpuSetStage::Named);
+        CHECK_EQ(i.name, L"Cache");
+        CHECK_EQ(cd::CpuSetStageLabel(i), L"Cache");
+        CHECK_EQ(i.failed, 0);
+        CHECK_EQ(i.notOurs, 1);
+    }
+
+    // Nor may it manufacture "All cores" by answering with no assignment at all.
+    {
+        std::vector<cd::CpuSetReadback> r;
+        r.push_back(Ok(cache));
+        r.push_back(RecycledAnswering(std::vector<ULONG>()));
+        cd::CpuSetStageInfo i = cd::ClassifyCpuSetStage(m, r);
+        CHECK(i.stage == cd::CpuSetStage::Named);
+        CHECK_EQ(i.name, L"Cache");
+    }
+
+    // EVERY instance recycled. A pid being handed to someone else is proof that the process
+    // we saw has EXITED, so the honest word is the one that means "no live instance" - and it
+    // must not be "No access", which would claim we could not ask when we could ask perfectly
+    // well and got an answer that simply was not ours.
+    {
+        std::vector<cd::CpuSetReadback> r;
+        r.push_back(Recycled());
+        r.push_back(RecycledAnswering(freq));
+        cd::CpuSetStageInfo i = cd::ClassifyCpuSetStage(m, r);
+        CHECK(i.stage == cd::CpuSetStage::NotRunning);
+        CHECK_EQ(cd::CpuSetStageLabel(i), L"-");
+        CHECK_EQ(i.name, L"");
+        CHECK_EQ(i.probed, 2);
+        CHECK_EQ(i.failed, 0);
+        CHECK_EQ(i.notOurs, 2);
+    }
+
+    // Recycled AND refused, with nothing readable left. One of OURS refused, so "we could not
+    // ask" is true of a live process of ours and No access is the right word; the recycled one
+    // cannot take that away by being silent about a stranger.
+    {
+        std::vector<cd::CpuSetReadback> r;
+        r.push_back(Recycled());
+        r.push_back(Denied());
+        cd::CpuSetStageInfo i = cd::ClassifyCpuSetStage(m, r);
+        CHECK(i.stage == cd::CpuSetStage::NoAccess);
+        CHECK_EQ(cd::CpuSetStageLabel(i), L"No access");
+        CHECK_EQ(i.failed, 1);
+        CHECK_EQ(i.notOurs, 1);
+    }
+
+    // And one readable instance still decides for the family, with both counters complete.
+    {
+        std::vector<cd::CpuSetReadback> r;
+        r.push_back(Recycled());
+        r.push_back(Denied());
+        r.push_back(Ok(freq));
+        cd::CpuSetStageInfo i = cd::ClassifyCpuSetStage(m, r);
+        CHECK(i.stage == cd::CpuSetStage::Named);
+        CHECK_EQ(i.name, L"Freq");
+        CHECK_EQ(i.probed, 3);
+        CHECK_EQ(i.failed, 1);
+        CHECK_EQ(i.notOurs, 1);
+    }
+
+    // The guard changes nothing for a readback nobody marked: it is ours by default, so the
+    // states that existed before it still come out exactly as they did.
+    {
+        std::vector<cd::CpuSetReadback> r;
+        r.push_back(Ok(cache));
+        r.push_back(Denied());
+        cd::CpuSetStageInfo i = cd::ClassifyCpuSetStage(m, r);
+        CHECK(i.stage == cd::CpuSetStage::Named);
+        CHECK_EQ(i.notOurs, 0);
+    }
+}
+
+// The LIVE half of the guard, and the only case in this file that opens a process.
+//
+// Everything else here drives pure functions, deliberately. But a guard that is only tested
+// through the classifier proves the classifier and nothing about the code that decides what
+// to hand it - so this drives ReadCpuSetStage itself, against THIS process: the one process a
+// test can know the true creation time of without racing anything, and one that is always
+// openable for PROCESS_QUERY_LIMITED_INFORMATION.
+//
+// Nothing below asserts WHICH mask we are on. A test may not assume the machine running it is
+// unmanaged - see applier.h on the 49 processes already carrying assignments nobody here
+// made. What is asserted is WHO the answer is about, which is the whole question.
+void Test_E5_LiveReadbackChecksIdentity() {
+    Case("E5 the live readback refuses a pid whose creation time has moved");
+    const std::vector<cd::Mask> m = cd::DeriveMasks(MakeReference(false));
+
+    const DWORD self = GetCurrentProcessId();
+    ULONGLONG born = 0;
+    CHECK(cd::GetProcessCreationTime(self, born));
+    CHECK(born != 0);
+
+    // Ourselves, correctly identified: a real answer about a process we vouched for.
+    {
+        std::vector<cd::ObservedProc> v(1);
+        v[0].pid = self;
+        v[0].creationTime = born;
+        cd::CpuSetStageInfo i = cd::ReadCpuSetStage(v, m, 16);
+        CHECK_EQ(i.probed, 1);
+        CHECK_EQ(i.failed, 0);
+        CHECK_EQ(i.notOurs, 0);
+        CHECK(i.stage != cd::CpuSetStage::NotRunning);   // we are plainly running
+        CHECK(i.stage != cd::CpuSetStage::NoAccess);     // and a process can always open itself
+    }
+
+    // The same live process under a creation time that is not its own - which is exactly what
+    // a recycled pid looks like from the caller's side. It must not be reported on at all, and
+    // with nothing else in the list the honest answer is "-" and not "No access".
+    {
+        std::vector<cd::ObservedProc> v(1);
+        v[0].pid = self;
+        v[0].creationTime = born + 1;
+        cd::CpuSetStageInfo i = cd::ReadCpuSetStage(v, m, 16);
+        CHECK(i.stage == cd::CpuSetStage::NotRunning);
+        CHECK_EQ(cd::CpuSetStageLabel(i), L"-");
+        CHECK_EQ(i.probed, 1);
+        CHECK_EQ(i.notOurs, 1);
+        CHECK_EQ(i.failed, 0);
+    }
+
+    // No creation time at all. We can open it and we can read it, and we still may not
+    // attribute the answer - so it is a process we got nothing usable out of, which is what
+    // `failed` means. NOT "not running": it is very obviously running.
+    {
+        std::vector<cd::ObservedProc> v(1);
+        v[0].pid = self;
+        v[0].creationTime = 0;
+        cd::CpuSetStageInfo i = cd::ReadCpuSetStage(v, m, 16);
+        CHECK(i.stage == cd::CpuSetStage::NoAccess);
+        CHECK_EQ(i.failed, 1);
+        CHECK_EQ(i.notOurs, 0);
+    }
+
+    // pid 0 is not a process. It is never opened, and it is never counted as a stranger.
+    {
+        std::vector<cd::ObservedProc> v(1);
+        cd::CpuSetStageInfo i = cd::ReadCpuSetStage(v, m, 16);
+        CHECK(i.stage == cd::CpuSetStage::NoAccess);
+        CHECK_EQ(i.failed, 1);
+        CHECK_EQ(i.notOurs, 0);
+    }
+
+    // A stranger between two of ours does not make the family Mixed on the live path either.
+    {
+        std::vector<cd::ObservedProc> v(3);
+        v[0].pid = self;
+        v[0].creationTime = born;
+        v[1].pid = self;
+        v[1].creationTime = born + 1;   // the "recycled" one
+        v[2].pid = self;
+        v[2].creationTime = born;
+        cd::CpuSetStageInfo i = cd::ReadCpuSetStage(v, m, 16);
+        CHECK(i.stage != cd::CpuSetStage::Mixed);
+        CHECK_EQ(i.probed, 3);
+        CHECK_EQ(i.notOurs, 1);
+        CHECK_EQ(i.failed, 0);
+
+        // maxProbe still bounds the work, and it counts PIDS, not answers.
+        cd::CpuSetStageInfo capped = cd::ReadCpuSetStage(v, m, 1);
+        CHECK_EQ(capped.probed, 1);
+        CHECK_EQ(capped.notOurs, 0);    // the stranger is second and was never reached
+        cd::CpuSetStageInfo uncapped = cd::ReadCpuSetStage(v, m, 0);
+        CHECK_EQ(uncapped.probed, 3);   // 0 is "no cap", unchanged by this guard
+    }
+}
+
 void Test_E3_LabelsAreDistinct() {
     Case("E3 no two states print the same word");
     // A label collision would make two different facts indistinguishable on screen, which is
@@ -1940,6 +2176,8 @@ int main() {
     Test_E1_MaskNameForIds();
     Test_E2_ClassifyCpuSetStage();
     Test_E3_LabelsAreDistinct();
+    Test_E4_PidReuseGuard();
+    Test_E5_LiveReadbackChecksIdentity();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

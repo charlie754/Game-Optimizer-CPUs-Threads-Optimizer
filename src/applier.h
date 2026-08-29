@@ -102,8 +102,11 @@ bool GetProcessCreationTime(DWORD pid, ULONGLONG& out);
 // So this reports what GetProcessDefaultCpuSets says, and where that disagrees with intent
 // the readback is what the user is shown. There is no state here meaning "as configured".
 enum class CpuSetStage {
-    NotRunning,   // nothing live matched the name at all
-    NoAccess,     // live, but every process refused PROCESS_QUERY_LIMITED_INFORMATION
+    // Nothing live this app can vouch for, and that is ONE state reached two ways: no process
+    // matched the name, or every pid that did has since been RECYCLED. Both say the same thing
+    // about OUR process - it is gone - so both get the same word. See ObservedProc below.
+    NotRunning,
+    NoAccess,     // live and ours, but every one refused PROCESS_QUERY_LIMITED_INFORMATION
     AllCores,     // live, readable, NO assignment - which is precisely what "all cores" means
     Named,        // the assignment is exactly one of the masks we have a name for
     Custom,       // an assignment we do not recognise: someone else's, or a partial set
@@ -113,8 +116,12 @@ enum class CpuSetStage {
 struct CpuSetStageInfo {
     CpuSetStage stage = CpuSetStage::NotRunning;
     std::wstring name;   // the mask name, and ONLY when stage == Named
-    int probed = 0;      // live processes looked at
-    int failed = 0;      // of those, how many could not be opened or read
+    int probed = 0;      // pids looked at
+    int failed = 0;      // of those, how many gave us no answer: not opened, not read, or
+                         // opened with no creation time to identify the process by
+    int notOurs = 0;     // of those, how many were a RECYCLED pid - live and readable, but
+                         // held by a process this app has never seen. Counted apart from
+                         // `failed` because nothing failed: we declined to ask.
 };
 
 // The word to put on screen. Never a mask name unless the readback produced one.
@@ -122,8 +129,13 @@ std::wstring CpuSetStageLabel(const CpuSetStageInfo& info);
 
 // One process's answer. `ok == false` is "we could not ask", which is NOT the same as
 // "no assignment" and must never be folded into it - ids.empty() with ok == true is.
+//
+// `ours == false` is a THIRD outcome and it is not a failure: the pid is live and would have
+// answered, but the process behind it is not the one the caller saw. Whatever it says is
+// about a stranger, so it contributes nothing to the verdict - see ObservedProc below.
 struct CpuSetReadback {
     bool ok = false;
+    bool ours = true;
     std::vector<ULONG> ids;
 };
 
@@ -131,21 +143,62 @@ struct CpuSetReadback {
 //
 // Failed reads are counted in `failed` and then EXCLUDED from the verdict: one protected
 // child in a family of eight would otherwise turn a perfectly uniform "Cache" into "Mixed",
-// which reads as a problem where there is none. When every read failed there is no verdict
-// left to give and the answer is NoAccess.
+// which reads as a problem where there is none. Recycled pids (`ours == false`) are excluded
+// the same way and counted in `notOurs` - and they are excluded even when they carry ids: a
+// stranger's mask must not be able to vote, least of all to vote "Mixed".
+//
+// When nothing of ours answered there is no verdict left to give, and WHICH silence it was
+// decides the word. One of OUR processes refusing is NoAccess - "we could not ask". Every
+// pid having been recycled is NotRunning, because our processes are gone; calling that
+// "No access" would be false twice over, since we could ask and we did get an answer.
 CpuSetStageInfo ClassifyCpuSetStage(const std::vector<Mask>& masks,
                                     const std::vector<CpuSetReadback>& reads);
 
-// ReadCpuSets over each pid, then ClassifyCpuSetStage. Read-only, and the only access right
-// asked for is PROCESS_QUERY_LIMITED_INFORMATION - each handle is closed before the next is
-// opened, so the cost is one handle at a time however long the list is.
+// A pid AND the creation time it carried when the caller observed it. The two travel
+// together deliberately: Windows reuses pids, so a bare pid is not an identity, and a
+// readback that cannot check for reuse can print a stranger's mask under our process's name.
+// Every other pid-keyed decision in this program is already guarded this way - the restore
+// journal's clear, the snapshot's CPU-history carry-forward, the parent/child edges in
+// Descendants - and this is the readback's share of the same rule.
+//
+// creationTime == 0 means the CALLER could not read one. That is not "no reuse to worry
+// about", it is "no identity to check against", and it is treated as a process we could not
+// interrogate rather than one we may report on.
+struct ObservedProc {
+    DWORD pid = 0;
+    ULONGLONG creationTime = 0;
+};
+
+// Pure. Is the process behind a pid right now the one the caller observed? The single place
+// that rule is written, so the readback and the tests cannot drift apart.
+//
+// A zero on either side is NOT a match: an unreadable creation time is an absence of
+// evidence, never evidence of sameness. The caller separates the two rejections, because
+// they are different statements to the user - two known times that differ means the pid was
+// RECYCLED, a zero means the process could not be IDENTIFIED at all.
+bool SameProcessInstance(ULONGLONG observedCreationTime, ULONGLONG liveCreationTime);
+
+// Read each process's mask from Windows, then ClassifyCpuSetStage over the answers.
+// Read-only, and the only access right asked for is PROCESS_QUERY_LIMITED_INFORMATION - each
+// handle is closed before the next is opened, so the cost is one handle at a time however
+// long the list is.
+//
+// ONE handle answers both questions, and that is a correctness requirement before it is a
+// saving. A handle is bound to the process OBJECT, not to the pid, so once it is open the
+// identity behind it cannot change under us, and the creation time checked is provably the
+// creation time of the process whose mask is read. Checking it through a SECOND, separate
+// OpenProcess would leave a window in which the pid is recycled between the two calls, and
+// the mask reported would be the stranger's after all - the very bug being guarded against,
+// reintroduced by the guard.
 //
 // `maxProbe` bounds the work when one executable has a great many instances. MEASURED
 // 2026-08-29: one full readback - OpenProcess, the two-call GetProcessDefaultCpuSets, and
 // CloseHandle - costs 1.43-1.72 us, so every process on a 377-process desktop reads in
-// ~0.6 ms. The cap is therefore not a performance necessity; it is a ceiling on the
-// pathological case, and callers should say in a comment what they chose and why.
-CpuSetStageInfo ReadCpuSetStage(const std::vector<DWORD>& pids,
+// ~0.6 ms. The identity check adds one GetProcessTimes to a handle that is ALREADY OPEN, so
+// the OpenProcess/CloseHandle pair that dominates that figure is still one per process. The
+// cap is therefore not a performance necessity; it is a ceiling on the pathological case,
+// and callers should say in a comment what they chose and why.
+CpuSetStageInfo ReadCpuSetStage(const std::vector<ObservedProc>& procs,
                                 const std::vector<Mask>& masks,
                                 size_t maxProbe);
 

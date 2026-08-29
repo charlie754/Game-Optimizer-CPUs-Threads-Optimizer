@@ -1670,6 +1670,31 @@ bool StatusDescribesProfile(const EngineStatus& s, const Profile& p);
 // and sixteen instances is far more than enough to notice that they disagree.
 const size_t kStageProbePerEntry = 16;
 
+// The pids paired with the creation time THIS snapshot recorded for each of them, which is
+// what makes the readback pid-reuse-safe: the applier re-checks that creation time through
+// the same handle it reads the mask through, and refuses to report on a pid that has been
+// recycled since. It costs nothing here - the creation time is already in the snapshot the
+// CPU meters just took, so there is no second enumeration and no extra syscall.
+//
+// A pid the snapshot does not hold is DROPPED rather than passed on with a zero creation
+// time. Nothing here can vouch for it, and this row exists to answer a question about our
+// process; the only such pid is the engine's game below, and one tick later our own snapshot
+// has it.
+std::vector<ObservedProc> ObservedFromSnapshot(const ProcessSnapshot& snap,
+                                               const std::vector<DWORD>& pids) {
+    std::vector<ObservedProc> out;
+    out.reserve(pids.size());
+    for (size_t i = 0; i < pids.size(); ++i) {
+        const ProcInfo* pi = snap.Find(pids[i]);
+        if (pi == nullptr) continue;
+        ObservedProc o;
+        o.pid = pi->pid;
+        o.creationTime = pi->creationTime;   // 0 when the snapshot could not open it
+        out.push_back(o);
+    }
+    return out;
+}
+
 // Re-reads which mask the target and every visible heavy entry are on. Costs one snapshot's
 // worth of nothing extra: it reuses the ProcessSnapshot RefreshCpuTable just took, so no
 // second enumeration and no second timer.
@@ -1696,8 +1721,9 @@ bool RefreshCpuSetStages(SettingsState* st) {
         // FindBySpec, not a basename lookup: it is the matcher the ENGINE uses, so a heavy
         // entry written as a full path is resolved here exactly as it is resolved when the
         // mask is applied, and the two cannot report different processes.
-        st->stageByHeavy[key] =
-            ReadCpuSetStage(st->cpuSnap.FindBySpec(heavy[i]), masks, kStageProbePerEntry);
+        st->stageByHeavy[key] = ReadCpuSetStage(
+            ObservedFromSnapshot(st->cpuSnap, st->cpuSnap.FindBySpec(heavy[i])),
+            masks, kStageProbePerEntry);
     }
 
     // NO PROFILE SELECTED LEAVES THE LABEL EMPTY, and LayoutPage then draws nothing. "-" is
@@ -1722,10 +1748,17 @@ bool RefreshCpuSetStages(SettingsState* st) {
         // An All Games profile names no executable, so the only target it HAS is the one the
         // engine matched - and only while that match is this profile's doing, or the row
         // would describe a game some other profile is governing.
+        //
+        // This pid comes from the ENGINE's snapshot, not ours, so it is looked up in ours
+        // below to pick up a creation time we recorded ourselves. A game that started in the
+        // few milliseconds between the two snapshots is not in ours yet and waits for the
+        // next tick, which is a beat of "-" rather than a mask read off a pid nothing here
+        // can vouch for.
         const EngineStatus s = st->engine->GetStatus();
         if (s.gamePid != 0 && StatusDescribesProfile(s, p)) gamePids.push_back(s.gamePid);
     }
-    st->targetStage = ReadCpuSetStage(gamePids, masks, kStageProbePerEntry);
+    st->targetStage = ReadCpuSetStage(ObservedFromSnapshot(st->cpuSnap, gamePids),
+                                      masks, kStageProbePerEntry);
     st->targetStageText = CpuSetStageLabel(st->targetStage);
     return was != st->targetStageText;
 }

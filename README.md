@@ -72,6 +72,19 @@ starting.
 **Pre-release.** Read [what has actually been tested](#what-has-actually-been-tested) before
 using this on anything you care about.
 
+## Anti-cheat has not been tested
+
+**No anti-cheat has been tested with this app by anyone, anywhere in this work. No game was
+running during any measurement.**
+
+Game Optimizer requests the minimum access rights
+(`PROCESS_SET_LIMITED_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION`), never reads or writes
+game memory, and never injects anything — but that is a design intention, not a vendor
+assurance. BattlEye's FAQ notes they may **kick** (not ban) players for using third-party
+programs; that outcome cannot be prevented or detected by this app.
+
+Use it on anti-cheat-protected titles at your own risk.
+
 ## Build
 
 Requires MSVC (Build Tools 2019 or newer) and a Windows 10 SDK. No other dependencies.
@@ -89,6 +102,28 @@ behaves; their output is the evidence behind `docs\spec\04-measurements.md`:
 tools\build-probe.bat      && build\topology_probe.exe
 tools\build-behaviour.bat  && build\behaviour_probe.exe
 ```
+
+## Windows SmartScreen on first run
+
+The binary is not code-signed. This is a free tool and a code-signing certificate is a recurring
+cost, so there is no certificate and no signature — and Windows notices.
+
+The first time you run a downloaded `GameOptimizer.exe`, SmartScreen shows a prompt headed
+**"Windows protected your PC"** saying the app is unrecognised. **Run anyway** is not on it
+until you click **More info**:
+
+1. **More info**
+2. **Run anyway**
+
+That is once, for that copy of the file. Nothing here asks you to turn SmartScreen off, add a
+Defender exclusion, or change any other security setting; none of that is needed to run this.
+
+"Unrecognised" is exactly what it says: no signature and no download reputation. It is not a
+statement about what is in the file. What this project offers instead of a signature is that the
+whole source is public and builds with MSVC via `tools\build.bat`, so you can read what it does
+and produce the binary yourself. A copy you compiled locally does not normally carry the
+downloaded-file marker this check is keyed to, so the prompt is a thing downloaders meet rather
+than builders.
 
 ## Use
 
@@ -167,12 +202,8 @@ Being specific here rather than implying more coverage than exists.
 
 **Not tested by anyone, anywhere in this work:**
 
-- **Any anti-cheat.** No game was running during any measurement. Game Optimizer requests the
-  minimum access rights (`PROCESS_SET_LIMITED_INFORMATION | PROCESS_QUERY_LIMITED_INFORMATION`),
-  never reads or writes game memory, and never injects anything — but that is a design
-  intention, not a vendor assurance. BattlEye's FAQ notes they may **kick** (not ban) players
-  for using third-party programs; that outcome cannot be prevented or detected by this app.
-  Use it on anti-cheat-protected titles at your own risk.
+- **Any anti-cheat.** No game was running during any measurement. The full warning is its own
+  section above: [Anti-cheat has not been tested](#anti-cheat-has-not-been-tested).
 - Intel hybrid, symmetric dual-CCD, single-CCD, and machines with more than 64 logical
   processors. Those code paths exist and are covered by synthetic unit tests only.
 - Laptops, and any behaviour on battery power.

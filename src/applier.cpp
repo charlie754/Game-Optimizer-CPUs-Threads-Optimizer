@@ -263,12 +263,13 @@ ApplyOutcome ClearCpuSets(DWORD pid) {
 
 // ---- read-back -------------------------------------------------------------
 
-bool ReadCpuSets(DWORD pid, std::vector<ULONG>& out) {
-    out.clear();
-    if (pid == 0) return false;
+namespace {
 
-    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (h == NULL) return false;
+// The readback itself, on a handle the CALLER owns and closes. Split out of ReadCpuSets so
+// the identity check and the mask read can share ONE open handle - see ReadCpuSetStage in
+// applier.h for why sharing it is a correctness requirement and not merely a saving.
+bool ReadCpuSetsOnHandle(HANDLE h, std::vector<ULONG>& out) {
+    out.clear();
 
     // Two-call pattern, and the first call's contract is NOT the obvious one.
     //
@@ -287,39 +288,56 @@ bool ReadCpuSets(DWORD pid, std::vector<ULONG>& out) {
     SetLastError(ERROR_SUCCESS);
     if (!GetProcessDefaultCpuSets(h, NULL, 0, &required)) {
         const DWORD err = GetLastError();
-        if (err != ERROR_INSUFFICIENT_BUFFER || required == 0) {
-            CloseHandle(h);
-            return false;
-        }
+        if (err != ERROR_INSUFFICIENT_BUFFER || required == 0) return false;
     }
-    if (required == 0) {
-        CloseHandle(h);
-        return true;   // empty is the normal unmanaged state
-    }
+    if (required == 0) return true;   // empty is the normal unmanaged state
 
     std::vector<ULONG> buf(static_cast<size_t>(required), 0u);
     ULONG got = 0;
     if (!GetProcessDefaultCpuSets(h, &buf[0], required, &got)) {
         // The set can grow between the two calls. One retry at the newly reported size, and
         // then give up rather than loop against a process that is changing under us.
-        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || got <= required || got == 0) {
-            CloseHandle(h);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || got <= required || got == 0)
             return false;
-        }
         required = got;
         buf.assign(static_cast<size_t>(required), 0u);
         got = 0;
-        if (!GetProcessDefaultCpuSets(h, &buf[0], required, &got)) {
-            CloseHandle(h);
-            return false;
-        }
+        if (!GetProcessDefaultCpuSets(h, &buf[0], required, &got)) return false;
     }
-    CloseHandle(h);
 
     if (got > required) got = required;   // defensive; the API should never do this
     buf.resize(static_cast<size_t>(got));
     out.swap(buf);
     return true;
+}
+
+// The same split for the same reason: the creation time is read through a handle that is
+// already open, so it costs no second OpenProcess and cannot be answered by a different
+// process than the one the mask came from.
+bool CreationTimeOnHandle(HANDLE h, ULONGLONG& out) {
+    out = 0;
+    FILETIME created, exited, kernelTime, userTime;
+    if (!GetProcessTimes(h, &created, &exited, &kernelTime, &userTime)) return false;
+
+    ULARGE_INTEGER u;
+    u.LowPart = created.dwLowDateTime;
+    u.HighPart = created.dwHighDateTime;
+    out = u.QuadPart;
+    return true;
+}
+
+}  // namespace
+
+bool ReadCpuSets(DWORD pid, std::vector<ULONG>& out) {
+    out.clear();
+    if (pid == 0) return false;
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (h == NULL) return false;
+
+    const bool ok = ReadCpuSetsOnHandle(h, out);
+    CloseHandle(h);
+    return ok;
 }
 
 bool ReadAffinityMask(DWORD pid, ULONG_PTR& processMask, ULONG_PTR& systemMask) {
@@ -348,16 +366,17 @@ bool GetProcessCreationTime(DWORD pid, ULONGLONG& out) {
     HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
     if (h == NULL) return false;
 
-    FILETIME created, exited, kernelTime, userTime;
-    BOOL ok = GetProcessTimes(h, &created, &exited, &kernelTime, &userTime);
+    const bool ok = CreationTimeOnHandle(h, out);
     CloseHandle(h);
-    if (!ok) return false;
+    return ok;
+}
 
-    ULARGE_INTEGER u;
-    u.LowPart = created.dwLowDateTime;
-    u.HighPart = created.dwHighDateTime;
-    out = u.QuadPart;
-    return true;
+bool SameProcessInstance(ULONGLONG observedCreationTime, ULONGLONG liveCreationTime) {
+    // Zero means "nobody could read one", on either side, and two unknowns are not a match:
+    // an absence of evidence must never leave this function as evidence of sameness. The
+    // caller decides what to do with the rejection - see applier.h.
+    if (observedCreationTime == 0 || liveCreationTime == 0) return false;
+    return observedCreationTime == liveCreationTime;
 }
 
 // ---- which mask a process is ON RIGHT NOW ----------------------------------
@@ -367,7 +386,7 @@ bool GetProcessCreationTime(DWORD pid, ULONGLONG& out) {
 std::wstring CpuSetStageLabel(const CpuSetStageInfo& info) {
     switch (info.stage) {
         // A dash, not an empty cell: a row with nothing in it reads as "not measured yet",
-        // and this is a measured answer - we looked, and the executable is not running.
+        // and this is a measured answer - we looked, and nothing we can vouch for is live.
         case CpuSetStage::NotRunning: return L"-";
         case CpuSetStage::NoAccess:   return L"No access";
         case CpuSetStage::AllCores:   return L"All cores";
@@ -396,6 +415,15 @@ CpuSetStageInfo ClassifyCpuSetStage(const std::vector<Mask>& masks,
     std::wstring agreedName;
 
     for (size_t i = 0; i < reads.size(); ++i) {
+        // The identity check comes FIRST, and it is checked even when the read succeeded: a
+        // recycled pid answers perfectly well, and the answer is about a process this app has
+        // never handled. Letting it through would put a stranger's mask on screen under our
+        // name, or - worse, because it looks like a real finding - turn a uniform family into
+        // "Mixed".
+        if (!reads[i].ours) {
+            ++info.notOurs;
+            continue;
+        }
         if (!reads[i].ok) {
             ++info.failed;
             continue;
@@ -423,7 +451,12 @@ CpuSetStageInfo ClassifyCpuSetStage(const std::vector<Mask>& masks,
     }
 
     if (!haveOne) {
-        info.stage = CpuSetStage::NoAccess;   // live, but not one of them would answer
+        // Nothing of ours answered, and the two ways that happens are DIFFERENT facts:
+        //   at least one of OUR processes refused -> we could not ask       -> No access
+        //   every pid we had has been recycled    -> our processes are gone -> not running
+        // Saying "No access" for the second would be false twice over - we could ask, and we
+        // got an answer; it just was not ours to report.
+        info.stage = (info.failed > 0) ? CpuSetStage::NoAccess : CpuSetStage::NotRunning;
         return info;
     }
     if (disagree) {
@@ -435,17 +468,50 @@ CpuSetStageInfo ClassifyCpuSetStage(const std::vector<Mask>& masks,
     return info;
 }
 
-CpuSetStageInfo ReadCpuSetStage(const std::vector<DWORD>& pids,
+namespace {
+
+// One process, ONE handle, both questions - identity first, then the mask. Every exit closes
+// the handle, including the two that give up before reading anything.
+CpuSetReadback ReadCpuSetOnce(const ObservedProc& p) {
+    CpuSetReadback r;   // ok == false, ours == true: "ours as far as we know, and no answer"
+    if (p.pid == 0) return r;
+
+    HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, p.pid);
+    if (h == NULL) return r;   // protected, or it exited between the snapshot and now
+
+    ULONGLONG live = 0;
+    if (!CreationTimeOnHandle(h, live)) {
+        CloseHandle(h);
+        return r;
+    }
+
+    if (!SameProcessInstance(p.creationTime, live)) {
+        // TWO rejections land here and only one of them is a recycled pid:
+        //   both times known and different - the pid HAS been recycled. Live, readable, and
+        //     none of our business: whatever mask it carries was put there for a process this
+        //     app has never seen.
+        //   either time zero - the process cannot be IDENTIFIED. In practice that is one the
+        //     caller's snapshot could not open either, so it stays what it has always been,
+        //     a process we got no answer out of. Never "not running": it is plainly running.
+        if (p.creationTime != 0 && live != 0) r.ours = false;
+        CloseHandle(h);
+        return r;
+    }
+
+    r.ok = ReadCpuSetsOnHandle(h, r.ids);
+    CloseHandle(h);
+    return r;
+}
+
+}  // namespace
+
+CpuSetStageInfo ReadCpuSetStage(const std::vector<ObservedProc>& procs,
                                 const std::vector<Mask>& masks,
                                 size_t maxProbe) {
     std::vector<CpuSetReadback> reads;
-    const size_t n = (maxProbe == 0 || pids.size() < maxProbe) ? pids.size() : maxProbe;
+    const size_t n = (maxProbe == 0 || procs.size() < maxProbe) ? procs.size() : maxProbe;
     reads.reserve(n);
-    for (size_t i = 0; i < n; ++i) {
-        CpuSetReadback r;
-        r.ok = ReadCpuSets(pids[i], r.ids);
-        reads.push_back(r);
-    }
+    for (size_t i = 0; i < n; ++i) reads.push_back(ReadCpuSetOnce(procs[i]));
     return ClassifyCpuSetStage(masks, reads);
 }
 

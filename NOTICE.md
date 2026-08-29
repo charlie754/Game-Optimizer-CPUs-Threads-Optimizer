@@ -87,16 +87,19 @@ copy of that file.
 
 | | |
 |---|---|
+| Version | 1.0.3650.58 — the loader's PE file version, and the version of the `Microsoft.Web.WebView2` package whose x64 loader hashes to the same SHA-256 |
 | Size | 160,320 bytes |
 | SHA-256 | `8427b1fc58ec707813e5c0a51eb5d69397bb333250a7b891be4d3b123f1e0f1c` |
 | Recorded | 2026-08-29 |
 
 **Licence.** Microsoft distributes the WebView2 SDK, including this loader, for redistribution
-with applications that use WebView2, under the Microsoft Software License Terms shipped with
-the `Microsoft.Web.WebView2` SDK package. **That licence text is NOT reproduced here, and it
-was NOT read on this machine** — no copy of the SDK's own licence file is present. Anyone
-shipping a build of this repository should obtain the WebView2 SDK's licence terms from
-Microsoft and satisfy them, rather than treating this paragraph as a licence review.
+with applications that use WebView2, under the licence terms Microsoft publishes for the
+`Microsoft.Web.WebView2` SDK package. **That licence text is NOT reproduced anywhere in this
+repository**, and no copy of the SDK's own `LICENSE.txt` or `NOTICE.txt` is present here.
+`third_party\webview2\README.md` records which package version this binary came from, shows
+that it is byte-identical to Microsoft's published copy, and links to Microsoft's terms for it.
+Anyone shipping a build of this repository should read those terms and satisfy them, rather
+than treating this paragraph as a licence review.
 
 **How to remove it.** Delete `third_party\webview2\` and rebuild. `tools\build.bat` prints a
 warning instead of failing, and the app falls back to the GDI sponsor strip at run time. No
