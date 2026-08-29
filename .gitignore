@@ -1,0 +1,16 @@
+build/
+*.obj
+*.pdb
+*.ilk
+*.exe
+*.user
+
+# --- publication exclusions -------------------------------------------------
+# Kept out of the public repository deliberately, not because they are secret:
+# the turn reports are an internal engineering log carrying local machine paths
+# and session reasoning, and the ledger is workflow scratch. The product docs in
+# docs/spec/ ARE published - they are what the README links to.
+docs/turns/
+.workflow/
+__pycache__/
+*.pyc
