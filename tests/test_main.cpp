@@ -35,6 +35,7 @@
 #include "engine.h"
 #include "procwatch.h"
 #include "settings_environment.h"
+#include "settings_heavy_order.h"
 #include "settings_warning.h"
 #include "topology.h"
 #include "util.h"
@@ -2614,6 +2615,83 @@ void Test_I6_TrayDetectionIsCaseInsensitive() {
         L"\"C:\\Game Optimizer\\GameOptimizer.exe\" --TRAY"));
 }
 
+// ===========================================================================
+// J. Heavy-app activity ordering.
+// ===========================================================================
+
+void Test_J1_MixedHeavyAppsPutRunningEntriesFirst() {
+    Case("J1 mixed heavy apps put running entries first");
+    const std::vector<std::wstring> items = {
+        L"claude.exe", L"node.exe", L"obs64.exe", L"firefox.exe", L"GameBar.exe"};
+    const std::vector<std::wstring> keys = {
+        L"claude.exe", L"node.exe", L"obs64.exe", L"firefox.exe", L"gamebar.exe"};
+    const std::set<std::wstring> running = {L"claude.exe", L"firefox.exe", L"gamebar.exe"};
+    const std::vector<std::wstring> expected = {
+        L"claude.exe", L"firefox.exe", L"GameBar.exe", L"node.exe", L"obs64.exe"};
+    CHECK_EQ(cd::OrderHeavyByActivity(items, keys, running), expected);
+}
+
+void Test_J2_RunningHeavyAppsKeepRelativeOrder() {
+    Case("J2 running heavy apps keep their relative order");
+    const std::vector<std::wstring> items = {L"second.exe", L"dead.exe", L"first.exe"};
+    const std::set<std::wstring> running = {L"first.exe", L"second.exe"};
+    const std::vector<std::wstring> expected = {L"second.exe", L"first.exe", L"dead.exe"};
+    CHECK_EQ(cd::OrderHeavyByActivity(items, items, running), expected);
+}
+
+void Test_J3_InactiveHeavyAppsKeepRelativeOrder() {
+    Case("J3 inactive heavy apps keep their relative order");
+    const std::vector<std::wstring> items = {L"dead-b.exe", L"live.exe", L"dead-a.exe"};
+    const std::set<std::wstring> running = {L"live.exe"};
+    const std::vector<std::wstring> expected = {L"live.exe", L"dead-b.exe", L"dead-a.exe"};
+    CHECK_EQ(cd::OrderHeavyByActivity(items, items, running), expected);
+}
+
+void Test_J4_EmptyRunningSetKeepsHeavyAppOrder() {
+    Case("J4 an empty running set keeps heavy app order unchanged");
+    const std::vector<std::wstring> items = {L"one.exe", L"two.exe", L"three.exe"};
+    CHECK_EQ(cd::OrderHeavyByActivity(items, items, std::set<std::wstring>()), items);
+}
+
+void Test_J5_EmptyHeavyAppListStaysEmpty() {
+    Case("J5 an empty heavy app list stays empty");
+    CHECK(cd::OrderHeavyByActivity(std::vector<std::wstring>(),
+                                   std::vector<std::wstring>(), {L"live.exe"}).empty());
+}
+
+void Test_J6_FullPathMatchesOnBasename() {
+    Case("J6 a full path heavy app matches on its basename");
+    const std::vector<std::wstring> items = {
+        L"dead.exe", L"C:\\Program Files\\obs\\obs64.exe"};
+    const std::vector<std::wstring> keys = {L"dead.exe", L"obs64.exe"};
+    const std::vector<std::wstring> expected = {
+        L"C:\\Program Files\\obs\\obs64.exe", L"dead.exe"};
+    CHECK_EQ(cd::OrderHeavyByActivity(items, keys, {L"obs64.exe"}), expected);
+}
+
+void Test_J7_HeavyAppMatchingIsCaseInsensitive() {
+    Case("J7 caller-folded heavy app keys match case-insensitively");
+    const std::vector<std::wstring> items = {L"dead.exe", L"OBS64.EXE"};
+    const std::vector<std::wstring> keys = {L"dead.exe", L"obs64.exe"};
+    const std::vector<std::wstring> expected = {L"OBS64.EXE", L"dead.exe"};
+    CHECK_EQ(cd::OrderHeavyByActivity(items, keys, {L"obs64.exe"}), expected);
+}
+
+void Test_J8_MismatchedItemAndKeyCountsKeepInputOrder() {
+    Case("J8 mismatched item and key counts keep input order unchanged");
+    const std::vector<std::wstring> items = {L"dead.exe", L"live.exe"};
+    const std::vector<std::wstring> keys = {L"live.exe"};
+    CHECK_EQ(cd::OrderHeavyByActivity(items, keys, {L"live.exe"}), items);
+}
+
+void Test_J9_CaseDifferentItemUsesCallerSuppliedKey() {
+    Case("J9 an item's case-different caller key controls activity ordering");
+    const std::vector<std::wstring> items = {L"dead.exe", L"ACTIVE.EXE"};
+    const std::vector<std::wstring> keys = {L"dead.exe", L"active.exe"};
+    const std::vector<std::wstring> expected = {L"ACTIVE.EXE", L"dead.exe"};
+    CHECK_EQ(cd::OrderHeavyByActivity(items, keys, {L"active.exe"}), expected);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -2694,6 +2772,17 @@ int main() {
     Test_I4_BareAutostartNeedsMigration();
     Test_I5_TrayAutostartDoesNotNeedMigration();
     Test_I6_TrayDetectionIsCaseInsensitive();
+
+    std::printf("\n== J. Heavy-app activity ordering ==\n");
+    Test_J1_MixedHeavyAppsPutRunningEntriesFirst();
+    Test_J2_RunningHeavyAppsKeepRelativeOrder();
+    Test_J3_InactiveHeavyAppsKeepRelativeOrder();
+    Test_J4_EmptyRunningSetKeepsHeavyAppOrder();
+    Test_J5_EmptyHeavyAppListStaysEmpty();
+    Test_J6_FullPathMatchesOnBasename();
+    Test_J7_HeavyAppMatchingIsCaseInsensitive();
+    Test_J8_MismatchedItemAndKeyCountsKeepInputOrder();
+    Test_J9_CaseDifferentItemUsesCallerSuppliedKey();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

@@ -26,6 +26,7 @@
 #include "engine.h"
 #include "procwatch.h"
 #include "settings_environment.h"
+#include "settings_heavy_order.h"
 #include "settings_warning.h"
 #include "sponsor.h"
 #include "theme.h"
@@ -1484,10 +1485,18 @@ int ManualRowCount(const SettingsState* st) {
 
 void SetHeavyItems(SettingsState* st, const std::vector<std::wstring>& v) {
     if (!st->hHeavy) return;
+    std::set<std::wstring> running;
+    for (const auto& entry : st->cpuByExe) running.insert(entry.first);
+    std::vector<std::wstring> itemKeys;
+    itemKeys.reserve(v.size());
+    for (const auto& entry : v) itemKeys.push_back(ToLower(BaseName(Trim(entry))));
+    // Profile load is the one safe settling point. Re-sorting on the status timer would make
+    // rows dance when processes start or stop and could move one out from under a click.
+    const std::vector<std::wstring> ordered = OrderHeavyByActivity(v, itemKeys, running);
     SendMessageW(st->hHeavy, LB_RESETCONTENT, 0, 0);
-    for (size_t i = 0; i < v.size(); ++i) {
+    for (size_t i = 0; i < ordered.size(); ++i) {
         const LRESULT row = SendMessageW(st->hHeavy, LB_ADDSTRING, 0,
-                                         reinterpret_cast<LPARAM>(v[i].c_str()));
+                                         reinterpret_cast<LPARAM>(ordered[i].c_str()));
         if (row >= 0)
             SendMessageW(st->hHeavy, LB_SETITEMDATA, static_cast<WPARAM>(row),
                          kHeavyRowManual);
@@ -3996,13 +4005,15 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             RefreshProfileList(st);
             RefreshLiveTopology(st);   // before the first warning pass, or it has no data
+            // LoadProfileToUi -> SetHeavyItems needs process presence before it builds the
+            // rows; sampling afterwards made the first ordering pass see everything inactive.
+            // The first snapshot has no predecessor, so every percentage in it is 0. The
+            // meters fill in on the next timer tick; they never show a made-up figure.
+            RefreshCpuTable(st);
             LoadProfileToUi(st);
             SelectMapMask(st);
             RefreshBlockedLine(st);
             UpdateEnvironmentSection(st);
-            // The first snapshot has no predecessor, so every percentage in it is 0. The
-            // meters fill in on the next timer tick; they never show a made-up figure.
-            RefreshCpuTable(st);
             UpdateMaskWarnings(st);
             RefreshAutoPinStatus(st);
             ApplyPageVisibility(st);
