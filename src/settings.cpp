@@ -27,6 +27,7 @@
 #include "procwatch.h"
 #include "settings_environment.h"
 #include "settings_heavy_order.h"
+#include "settings_merge.h"
 #include "settings_warning.h"
 #include "sponsor.h"
 #include "theme.h"
@@ -879,6 +880,8 @@ struct SettingsState {
     const Topology* topo = nullptr;
     Engine* engine = nullptr;
     Config work;
+    Config baseline;  // Exact config at open: distinguishes tray additions from deletions here,
+                      // so reconciling the measured stale snapshot cannot resurrect a profile.
 
     // A freshly detected copy of the machine, refreshed on the same 1 s timer that repaints
     // the core map. `topo` above is the topology the app STARTED with; Parked flags move
@@ -3566,6 +3569,43 @@ void ApplyChanges(SettingsState* st, HWND hwnd) {
     StoreUiToProfile(st);
     StoreGeneralToWork(st);
 
+    // Settings never edits these fields. Preserve their live values so a tray Pause or prompt
+    // decline saved while this modeless window is open cannot be erased by its stale snapshot.
+    st->work.paused = st->out->paused;
+    st->work.unknown = st->out->unknown;
+
+    // Compare caller-folded names against both the open baseline and the edited work copy. The
+    // baseline is what keeps a profile deliberately deleted here from being resurrected.
+    std::vector<std::wstring> liveProfileKeys;
+    std::vector<std::wstring> baselineProfileKeys;
+    std::vector<std::wstring> workProfileKeys;
+    liveProfileKeys.reserve(st->out->profiles.size());
+    baselineProfileKeys.reserve(st->baseline.profiles.size());
+    workProfileKeys.reserve(st->work.profiles.size());
+    for (size_t i = 0; i < st->out->profiles.size(); ++i)
+        liveProfileKeys.push_back(ToLower(st->out->profiles[i].name));
+    for (size_t i = 0; i < st->baseline.profiles.size(); ++i)
+        baselineProfileKeys.push_back(ToLower(st->baseline.profiles[i].name));
+    for (size_t i = 0; i < st->work.profiles.size(); ++i)
+        workProfileKeys.push_back(ToLower(st->work.profiles[i].name));
+
+    const std::vector<std::size_t> liveAdditions =
+        IndicesAddedBehindTheWindow(liveProfileKeys, baselineProfileKeys, workProfileKeys);
+    std::wstring recoveredProfiles;
+    for (size_t i = 0; i < liveAdditions.size(); ++i) {
+        const Profile& recovered = st->out->profiles[liveAdditions[i]];
+        st->work.profiles.push_back(recovered);
+        if (!recoveredProfiles.empty()) recoveredProfiles += L", ";
+        recoveredProfiles += L"'" + recovered.name + L"'";
+    }
+
+    // Name every recovered profile in one record so another behind-window reconciliation is
+    // visible in the app log instead of surfacing later as unexplained config churn.
+    if (!recoveredProfiles.empty()) {
+        LogLine(L"[settings] recovered live profile(s) added while Settings was open: %s",
+                recoveredProfiles.c_str());
+    }
+
     *st->out = st->work;
     std::vector<std::wstring> repairs = ValidateAndRepair(*st->out, *st->topo);
     st->work = *st->out;
@@ -3584,6 +3624,8 @@ void ApplyChanges(SettingsState* st, HWND hwnd) {
         MessageBoxW(hwnd, m.c_str(), L"Game Optimizer", MB_OK | MB_ICONWARNING);
     }
 
+    // This also exposes recovered profiles. It retains selProfile unless that index is invalid,
+    // so the refresh cannot redirect a subsequent edit to a different profile.
     RefreshProfileList(st);
     LoadProfileToUi(st);
     FillMaskCombo(st->hMapMask, st->work, ComboText(st->hMapMask));
@@ -5051,6 +5093,7 @@ void ShowSettings(HWND owner, Config& cfg, const Topology& topo, Engine& engine)
     st->topo = &topo;
     st->engine = &engine;
     st->work = cfg;
+    st->baseline = cfg;
     st->env = ProbeEnvironment();
     st->selProfile = st->work.profiles.empty() ? -1 : 0;
 

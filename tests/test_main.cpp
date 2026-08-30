@@ -36,6 +36,7 @@
 #include "procwatch.h"
 #include "settings_environment.h"
 #include "settings_heavy_order.h"
+#include "settings_merge.h"
 #include "settings_warning.h"
 #include "topology.h"
 #include "util.h"
@@ -2744,6 +2745,57 @@ void Test_J16_DuplicateCanonicalStringsUseFirstIndexWithoutDroppingEntries() {
     CHECK_EQ(cd::RestoreCanonicalOrder(displayed, canonical), expected);
 }
 
+// ===========================================================================
+// K. Settings live-config reconciliation.
+// ===========================================================================
+void Test_K1_LiveEntryAddedBehindTheWindowIsReported() {
+    Case("K1 a live entry absent from baseline and work is reported");
+    const std::vector<std::size_t> expected = {1};
+    CHECK(cd::IndicesAddedBehindTheWindow(
+              {L"existing", L"tray-added"}, {L"existing"}, {L"existing"}) == expected);
+}
+
+void Test_K2_ProfileDeletedInSettingsIsNotResurrected() {
+    Case("K2 an entry present in baseline but deleted from work is not reported");
+    CHECK(cd::IndicesAddedBehindTheWindow(
+              {L"kept", L"deleted"}, {L"kept", L"deleted"}, {L"kept"})
+              .empty());
+}
+
+void Test_K3_LiveEntryAlreadyInWorkIsNotDuplicated() {
+    Case("K3 a live entry already present in work is not reported");
+    CHECK(cd::IndicesAddedBehindTheWindow(
+              {L"existing", L"already-present"}, {L"existing"},
+              {L"existing", L"already-present"})
+              .empty());
+}
+
+void Test_K4_SeveralLiveAdditionsKeepAscendingIndexOrder() {
+    Case("K4 several live additions are reported in ascending index order");
+    const std::vector<std::size_t> expected = {0, 2, 3};
+    CHECK(cd::IndicesAddedBehindTheWindow(
+              {L"new-zero", L"existing", L"new-two", L"new-three"},
+              {L"existing"}, {L"existing"}) == expected);
+}
+
+void Test_K5_EmptyLiveConfigReturnsNoIndices() {
+    Case("K5 an empty live config returns no indices");
+    CHECK(cd::IndicesAddedBehindTheWindow({}, {L"baseline"}, {L"work"}).empty());
+}
+
+void Test_K6_EmptyBaselineAndWorkReportEveryLiveIndex() {
+    Case("K6 empty baseline and work report every live index");
+    const std::vector<std::size_t> expected = {0, 1, 2};
+    CHECK(cd::IndicesAddedBehindTheWindow({L"zero", L"one", L"two"}, {}, {}) == expected);
+}
+
+void Test_K7_KeyComparisonIsExactAndDoesNotFoldCase() {
+    Case("K7 keys differing only by case are treated as different");
+    const std::vector<std::size_t> expected = {0};
+    CHECK(cd::IndicesAddedBehindTheWindow({L"Profile"}, {L"profile"}, {L"profile"}) ==
+          expected);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -2842,6 +2894,15 @@ int main() {
     Test_J14_EmptyCanonicalOrderKeepsDisplayedOrder();
     Test_J15_EmptyDisplayedOrderStaysEmpty();
     Test_J16_DuplicateCanonicalStringsUseFirstIndexWithoutDroppingEntries();
+
+    std::printf("\n== K. Settings live-config reconciliation ==\n");
+    Test_K1_LiveEntryAddedBehindTheWindowIsReported();
+    Test_K2_ProfileDeletedInSettingsIsNotResurrected();
+    Test_K3_LiveEntryAlreadyInWorkIsNotDuplicated();
+    Test_K4_SeveralLiveAdditionsKeepAscendingIndexOrder();
+    Test_K5_EmptyLiveConfigReturnsNoIndices();
+    Test_K6_EmptyBaselineAndWorkReportEveryLiveIndex();
+    Test_K7_KeyComparisonIsExactAndDoesNotFoldCase();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);
