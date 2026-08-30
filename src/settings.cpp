@@ -2392,7 +2392,9 @@ std::wstring MaskParkedWarning(const SettingsState* st, const std::wstring& mask
     const std::wstring p = std::to_wstring(parked);
     if (parked == total) {
         return FormatFullyParkedMaskWarning(maskName, total,
-                                            st->env.amdVCacheServiceRunning);
+                                            st->env.amdVCacheServiceRunning,
+                                            st->env.amdVCacheServicePresent ||
+                                                st->env.amdVCacheDriverPresent);
     }
     if (parked * 2 > total) {
         return p + L" of " + n + L" processors in \"" + maskName +
@@ -2626,10 +2628,10 @@ struct WarningLayout {
     int cardH;
 };
 
-// The warning statics use UiSmall and SS_LEFT, whose default drawing path word-wraps.
-// Dp(36) preserves the old comfortable minimum; Dp(96) bounds pathological narrow-width
+// Measure wrapped static text using the control's actual font and assigned text width.
+// Dp(36) keeps a comfortable minimum; Dp(96) bounds pathological narrow-width
 // growth while leaving room for roughly six lines at the supported window widths.
-int MeasureWarningRow(HWND control, HDC dc, int textW, int dpi) {
+int MeasureWrappedStaticHeight(HWND control, HDC dc, int textW, int dpi) {
     const int floorH = theme::Dp(36, dpi);
     const int capH = theme::Dp(96, dpi);
     int height = floorH;
@@ -2664,9 +2666,9 @@ WarningLayout MeasureWarningLayout(SettingsState* st, HDC dc, int cardW, int dpi
     if (warning.textW < 1) warning.textW = 1;
 
     if (warning.game)
-        warning.gameH = MeasureWarningRow(st->hGameMaskWarn, dc, warning.textW, dpi);
+        warning.gameH = MeasureWrappedStaticHeight(st->hGameMaskWarn, dc, warning.textW, dpi);
     if (warning.heavy)
-        warning.heavyH = MeasureWarningRow(st->hHeavyMaskWarn, dc, warning.textW, dpi);
+        warning.heavyH = MeasureWrappedStaticHeight(st->hHeavyMaskWarn, dc, warning.textW, dpi);
 
     const int rows = (warning.game ? 1 : 0) + (warning.heavy ? 1 : 0);
     if (rows > 0)
@@ -3169,10 +3171,12 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hMapFail, ix, iy, iw, mapH);   // only ever one of the two exists
         y = c.bottom + GAP;
     } else {
-        const int vCacheDescH = 5 * LH;
+        int iw = W - 2 * PAD;
+        const int vCacheDescH = MeasureWrappedStaticHeight(
+            st->hVCacheManageDesc, measureDc, iw, dpi);
         const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW + vCacheDescH + GT + ROW;
         RECT c = AddCard(y, cardH, x0, W);
-        int ix = c.left + PAD, iy = c.top + PAD, iw = W - 2 * PAD;
+        int ix = c.left + PAD, iy = c.top + PAD;
         Put(st->hGenHdr, ix, iy, iw, HH);
         iy += HH + GT;
         Put(st->hStartup, ix, iy, theme::Dp(200, dpi), ROW);
@@ -4059,9 +4063,9 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 hwnd, L"STATIC",
                 L"Changing this needs administrator approval once and takes effect only after "
                 L"you restart Windows. It stays off until you turn it back on here. AMD's "
-                L"optimizer normally parks the non-cache CCD while a game runs; with it "
-                L"disabled that CCD stays available, so Game Optimizer's background mask can "
-                L"actually be used.",
+                L"optimizer parks the non-cache CCD while a game runs; disabling it stops the "
+                L"Windows side only. If your BIOS also has a 3D V-Cache or CCD parking option, "
+                L"that one is separate and is not affected by this setting.",
                 SS_LEFT, -1);
             st->hPollLbl = Mk(hwnd, L"STATIC", L"Poll interval (ms):", SS_LEFT, -1);
             st->hPoll = Mk(hwnd, L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
