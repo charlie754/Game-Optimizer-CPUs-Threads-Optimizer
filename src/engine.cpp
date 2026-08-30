@@ -56,6 +56,11 @@ bool SameGoverned(const std::vector<GovernedProcess>& a,
     for (size_t i = 0; i < a.size(); ++i) {
         if (a[i].pid != b[i].pid) return false;
         if (a[i].blocked != b[i].blocked) return false;
+        if (a[i].applyResult != b[i].applyResult) return false;
+        // Compared, or the settings window is never told that the auto-pinned SET moved while
+        // the count and the masks stayed the same - which is the one transition the new
+        // readout exists to show.
+        if (a[i].autoPinned != b[i].autoPinned) return false;
         if (a[i].maskName != b[i].maskName) return false;
         if (a[i].name != b[i].name) return false;
     }
@@ -153,10 +158,13 @@ bool ResolveMask(const Config& cfg, const std::wstring& name, std::vector<ULONG>
 std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
                                              const Config& cfg,
                                              DWORD foregroundPid,
-                                             std::vector<DWORD>& sticky,
-                                             const Profile** matchedProfile) {
+                                             std::vector<std::wstring>& sticky,
+                                             const Profile** matchedProfile,
+                                             DWORD selfPid,
+                                             std::set<DWORD>* autoPinnedOut) {
     std::map<DWORD, std::wstring> desired;
     if (matchedProfile) *matchedProfile = nullptr;
+    if (autoPinnedOut) autoPinnedOut->clear();
 
     // --- Rule 1: the first ENABLED SPECIFIC profile whose game matches a live process. ---
     // All Games profiles are skipped here and considered only in Rule 1b, so a specific
@@ -245,6 +253,23 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
     }
 
     // --- Rule 4: autoSet. ----------------------------------------------------------------
+    //
+    // OUR OWN SUBTREE IS NEVER A CANDIDATE. GameOptimizer.exe is on the default exclusion
+    // list, but an exclusion is matched by NAME and our children do not share our name: the
+    // sponsor panel runs in msedgewebview2.exe, which spawns children of its own, and every
+    // one of them was being auto-pinned. Adding that name to the exclusion list would spare
+    // the wrong processes - the same executable hosts unrelated trees under Windows' own
+    // SearchHost.exe - so the test is descent from selfPid, not the image name.
+    //
+    // Descendants() is reused rather than re-walked here on purpose: it is the one place
+    // that knows a ppid is only an edge when the parent is live AND was created no later
+    // than the child, and a second walk would be a second chance to get that wrong.
+    std::set<DWORD> selfSet;
+    if (selfPid != 0 && !IsReservedPid(selfPid) && snap.Find(selfPid) != nullptr) {
+        const std::vector<DWORD> mine = snap.Descendants(selfPid);
+        selfSet.insert(mine.begin(), mine.end());
+    }
+
     std::set<DWORD> autoSet;
     if (prof->autoPin) {
         // FIXED DEBOUNCE, in ticks. autoPinSeconds is no longer a user setting - the seconds
@@ -262,29 +287,40 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
                 DWORD pid = it->first;
                 if (IsReservedPid(pid)) continue;
                 if (gameSet.find(pid) != gameSet.end()) continue;
+                if (selfSet.find(pid) != selfSet.end()) continue;
                 if (cfg.IsExcluded(it->second.name)) continue;
                 if (it->second.aboveThresholdTicks < kAutoPinDebounceTicks) continue;
-                if (std::find(sticky.begin(), sticky.end(), pid) == sticky.end())
-                    sticky.push_back(pid);
+
+                // Admission is per executable because that is the unit the settings list
+                // presents and rule 3 already uses. Keep the snapshot's basename verbatim;
+                // FindBySpec applies the same ordinal case-insensitive matching as rule 3.
+                const std::wstring& exeName = it->second.name;
+                if (exeName.empty()) continue;
+                bool alreadyAdmitted = false;
+                for (size_t i = 0; i < sticky.size(); ++i) {
+                    if (IEquals(sticky[i], exeName)) { alreadyAdmitted = true; break; }
+                }
+                if (!alreadyAdmitted) sticky.push_back(exeName);
             }
         }
 
-        // Once admitted, a pid stays pinned for as long as it is alive and the game is
-        // running, regardless of its CURRENT cpu% and regardless of where the foreground
-        // is now. Alt-tabbing during a match, or a compile finishing, must not flap a mask.
-        std::vector<DWORD> stillLive;
-        stillLive.reserve(sticky.size());
+        // Once admitted, an executable name stays sticky while the game runs, regardless of
+        // current CPU%, foreground, or whether all of its processes briefly exit. Expanding
+        // through the same matcher as rule 3 every tick makes later processes join without
+        // attaching session state to a reusable pid. Every group member is then vetted on
+        // its own: expansion must not smuggle a reserved, game, excluded, or self pid in.
         for (size_t i = 0; i < sticky.size(); ++i) {
-            DWORD pid = sticky[i];
-            if (IsReservedPid(pid)) continue;
-            const ProcInfo* pi = snap.Find(pid);
-            if (!pi) continue;                       // exited - drop it from the sticky list
-            stillLive.push_back(pid);
-            if (gameSet.find(pid) != gameSet.end()) continue;   // gameSet vetoes
-            if (cfg.IsExcluded(pi->name)) continue;             // exclusion vetoes
-            autoSet.insert(pid);
+            const std::vector<DWORD> hits = snap.FindBySpec(sticky[i]);
+            for (size_t h = 0; h < hits.size(); ++h) {
+                const DWORD pid = hits[h];
+                if (IsReservedPid(pid)) continue;
+                if (gameSet.find(pid) != gameSet.end()) continue;
+                if (selfSet.find(pid) != selfSet.end()) continue;
+                const ProcInfo* pi = snap.Find(pid);
+                if (!pi || cfg.IsExcluded(pi->name)) continue;
+                autoSet.insert(pid);
+            }
         }
-        sticky.swap(stillLive);
     } else {
         sticky.clear();
     }
@@ -300,9 +336,49 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
         if (gameSet.find(*it) != gameSet.end()) continue;
         if (heavySet.find(*it) != heavySet.end()) continue;
         desired[*it] = prof->heavyMask;
+        // Reported HERE and not from autoSet, so the published set is exactly the pids whose
+        // mask this rule actually decided. A pid autoSet also holds but gameSet or heavySet
+        // won would otherwise be labelled "the app chose this" in the UI when the user did.
+        if (autoPinnedOut) autoPinnedOut->insert(*it);
     }
 
     return desired;
+}
+
+// ---------------------------------------------------------------------------
+// AutoPinnedExeNames - pure
+// ---------------------------------------------------------------------------
+
+std::vector<std::wstring> AutoPinnedExeNames(const EngineStatus& st,
+                                             const std::vector<std::wstring>& alreadyListed) {
+    std::set<std::wstring> skip;
+    for (size_t i = 0; i < alreadyListed.size(); ++i) {
+        const std::wstring key = ToLower(BaseName(Trim(alreadyListed[i])));
+        if (!key.empty()) skip.insert(key);
+    }
+
+    // Keyed on the lowercased basename, valued with the casing the SNAPSHOT reported, so the
+    // row reads "NVIDIA Broadcast.exe" rather than a flattened one. Sorted by the key, which
+    // is what makes the order stable across ticks: a list that re-ordered itself once a
+    // second would be unreadable, and this is redrawn once a second.
+    std::map<std::wstring, std::wstring> byKey;
+    for (size_t i = 0; i < st.governed.size(); ++i) {
+        const GovernedProcess& g = st.governed[i];
+        if (!g.autoPinned) continue;
+        const std::wstring name = BaseName(Trim(g.name));
+        if (name.empty()) continue;                   // unreadable: nothing honest to print
+        const std::wstring key = ToLower(name);
+        if (skip.find(key) != skip.end()) continue;
+        if (byKey.find(key) == byKey.end()) byKey[key] = name;
+    }
+
+    std::vector<std::wstring> out;
+    out.reserve(byKey.size());
+    for (std::map<std::wstring, std::wstring>::const_iterator it = byKey.begin();
+         it != byKey.end(); ++it) {
+        out.push_back(it->second);
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,6 +413,7 @@ struct Engine::Impl {
         std::wstring name;
         ULONGLONG creationTime = 0;
         bool blocked = false;
+        ApplyResult applyResult = ApplyResult::OtherError;
     };
 
     // --- guarded by mu ---------------------------------------------------------------
@@ -353,7 +430,7 @@ struct Engine::Impl {
     std::mutex tickMu;
     ProcessSnapshot prevSnap;
     bool havePrev = false;
-    std::vector<DWORD> sticky;
+    std::vector<std::wstring> sticky;
     std::map<DWORD, AppliedRec> applied;
     std::wstring lastProfileName;
 
@@ -548,6 +625,7 @@ int Engine::Impl::Tick() {
 
     const Profile* matched = nullptr;
     std::map<DWORD, std::wstring> desired;
+    std::set<DWORD> autoPinned;
     if (pausedCopy) {
         // Paused means "govern nothing". An empty desired map makes the diff below clear
         // every applied mask on this very tick, and keeps clearing it until resumed.
@@ -557,7 +635,11 @@ int Engine::Impl::Tick() {
         // the decision function stays pure and unit-testable. No-op unless an enabled All
         // Games profile exists.
         RefreshAllGamesSpec(cfgCopy, fresh);
-        desired = ComputeDesired(fresh, cfgCopy, GetForegroundPid(), sticky, &matched);
+        // GetCurrentProcessId is the other impure half, for the same reason and by the same
+        // route: rule 4 must not pin the app's own sponsor-panel browser subtree, and the
+        // pure function is told which pid is ours rather than asking Win32 itself.
+        desired = ComputeDesired(fresh, cfgCopy, GetForegroundPid(), sticky, &matched,
+                                 GetCurrentProcessId(), &autoPinned);
     }
 
     // GAME DETECTION SIGNAL (operator request 9) is NOT implemented, on purpose.
@@ -623,6 +705,7 @@ int Engine::Impl::Tick() {
         if (isNew) JournalAdd(pid, rec.creationTime, rec.name);
 
         ApplyOutcome oc = want.empty() ? ClearCpuSets(pid) : ApplyCpuSets(pid, ids);
+        rec.applyResult = oc.result;
         if (oc.result == ApplyResult::Ok) {
             applied[pid] = rec;
         } else if (oc.result == ApplyResult::Gone) {
@@ -691,8 +774,11 @@ int Engine::Impl::Tick() {
         g.maskName = it->second;
         const ProcInfo* pi = fresh.Find(it->first);
         if (pi) g.name = pi->name;
+        g.autoPinned = (autoPinned.find(it->first) != autoPinned.end());
         std::map<DWORD, AppliedRec>::const_iterator a = applied.find(it->first);
         g.blocked = (a != applied.end() && a->second.blocked);
+        g.applyResult = a != applied.end() ? a->second.applyResult
+                                           : ApplyResult::OtherError;
         if (g.blocked) ++st.blockedCount;
         if (gameFamily.find(it->first) != gameFamily.end()) ++st.gameProcCount;
         else ++st.heavyCount;

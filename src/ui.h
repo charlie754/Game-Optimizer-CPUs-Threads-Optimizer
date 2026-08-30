@@ -19,6 +19,9 @@ constexpr UINT WM_APP_TRAY   = WM_APP + 1;   // Shell_NotifyIcon callback
 constexpr UINT WM_APP_STATUS = WM_APP + 2;   // engine -> UI, "status changed, redraw"
 
 // ---- Tray menu command ids -------------------------------------------------
+// Explorer uses the lowest resource id for the app icon, so keep this below the 40000+ menu ids.
+constexpr UINT IDI_APPICON = 101;
+
 enum : UINT {
     IDM_STATUS = 40000,      // disabled, shows the status line
     IDM_SETTINGS,

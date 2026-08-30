@@ -23,6 +23,9 @@ else, and clears every mask the moment the game exits.
 - **One optional runtime dependency: WebView2.** It is used for the sponsor strip in the
   Settings window and for nothing else. See below — the app runs, and looks right, without it.
 
+**Runs on:** Windows 10 or 11, x64. The manifest declares no older Windows, and there is no
+32-bit or ARM build.
+
 ## WebView2 — the one optional runtime dependency
 
 It was true until 2026-08-29 that this app had **no** runtime dependency at all. That sentence
@@ -49,9 +52,9 @@ What that does and does not mean:
   all destroyed when that window closes. While the app sits in the tray — which is nearly all
   of its life — there is no browser and no extra process. Nothing on the startup path touches
   it.
-- **The page is inside the binary.** It is generated into `src\sponsor_html.h` by
-  `python tools\gen-sponsor-html.py`, which is run by hand and whose output is committed with
-  the source. The app never reads the extension's files at run time and does not depend on any
+- **The page is inside the binary.** In the repository it is generated into `src\sponsor_html.h`
+  by `python tools\gen-sponsor-html.py`, run by hand, with the output committed alongside the
+  source; neither file is in this download. The app never reads the extension's files at run time and does not depend on any
   path outside its own tree.
 - **Links leave.** Every navigation the page attempts is cancelled and handed to
   `ShellExecuteW`, so a click opens your normal browser. Only the three URLs in
@@ -62,10 +65,11 @@ What that does and does not mean:
   Microsoft runtime may do on its own. If that matters to you, do not install WebView2: the
   app then uses the GDI strip and this component never loads.
 
-`WebView2Loader.dll` is Microsoft's redistributable loader and is vendored under
-`third_party\webview2\x64\`; see `NOTICE.md`. It is loaded with `LoadLibraryW` at run time and
-is deliberately **not** in the exe's import table, so its absence can never stop the app
-starting.
+`WebView2Loader.dll` is Microsoft's redistributable loader; see `NOTICE.md`. In a downloaded
+release it sits beside `GameOptimizer.exe`, which is the **first** place the app looks — keep it
+there. (It then tries the installed Edge WebView2 runtime, then the default search path.) (In the source repository it is vendored under `third_party\webview2\x64\` and
+the build copies it next to the binary.) It is loaded with `LoadLibraryW` at run time and is
+deliberately **not** in the exe's import table, so its absence can never stop the app starting.
 
 ## Status
 
@@ -85,7 +89,38 @@ programs; that outcome cannot be prevented or detected by this app.
 
 Use it on anti-cheat-protected titles at your own risk.
 
-## Build
+## What is in this download
+
+Eight files. There is no installer, no service and no driver, and nothing is written outside your
+user profile.
+
+| File | What it is |
+|---|---|
+| `GameOptimizer.exe` | **The app. Double-click this one.** |
+| `WebView2Loader.dll` | Microsoft's WebView2 loader. **Keep it in the same folder as the exe** — that is the first place the app looks for it. It is optional: without it the Settings window draws its sponsor strip with GDI instead and nothing else changes. |
+| `README.md` | This file. |
+| `LICENSE` | MIT, for Game Optimizer itself. |
+| `NOTICE.md` | What is bundled, where it came from, and what is not third-party. |
+| `third_party\webview2\LICENSE.txt` | Microsoft's licence for the loader above. |
+| `third_party\webview2\NOTICE.txt` | Microsoft's notices for the same. |
+| `third_party\webview2\README.md` | Which SDK package version that loader came from. |
+
+The `third_party\webview2\` folder is **documentation only** — nothing in it is loaded at run
+time. To remove Game Optimizer: Exit from the tray icon, delete the folder you unzipped, and delete
+`%LOCALAPPDATA%\GameOptimizer\` if you want its settings gone too.
+
+**If Windows says the file is blocked**, that is the mark-of-the-web that lands on anything
+downloaded. Right-click the **zip** before extracting, Properties, tick **Unblock**, OK, then
+extract.
+
+**It never asks for administrator rights.** The manifest requests `asInvoker`, so double-clicking
+it raises no UAC prompt. (You can still force one yourself with Run as administrator; nothing
+in the app needs it.)
+
+## Build from source
+
+None of this is in the download — it is for the repository at
+<https://github.com/charlie754/Game-Optimizer-CPUs-Threads-Optimizer>.
 
 Requires MSVC (Build Tools 2019 or newer) and a Windows 10 SDK. No other dependencies.
 
@@ -119,15 +154,22 @@ That is once, for that copy of the file. Nothing here asks you to turn SmartScre
 Defender exclusion, or change any other security setting; none of that is needed to run this.
 
 "Unrecognised" is exactly what it says: no signature and no download reputation. It is not a
-statement about what is in the file. What this project offers instead of a signature is that the
-whole source is public and builds with MSVC via `tools\build.bat`, so you can read what it does
-and produce the binary yourself. A copy you compiled locally does not normally carry the
-downloaded-file marker this check is keyed to, so the prompt is a thing downloaders meet rather
-than builders.
+statement about what is in the file. What this project offers instead of a signature is that
+[the whole source is public](https://github.com/charlie754/Game-Optimizer-CPUs-Threads-Optimizer)
+and builds with MSVC via `tools\build.bat` in that repository (not in this zip), so you can read
+what it does and produce the binary yourself. A copy you compiled locally does not normally carry
+the downloaded-file marker this check is keyed to, so the prompt is a thing downloaders meet
+rather than builders.
 
 ## Use
 
-Run it. It lives in the tray.
+Double-click `GameOptimizer.exe`. The Settings window opens and the app gets a taskbar button,
+plus an icon in the notification area.
+
+**Closing the Settings window does not quit the app.** It returns to the tray and keeps working.
+The tray icon's **Settings** item brings the window back; **Exit** is what actually quits, and
+quitting clears every mask it applied. If you turn on **Start with Windows**, the app starts
+quietly at login with no window.
 
 On first launch it detects your topology, shows you a core map, and asks you to confirm it
 before anything is applied. Then pick a game — from the running-process list or by browsing to
@@ -144,6 +186,14 @@ sustains more than N% CPU for M seconds while the game is in the foreground is m
 background mask too.
 
 Configuration is a plain INI file at `%LOCALAPPDATA%\GameOptimizer\config.ini`, editable by hand.
+
+**If it is killed rather than closed** — Task Manager, a crash, a power cut — the assignments it
+had applied are recorded in `%LOCALAPPDATA%\GameOptimizer\applied.journal`, and the next start
+reads that journal and tries to clear each one, writing the result of every attempt to
+`%LOCALAPPDATA%\GameOptimizer\GameOptimizer.log`. An entry it cannot clear is **logged as
+FAILED and not retried later**, so the log is the place to check rather than an assumption.
+Rebooting is the guaranteed reset: a CPU Set assignment belongs to a running process and does
+not survive one.
 
 ### Upgrading from the "CoreDirector" builds
 
@@ -187,7 +237,8 @@ Being specific here rather than implying more coverage than exists.
   returns TRUE, the getter echoes every id back, and the threads run elsewhere at full speed.
 - That an invalid CPU Set Id returns error **813** (`ERROR_CPU_SET_INVALID`) and leaves the
   previous assignment intact.
-- End-to-end, via `build\gateb_probe.exe`: a masked process runs **only** on the assigned
+- End-to-end, via `build\gateb_probe.exe` (a probe built from the repository, not shipped
+  here): a masked process runs **only** on the assigned
   processors; a **grandchild spawned after the parent was masked** is confined too when the
   engine is running, and runs on all 32 logical processors when it is not — which is the
   product's whole reason to exist, demonstrated rather than asserted.
@@ -214,10 +265,12 @@ map shows live parked state and Settings offers *Verify placement*.
 
 ## Documentation
 
-- [Product spec](docs/spec/01-product-spec.md) — who it is for, profiles, first run, non-goals
-- [Architecture](docs/spec/02-architecture.md) — topology, watcher, inheritance, config schema
-- [Risks](docs/spec/03-risks.md) — anti-cheat, elevation, Game Mode, wrong-CCD detection
-- [Measurements](docs/spec/04-measurements.md) — the evidence, including two claims it overturned
+- [Product spec](https://github.com/charlie754/Game-Optimizer-CPUs-Threads-Optimizer/blob/main/docs/spec/01-product-spec.md) — who it is for, profiles, first run, non-goals
+- [Architecture](https://github.com/charlie754/Game-Optimizer-CPUs-Threads-Optimizer/blob/main/docs/spec/02-architecture.md) — topology, watcher, inheritance, config schema
+- [Risks](https://github.com/charlie754/Game-Optimizer-CPUs-Threads-Optimizer/blob/main/docs/spec/03-risks.md) — anti-cheat, elevation, Game Mode, wrong-CCD detection
+- [Measurements](https://github.com/charlie754/Game-Optimizer-CPUs-Threads-Optimizer/blob/main/docs/spec/04-measurements.md) — the evidence, including two claims it overturned
+
+Source, issues and releases: <https://github.com/charlie754/Game-Optimizer-CPUs-Threads-Optimizer>
 
 ## Credits and licence
 

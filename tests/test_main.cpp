@@ -26,6 +26,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -33,7 +34,10 @@
 #include "config.h"
 #include "engine.h"
 #include "procwatch.h"
+#include "settings_environment.h"
+#include "settings_warning.h"
 #include "topology.h"
+#include "util.h"
 
 // ===========================================================================
 // Private-member access for ProcessSnapshot (header untouched).
@@ -1335,7 +1339,7 @@ void Test_B13_MarkProfileUsed() {
 }
 
 void Test_B9_IsExcludedCaseInsensitive() {
-    Case("B9 IsExcluded is case-insensitive");
+    Case("B9 IsExcluded is case-insensitive and supports exclusion-only trailing wildcards");
     cd::Topology t = MakeReference(false);
     cd::Config c = cd::DefaultConfig(t);
 
@@ -1344,11 +1348,92 @@ void Test_B9_IsExcludedCaseInsensitive() {
     CHECK(c.IsExcluded(L"AudioDg.Exe"));
     CHECK(!c.IsExcluded(L"zz_not_a_real_process_qqq.exe"));
 
+    // A trailing '*' is a case-insensitive prefix wildcard for exclusions only.
+    cd::Config wildcard;
+    wildcard.exclusions.push_back(L"NVIDIA Broadcast*");
+    CHECK(wildcard.IsExcluded(L"NVIDIA Broadcast 1.exe"));
+    CHECK(wildcard.IsExcluded(L"nvidia broadcast.exe"));
+    CHECK(!wildcard.IsExcluded(L"NVIDIA Broad.exe"));
+    CHECK(!wildcard.IsExcluded(L"OBS.exe"));
+
+    // A '*' anywhere else remains an ordinary literal character, and a bare '*' is ignored
+    // so a malformed hand-edited entry cannot disable auto-pin for the whole machine.
+    cd::Config literal;
+    literal.exclusions.push_back(L"NVIDIA*Broadcast.exe");
+    CHECK(literal.IsExcluded(L"NVIDIA*Broadcast.exe"));
+    CHECK(!literal.IsExcluded(L"NVIDIA Camera Broadcast.exe"));
+    literal.exclusions.clear();
+    literal.exclusions.push_back(L"*");
+    CHECK(!literal.IsExcluded(L"anything.exe"));
+
+    // Ordinary entries retain their exact-match behavior; they are not prefixes.
+    cd::Config exact;
+    exact.exclusions.push_back(L"audiodg.exe");
+    CHECK(exact.IsExcluded(L"AUDIODG.EXE"));
+    CHECK(!exact.IsExcluded(L"audiodg.exe.backup"));
+
     cd::Config d;
     d.exclusions = cd::DefaultExclusions();
     CHECK(!d.exclusions.empty());
     CHECK(d.IsExcluded(L"AUDIODG.EXE"));
+    CHECK(d.IsExcluded(L"NVIDIA Broadcast 1.exe"));
     CHECK(!d.IsExcluded(L"zz_not_a_real_process_qqq.exe"));
+}
+
+void Test_B14_DefaultExclusionsProtectAtieclxx() {
+    Case("B14 default exclusions protect AMD display-driver client atieclxx only");
+    const cd::Config c = cd::DefaultConfig(MakeReference(false));
+    CHECK(c.IsExcluded(L"atieclxx.exe"));
+    CHECK(!c.IsExcluded(L"atieclxx-helper.exe"));
+}
+
+void Test_B15_DefaultExclusionsProtectAtiesrxx() {
+    Case("B15 default exclusions protect AMD display-driver service atiesrxx only");
+    const cd::Config c = cd::DefaultConfig(MakeReference(false));
+    CHECK(c.IsExcluded(L"atiesrxx.exe"));
+    CHECK(!c.IsExcluded(L"atiesrxx-helper.exe"));
+}
+
+void Test_B16_DefaultExclusionsProtectAmdow() {
+    Case("B16 default exclusions protect AMD display-driver helper amdow only");
+    const cd::Config c = cd::DefaultConfig(MakeReference(false));
+    CHECK(c.IsExcluded(L"amdow.exe"));
+    CHECK(!c.IsExcluded(L"amdow-helper.exe"));
+}
+
+void Test_B17_DefaultExclusionsProtectAmd3dvcachePrefix() {
+    Case("B17 default exclusions protect AMD V-Cache optimizer prefix only");
+    const cd::Config c = cd::DefaultConfig(MakeReference(false));
+    CHECK(c.IsExcluded(L"amd3dvcacheSvc.exe"));
+    CHECK(!c.IsExcluded(L"amd3dvideo.exe"));
+}
+
+void Test_B18_DefaultExclusionsProtectAmdfendrPrefix() {
+    Case("B18 default exclusions protect AMD Crash Defender prefix only");
+    const cd::Config c = cd::DefaultConfig(MakeReference(false));
+    CHECK(c.IsExcluded(L"amdfendrsr.exe"));
+    CHECK(!c.IsExcluded(L"amddefender.exe"));
+}
+
+void Test_B19_DefaultExclusionsProtectAmdAppCompatPrefix() {
+    Case("B19 default exclusions protect AMD app-compatibility service prefix only");
+    const cd::Config c = cd::DefaultConfig(MakeReference(false));
+    CHECK(c.IsExcluded(L"AmdAppCompatSvc.exe"));
+    CHECK(!c.IsExcluded(L"AmdApplication.exe"));
+}
+
+void Test_B20_DefaultExclusionsProtectAmdPpkgPrefix() {
+    Case("B20 default exclusions protect AMD provisioning-package service prefix only");
+    const cd::Config c = cd::DefaultConfig(MakeReference(false));
+    CHECK(c.IsExcluded(L"AmdPpkgSvc.exe"));
+    CHECK(!c.IsExcluded(L"AmdPackageManager.exe"));
+}
+
+void Test_B21_DefaultExclusionsProtectAmdRsSourceExtension() {
+    Case("B21 default exclusions protect AMD Radeon source extension only");
+    const cd::Config c = cd::DefaultConfig(MakeReference(false));
+    CHECK(c.IsExcluded(L"AMDRSSrcExt.exe"));
+    CHECK(!c.IsExcluded(L"AMDRSSrcExt-helper.exe"));
 }
 
 // ===========================================================================
@@ -1439,7 +1524,7 @@ void Test_C1_NoMatch() {
     AddProc(s, 500, 400, L"explorer.exe", 100, 0, 0.0);
     AddProc(s, 3000, 500, L"OBS.exe", 150, 0, 0.0);  // heavy is live, the game is not
 
-    std::vector<DWORD> sticky;
+    std::vector<std::wstring> sticky;
     const cd::Profile* matched = reinterpret_cast<const cd::Profile*>(0x1);
     std::map<DWORD, std::wstring> res = cd::ComputeDesired(s, c, 500, sticky, &matched);
 
@@ -1452,7 +1537,7 @@ void Test_C1_NoMatch() {
     cd::Config c2 = MakeEngineConfig(t, false);
     c2.profiles[0].enabled = false;
     cd::ProcessSnapshot s2 = MakeGameSnapshot();
-    std::vector<DWORD> sticky2;
+    std::vector<std::wstring> sticky2;
     const cd::Profile* matched2 = reinterpret_cast<const cd::Profile*>(0x1);
     std::map<DWORD, std::wstring> res2 = cd::ComputeDesired(s2, c2, 1000, sticky2, &matched2);
     CHECK_EQ((int)res2.size(), 0);
@@ -1470,7 +1555,7 @@ void Test_C2_C3_C4_C5_C8() {
     CHECK(std::find(desc.begin(), desc.end(), 1004u) != desc.end());  // OBS child IS one too
     CHECK_EQ((int)s.FindBySpec(L"OBS.exe").size(), 2);
 
-    std::vector<DWORD> sticky;
+    std::vector<std::wstring> sticky;
     const cd::Profile* matched = nullptr;
     std::map<DWORD, std::wstring> res = cd::ComputeDesired(s, c, 1000, sticky, &matched);
 
@@ -1507,7 +1592,7 @@ void Test_C8b_ZeroAndFourViaHeavyList() {
     c.profiles[0].heavy.push_back(L"Idle");
 
     cd::ProcessSnapshot s = MakeGameSnapshot();
-    std::vector<DWORD> sticky;
+    std::vector<std::wstring> sticky;
     const cd::Profile* matched = nullptr;
     std::map<DWORD, std::wstring> res = cd::ComputeDesired(s, c, 1000, sticky, &matched);
 
@@ -1526,7 +1611,7 @@ void Test_C6_AutoPinInertWhenForegroundNotInGameSet() {
     AddProc(s, 4000, 500, L"transcoder.exe", 140, 40, 25.0);  // well past the threshold
 
     // Foreground is explorer, which is NOT in the game set.
-    std::vector<DWORD> sticky;
+    std::vector<std::wstring> sticky;
     const cd::Profile* matched = nullptr;
     std::map<DWORD, std::wstring> res = cd::ComputeDesired(s, c, 500, sticky, &matched);
     CHECK(matched != nullptr);
@@ -1536,12 +1621,12 @@ void Test_C6_AutoPinInertWhenForegroundNotInGameSet() {
     // POSITIVE CONTROL: identical snapshot, foreground moved to the game, and the very same
     // process IS auto-pinned. Without this, C6 would pass on an engine where auto-pin is
     // simply broken.
-    std::vector<DWORD> sticky2;
+    std::vector<std::wstring> sticky2;
     const cd::Profile* matched2 = nullptr;
     std::map<DWORD, std::wstring> res2 = cd::ComputeDesired(s, c, 1000, sticky2, &matched2);
     CHECK(matched2 != nullptr);
     CHECK_EQ(MaskOf(res2, 4000), L"Freq");
-    CHECK(std::find(sticky2.begin(), sticky2.end(), 4000u) != sticky2.end());
+    CHECK(std::find(sticky2.begin(), sticky2.end(), L"transcoder.exe") != sticky2.end());
 
     // REWRITTEN for the fixed debounce. This block used to read "3 ticks * 250 ms = 750 ms
     // < the profile's 5 s hold". autoPinSeconds is no longer a user setting (config.h), so
@@ -1550,7 +1635,7 @@ void Test_C6_AutoPinInertWhenForegroundNotInGameSet() {
     CHECK_EQ(cd::kAutoPinDebounceTicks, 2);   // fixture assumption, stated out loud
     cd::ProcessSnapshot s3 = MakeGameSnapshot();
     AddProc(s3, 4001, 500, L"briefly_busy.exe", 140, cd::kAutoPinDebounceTicks - 1, 25.0);
-    std::vector<DWORD> sticky3;
+    std::vector<std::wstring> sticky3;
     const cd::Profile* matched3 = nullptr;
     std::map<DWORD, std::wstring> res3 = cd::ComputeDesired(s3, c, 1000, sticky3, &matched3);
     CHECK(matched3 != nullptr);
@@ -1560,7 +1645,7 @@ void Test_C6_AutoPinInertWhenForegroundNotInGameSet() {
     // assertion above would also pass on an engine that never auto-pins anything.
     cd::ProcessSnapshot s3b = MakeGameSnapshot();
     AddProc(s3b, 4001, 500, L"briefly_busy.exe", 140, cd::kAutoPinDebounceTicks, 25.0);
-    std::vector<DWORD> sticky3b;
+    std::vector<std::wstring> sticky3b;
     const cd::Profile* matched3b = nullptr;
     std::map<DWORD, std::wstring> res3b = cd::ComputeDesired(s3b, c, 1000, sticky3b, &matched3b);
     CHECK(matched3b != nullptr);
@@ -1570,7 +1655,7 @@ void Test_C6_AutoPinInertWhenForegroundNotInGameSet() {
     // different poll interval gives the same answer. A seconds-based hold would not.
     cd::Config cSlow = MakeEngineConfig(t, true);
     cSlow.pollMs = 2000;
-    std::vector<DWORD> sticky3c;
+    std::vector<std::wstring> sticky3c;
     const cd::Profile* matched3c = nullptr;
     std::map<DWORD, std::wstring> res3c = cd::ComputeDesired(s3b, cSlow, 1000, sticky3c, &matched3c);
     CHECK(matched3c != nullptr);
@@ -1579,20 +1664,44 @@ void Test_C6_AutoPinInertWhenForegroundNotInGameSet() {
     // An EXCLUDED process is never auto-pinned (rule 4: "not excluded").
     cd::ProcessSnapshot s4 = MakeGameSnapshot();
     AddProc(s4, 4002, 500, L"encoder.exe", 140, 40, 25.0);  // "encoder.exe" is excluded
-    std::vector<DWORD> sticky4;
+    std::vector<std::wstring> sticky4;
     const cd::Profile* matched4 = nullptr;
     std::map<DWORD, std::wstring> res4 = cd::ComputeDesired(s4, c, 1000, sticky4, &matched4);
     CHECK(matched4 != nullptr);
     CHECK(!Has(res4, 4002));
+
+    Case("C6b NVIDIA Broadcast wildcard blocks auto-pin, while an exact manual Heavy entry wins");
+    cd::Config broadcastConfig = MakeEngineConfig(t, true);
+    broadcastConfig.exclusions = cd::DefaultExclusions();
+    cd::ProcessSnapshot broadcastSnapshot = MakeGameSnapshot();
+    AddProc(broadcastSnapshot, 4003, 500, L"NVIDIA Broadcast 1.exe", 145, 40, 25.0);
+
+    std::vector<std::wstring> broadcastSticky;
+    const cd::Profile* broadcastMatched = nullptr;
+    std::map<DWORD, std::wstring> broadcastResult =
+        cd::ComputeDesired(broadcastSnapshot, broadcastConfig, 1000, broadcastSticky,
+                           &broadcastMatched);
+    CHECK(broadcastMatched != nullptr);
+    CHECK(!Has(broadcastResult, 4003));
+    CHECK(std::find(broadcastSticky.begin(), broadcastSticky.end(),
+                    L"NVIDIA Broadcast 1.exe") == broadcastSticky.end());
+
+    // Rule 3 is deliberate: the user's exact Heavy entry outranks an exclusion.
+    broadcastConfig.profiles[0].heavy.push_back(L"NVIDIA Broadcast 1.exe");
+    broadcastSticky.clear();
+    broadcastResult = cd::ComputeDesired(broadcastSnapshot, broadcastConfig, 1000,
+                                         broadcastSticky, &broadcastMatched);
+    CHECK_EQ(MaskOf(broadcastResult, 4003), L"Freq");
 }
 
 void Test_C7_Stickiness() {
-    Case("C7 once auto-pinned, a pid stays pinned after its CPU drops, until the game exits");
+    Case("C7 once auto-pinned, an executable stays pinned after its CPU drops, until the "
+         "game exits");
     cd::Topology t = MakeReference(false);
     cd::Config c = MakeEngineConfig(t, true);
     c.pollMs = 250;
 
-    std::vector<DWORD> sticky;
+    std::vector<std::wstring> sticky;
     const cd::Profile* matched = nullptr;
 
     // Tick 1: busy, foreground is the game -> auto-pinned.
@@ -1601,7 +1710,7 @@ void Test_C7_Stickiness() {
     std::map<DWORD, std::wstring> r1 = cd::ComputeDesired(s1, c, 1000, sticky, &matched);
     CHECK(matched != nullptr);
     CHECK_EQ(MaskOf(r1, 4000), L"Freq");
-    CHECK(std::find(sticky.begin(), sticky.end(), 4000u) != sticky.end());
+    CHECK(std::find(sticky.begin(), sticky.end(), L"transcoder.exe") != sticky.end());
 
     // Tick 2: same process, CPU has collapsed. It must STAY pinned.
     cd::ProcessSnapshot s2 = MakeGameSnapshot();
@@ -1625,6 +1734,214 @@ void Test_C7_Stickiness() {
     std::map<DWORD, std::wstring> r4 = cd::ComputeDesired(s4, c, 500, sticky, &matched4);
     CHECK(matched4 == nullptr);
     CHECK_EQ((int)r4.size(), 0);
+}
+
+// pid 9000 GameOptimizer.exe       <- US
+// pid 9001 msedgewebview2.exe      <- our sponsor panel, our child
+// pid 9002 msedgewebview2.exe      <- a child of THAT
+// pid 8000 SearchHost.exe          <- Windows' own, nothing to do with us
+// pid 8001 msedgewebview2.exe      <- ITS child: the SAME executable name, NOT ours
+// Every one of them is well past the threshold and well past the debounce, so the only
+// thing that can separate them is descent.
+cd::ProcessSnapshot MakeSelfSubtreeSnapshot() {
+    cd::ProcessSnapshot s = MakeGameSnapshot();
+    AddProc(s, 9000, 500, L"GameOptimizer.exe", 600, 40, 25.0);
+    AddProc(s, 9001, 9000, L"msedgewebview2.exe", 610, 40, 25.0);
+    AddProc(s, 9002, 9001, L"msedgewebview2.exe", 620, 40, 25.0);
+    AddProc(s, 8000, 500, L"SearchHost.exe", 605, 40, 25.0);
+    AddProc(s, 8001, 8000, L"msedgewebview2.exe", 615, 40, 25.0);
+    return s;
+}
+
+void Test_C9_SelfSubtreeIsNeverAutoPinned() {
+    Case("C9 rule 4 never auto-pins our own process or its descendants, and separates them "
+         "by PARENTAGE rather than by executable name");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeEngineConfig(t, true);
+
+    cd::ProcessSnapshot s = MakeSelfSubtreeSnapshot();
+    std::vector<std::wstring> sticky;
+    const cd::Profile* matched = nullptr;
+    std::map<DWORD, std::wstring> res =
+        cd::ComputeDesired(s, c, 1000, sticky, &matched, 9000);
+    CHECK(matched != nullptr);
+    CHECK(!Has(res, 9000));
+    CHECK(!Has(res, 9001));
+    CHECK(!Has(res, 9002));
+
+    // The self-only executable is not admitted. msedgewebview2.exe is admitted by the valid
+    // SearchHost child below, so the output assertions above prove its self-owned members are
+    // re-vetoed after name-group expansion rather than admitted by association.
+    CHECK(std::find(sticky.begin(), sticky.end(), L"GameOptimizer.exe") == sticky.end());
+    CHECK(std::find(sticky.begin(), sticky.end(), L"msedgewebview2.exe") != sticky.end());
+
+    // THE NAME-COLLISION CONTROL, and the whole reason this rule is parentage and not another
+    // line on the exclusion list: the same executable under SearchHost.exe is a genuine
+    // background load the user may well want moved, and it still is.
+    CHECK_EQ(MaskOf(res, 8001), L"Freq");
+    CHECK_EQ(MaskOf(res, 8000), L"Freq");
+
+    // POSITIVE CONTROL: the identical snapshot with no self pid pins all three. Without it,
+    // C9 would pass just as happily on an engine whose auto-pin never fires at all.
+    std::vector<std::wstring> sticky2;
+    const cd::Profile* matched2 = nullptr;
+    std::map<DWORD, std::wstring> res2 = cd::ComputeDesired(s, c, 1000, sticky2, &matched2);
+    CHECK_EQ(MaskOf(res2, 9000), L"Freq");
+    CHECK_EQ(MaskOf(res2, 9001), L"Freq");
+    CHECK_EQ(MaskOf(res2, 9002), L"Freq");
+
+    // A selfPid naming no live process excludes nothing. It must not read as "exclude
+    // everything", and it must not quietly exclude the real subtree either.
+    std::vector<std::wstring> sticky3;
+    const cd::Profile* matched3 = nullptr;
+    std::map<DWORD, std::wstring> res3 =
+        cd::ComputeDesired(s, c, 1000, sticky3, &matched3, 7777);
+    CHECK_EQ(MaskOf(res3, 9001), L"Freq");
+}
+
+void Test_C10_SelfSubtreeVetoesAStickyName() {
+    Case("C10 the self-subtree veto applies to every member of a sticky executable group, "
+         "including a recycled pid");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeEngineConfig(t, true);
+
+    // Tick 1: an ordinary busy process is admitted. It is nothing to do with us.
+    cd::ProcessSnapshot s1 = MakeGameSnapshot();
+    AddProc(s1, 9000, 500, L"GameOptimizer.exe", 600, 0, 0.0);
+    AddProc(s1, 4000, 500, L"transcoder.exe", 140, 40, 25.0);
+    std::vector<std::wstring> sticky;
+    const cd::Profile* matched = nullptr;
+    std::map<DWORD, std::wstring> r1 =
+        cd::ComputeDesired(s1, c, 1000, sticky, &matched, 9000);
+    CHECK_EQ(MaskOf(r1, 4000), L"Freq");
+    CHECK(std::find(sticky.begin(), sticky.end(), L"transcoder.exe") != sticky.end());
+
+    // Tick 2: pid 4000 has been recycled into a new instance of the admitted executable,
+    // now inside OUR subtree. Name stickiness intentionally finds the new instance; the
+    // member-level self veto must still keep it out.
+    cd::ProcessSnapshot s2 = MakeGameSnapshot();
+    AddProc(s2, 9000, 500, L"GameOptimizer.exe", 600, 0, 0.0);
+    AddProc(s2, 4000, 9000, L"transcoder.exe", 700, 0, 0.0);
+    std::vector<std::wstring> sticky2 = sticky;
+    const cd::Profile* matched2 = nullptr;
+    std::map<DWORD, std::wstring> r2 =
+        cd::ComputeDesired(s2, c, 1000, sticky2, &matched2, 9000);
+    CHECK(!Has(r2, 4000));
+
+    // POSITIVE CONTROL: the same-name recycled pid with no self pid is pinned, so the
+    // assertion above is specifically about the subtree veto.
+    std::vector<std::wstring> sticky3 = sticky;
+    const cd::Profile* matched3 = nullptr;
+    std::map<DWORD, std::wstring> r3 = cd::ComputeDesired(s2, c, 1000, sticky3, &matched3);
+    CHECK_EQ(MaskOf(r3, 4000), L"Freq");
+
+    // PID-REUSE CONTROL: session state is not attached to the numeric pid. Reusing 4000 for
+    // a different executable does not inherit transcoder.exe's admission.
+    cd::ProcessSnapshot s3 = MakeGameSnapshot();
+    AddProc(s3, 4000, 500, L"unrelated.exe", 800, 0, 0.0);
+    std::vector<std::wstring> sticky4 = sticky;
+    const cd::Profile* matched4 = nullptr;
+    std::map<DWORD, std::wstring> r4 = cd::ComputeDesired(s3, c, 1000, sticky4, &matched4);
+    CHECK(!Has(r4, 4000));
+}
+
+void Test_C11_AutoPinnedOutIsExactlyRuleFour() {
+    Case("C11 autoPinnedOut carries the pids rule 4 decided, and only those");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeEngineConfig(t, true);
+
+    cd::ProcessSnapshot s = MakeGameSnapshot();
+    AddProc(s, 4000, 500, L"transcoder.exe", 140, 40, 25.0);   // rule 4's own
+    // OBS.exe is on the heavy LIST and is busy enough to qualify as well. Rule 5 gives it the
+    // heavy mask because the USER named it, so it must not be reported as one the app chose.
+    access::Procs(s)[3000].aboveThresholdTicks = 40;
+    access::Procs(s)[3000].cpuPercent = 25.0;
+    // A busy DESCENDANT of the game keeps the game mask and is likewise not rule 4's doing.
+    access::Procs(s)[1001].aboveThresholdTicks = 40;
+    access::Procs(s)[1001].cpuPercent = 25.0;
+
+    std::vector<std::wstring> sticky;
+    const cd::Profile* matched = nullptr;
+    std::set<DWORD> autoPinned;
+    std::map<DWORD, std::wstring> res =
+        cd::ComputeDesired(s, c, 1000, sticky, &matched, 0, &autoPinned);
+    CHECK(matched != nullptr);
+    CHECK_EQ((int)autoPinned.size(), 1);
+    CHECK(autoPinned.find(4000) != autoPinned.end());
+    CHECK(autoPinned.find(3000) == autoPinned.end());   // the user named this one
+    CHECK(autoPinned.find(1001) == autoPinned.end());   // the game owns this one
+    // Both are still governed - they are just not rule 4's to claim.
+    CHECK_EQ(MaskOf(res, 3000), L"Freq");
+    CHECK_EQ(MaskOf(res, 1001), L"Cache no SMT");
+
+    // CLEARED, never appended to, so a caller that reuses one set across ticks cannot
+    // accumulate pids the rule has since dropped.
+    autoPinned.insert(123456);
+    cd::ProcessSnapshot gone;
+    AddProc(gone, 500, 400, L"explorer.exe", 100, 0, 0.0);
+    std::vector<std::wstring> sticky2;
+    const cd::Profile* matched2 = nullptr;
+    cd::ComputeDesired(gone, c, 500, sticky2, &matched2, 0, &autoPinned);
+    CHECK_EQ((int)autoPinned.size(), 0);
+}
+
+void Test_C12_AutoPinExpandsExeGroupWithPerPidVetoes() {
+    Case("C12 one qualifying auto-pin process admits its executable group, including later "
+         "processes, while every per-pid veto remains in force");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeEngineConfig(t, true);
+
+    // Tick 1: only pid 4000 has crossed the CPU threshold. Its idle sibling must join the
+    // admitted executable group, but members owned by the game or our subtree must not.
+    cd::ProcessSnapshot s1 = MakeGameSnapshot();
+    AddProc(s1, 9000, 500, L"GameOptimizer.exe", 600, 0, 0.0);
+    AddProc(s1, 4000, 500, L"NVIDIA Broadcast 1.exe", 140,
+            cd::kAutoPinDebounceTicks, 25.0);
+    AddProc(s1, 4001, 500, L"NVIDIA Broadcast 1.exe", 141, 0, 0.0);
+    AddProc(s1, 4002, 9000, L"NVIDIA Broadcast 1.exe", 610, 0, 0.0);
+    AddProc(s1, 4003, 1000, L"NVIDIA Broadcast 1.exe", 370, 0, 0.0);
+    AddProc(s1, 5000, 500, L"encoder.exe", 142, cd::kAutoPinDebounceTicks, 25.0);
+    AddProc(s1, 5001, 500, L"encoder.exe", 143, 0, 0.0);
+    access::Procs(s1)[4].name = L"NVIDIA Broadcast 1.exe";
+    access::Procs(s1)[4].fullPath = L"C:\\Apps\\NVIDIA Broadcast 1.exe";
+
+    std::vector<std::wstring> sticky;
+    const cd::Profile* matched = nullptr;
+    std::set<DWORD> autoPinned;
+    std::map<DWORD, std::wstring> r1 =
+        cd::ComputeDesired(s1, c, 1000, sticky, &matched, 9000, &autoPinned);
+    CHECK(matched != nullptr);
+    CHECK_EQ(MaskOf(r1, 4000), L"Freq");
+    CHECK_EQ(MaskOf(r1, 4001), L"Freq");
+    CHECK(!Has(r1, 4002));
+    CHECK_EQ(MaskOf(r1, 4003), L"Cache no SMT");
+    CHECK(!Has(r1, 4));
+    CHECK(!Has(r1, 5000));
+    CHECK(!Has(r1, 5001));
+    CHECK_EQ((int)autoPinned.size(), 2);
+    CHECK(autoPinned.find(4000) != autoPinned.end());
+    CHECK(autoPinned.find(4001) != autoPinned.end());
+
+    // Tick 2: the qualifying pid and every ordinary sibling have exited. A newly launched
+    // process of the admitted executable still joins while focus is outside the game. The
+    // same-name members behind each per-pid veto remain governed only by the winning rule.
+    cd::ProcessSnapshot s2 = MakeGameSnapshot();
+    AddProc(s2, 9000, 500, L"GameOptimizer.exe", 600, 0, 0.0);
+    AddProc(s2, 4010, 500, L"NVIDIA Broadcast 1.exe", 700, 0, 0.0);
+    AddProc(s2, 4011, 9000, L"NVIDIA Broadcast 1.exe", 710, 0, 0.0);
+    AddProc(s2, 4012, 1000, L"NVIDIA Broadcast 1.exe", 380, 0, 0.0);
+    access::Procs(s2)[4].name = L"NVIDIA Broadcast 1.exe";
+    access::Procs(s2)[4].fullPath = L"C:\\Apps\\NVIDIA Broadcast 1.exe";
+
+    std::set<DWORD> autoPinned2;
+    std::map<DWORD, std::wstring> r2 =
+        cd::ComputeDesired(s2, c, 500, sticky, &matched, 9000, &autoPinned2);
+    CHECK_EQ(MaskOf(r2, 4010), L"Freq");
+    CHECK(!Has(r2, 4011));
+    CHECK_EQ(MaskOf(r2, 4012), L"Cache no SMT");
+    CHECK(!Has(r2, 4));
+    CHECK_EQ((int)autoPinned2.size(), 1);
+    CHECK(autoPinned2.find(4010) != autoPinned2.end());
 }
 
 // ===========================================================================
@@ -2131,6 +2448,172 @@ void Test_E3_LabelsAreDistinct() {
     CHECK_EQ(cd::CpuSetStageLabel(named), L"Freq 2");
 }
 
+// ===========================================================================
+// F. The auto-pin readout, and whose window the foreground answer belongs to.
+// ===========================================================================
+
+cd::GovernedProcess Gov(DWORD pid, const wchar_t* name, bool autoPinned) {
+    cd::GovernedProcess g;
+    g.pid = pid;
+    g.name = name;
+    g.maskName = L"Freq";
+    g.autoPinned = autoPinned;
+    return g;
+}
+
+void Test_F1_AutoPinnedExeNames() {
+    Case("F1 AutoPinnedExeNames collapses pids to executables and drops what is already "
+         "listed");
+    cd::EngineStatus st;
+    st.governed.push_back(Gov(101, L"chrome.exe", true));
+    st.governed.push_back(Gov(102, L"chrome.exe", true));       // another pid, same exe
+    st.governed.push_back(Gov(103, L"CHROME.EXE", true));       // and another casing
+    st.governed.push_back(Gov(104, L"NVIDIA Broadcast.exe", true));
+    st.governed.push_back(Gov(105, L"Overwatch.exe", false));   // governed, not by rule 4
+    st.governed.push_back(Gov(106, L"", true));                 // name could not be read
+
+    std::vector<std::wstring> none;
+    std::vector<std::wstring> v = cd::AutoPinnedExeNames(st, none);
+    CHECK_EQ((int)v.size(), 2);
+    // Sorted on the lowercased name, so the rows do not re-order themselves once a second.
+    CHECK_EQ(v[0], L"chrome.exe");
+    CHECK_EQ(v[1], L"NVIDIA Broadcast.exe");
+
+    // A process the user listed themselves is dropped, case-insensitively...
+    std::vector<std::wstring> listed;
+    listed.push_back(L"CHROME.EXE");
+    std::vector<std::wstring> v2 = cd::AutoPinnedExeNames(st, listed);
+    CHECK_EQ((int)v2.size(), 1);
+    CHECK_EQ(v2[0], L"NVIDIA Broadcast.exe");
+
+    // ...and whether their entry was written as a name or as a full path.
+    std::vector<std::wstring> byPath;
+    byPath.push_back(L"C:\\Program Files\\NVIDIA Broadcast.exe");
+    std::vector<std::wstring> v3 = cd::AutoPinnedExeNames(st, byPath);
+    CHECK_EQ((int)v3.size(), 1);
+    CHECK_EQ(v3[0], L"chrome.exe");
+
+    // Nothing auto-pinned is an empty list, never one blank row.
+    cd::EngineStatus quiet;
+    quiet.governed.push_back(Gov(201, L"Overwatch.exe", false));
+    CHECK_EQ((int)cd::AutoPinnedExeNames(quiet, none).size(), 0);
+}
+
+void Test_F2_ResolveForegroundPid() {
+    Case("F2 our own window never becomes the foreground answer");
+    const DWORD kUs = 4242;
+
+    // The hook has a value. It was recorded under WINEVENT_SKIPOWNPROCESS, so it is already
+    // the last foreground that was NOT ours and is used verbatim - including at the instant
+    // our own Settings window is the one in front.
+    CHECK_EQ(cd::ResolveForegroundPid(1000, kUs, kUs), 1000u);
+    CHECK_EQ(cd::ResolveForegroundPid(1000, 500, kUs), 1000u);
+
+    // No cached value and our own window is in front: NOT KNOWN. Answering with our own pid
+    // is what let opening the window to watch the rule be the thing that stopped it.
+    CHECK_EQ(cd::ResolveForegroundPid(0, kUs, kUs), 0u);
+
+    // No cached value and somebody else's window is in front: that is a real answer.
+    CHECK_EQ(cd::ResolveForegroundPid(0, 500, kUs), 500u);
+
+    // No self pid known at all still answers, and pid 0 stays "nothing".
+    CHECK_EQ(cd::ResolveForegroundPid(0, 500, 0), 500u);
+    CHECK_EQ(cd::ResolveForegroundPid(0, 0, kUs), 0u);
+}
+
+void Test_G1_FullyParkedWarningWithoutVCacheServiceIsUnchanged() {
+    Case("G1 fully parked warning is unchanged without the AMD service running");
+    CHECK_EQ(
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false),
+        L"Warning: all 16 processors in \"Freq\" are currently parked. Windows can accept "
+        L"an assignment to a fully parked mask and then ignore it - the process keeps "
+        L"running elsewhere.");
+}
+
+void Test_G2_FullyParkedWarningNamesLikelyVCacheCause() {
+    Case("G2 fully parked warning names the likely AMD V-Cache cause");
+    CHECK_EQ(
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true),
+        L"Warning: all 16 processors in \"Freq\" are currently parked. The running AMD 3D "
+        L"V-Cache Performance Optimizer service is the likely cause. It normally parks the "
+        L"non-cache CCD while a game is running. While that CCD is parked, a background mask "
+        L"pointing at it is effectively inert. Windows can accept assignments to that CCD "
+        L"and then ignore them.");
+}
+
+void Test_H1_GameModeEnvironmentWordingCoversEveryState() {
+    Case("H1 Game Mode environment wording covers on, off, and indeterminate");
+    CHECK_EQ(cd::FormatGameModeEnvironmentStatus(cd::GameModeState::On),
+             L"Windows Game Mode: On");
+    CHECK_EQ(cd::FormatGameModeEnvironmentStatus(cd::GameModeState::Off),
+             L"Windows Game Mode: Off");
+    CHECK_EQ(cd::FormatGameModeEnvironmentStatus(cd::GameModeState::NotDeterminable),
+             L"Windows Game Mode: Not determinable");
+}
+
+void Test_H2_AmdVCacheEnvironmentWordingCoversEveryState() {
+    Case("H2 AMD V-Cache environment wording covers every service state");
+    CHECK_EQ(cd::FormatAmdVCacheEnvironmentStatus(cd::AmdVCacheServiceState::NotInstalled),
+             L"AMD 3D V-Cache Performance Optimizer: Not installed");
+    CHECK_EQ(cd::FormatAmdVCacheEnvironmentStatus(
+                 cd::AmdVCacheServiceState::InstalledButStopped),
+             L"AMD 3D V-Cache Performance Optimizer: Installed but stopped");
+    CHECK_EQ(cd::FormatAmdVCacheEnvironmentStatus(cd::AmdVCacheServiceState::Running),
+             L"AMD 3D V-Cache Performance Optimizer: Running");
+    CHECK_EQ(cd::FormatAmdVCacheEnvironmentStatus(
+                 cd::AmdVCacheServiceState::NotDeterminable),
+             L"AMD 3D V-Cache Performance Optimizer: Not determinable");
+}
+
+void Test_H3_RunningVCacheEffectMatchesTheParkedMaskWarning() {
+    Case("H3 running AMD V-Cache effect matches the parked-mask warning");
+    const std::wstring effect = cd::AmdVCacheRunningEffectText();
+    CHECK_EQ(effect,
+             L"It normally parks the non-cache CCD while a game is running. While that CCD "
+             L"is parked, a background mask pointing at it is effectively inert.");
+    CHECK(cd::FormatFullyParkedMaskWarning(L"Freq", 16, true).find(effect) !=
+          std::wstring::npos);
+}
+
+// ===========================================================================
+// I. Autostart command construction and old-entry detection.
+// ===========================================================================
+
+void Test_I1_AutostartCommandEndsWithTrayFlag() {
+    Case("I1 autostart command ends with the exact --tray flag");
+    CHECK(EndsWith(cd::AutostartCommand(L"C:\\Game Optimizer\\GameOptimizer.exe"),
+                   L" --tray"));
+}
+
+void Test_I2_AutostartCommandQuotesExePath() {
+    Case("I2 autostart command quotes the executable path");
+    const std::wstring exePath = L"C:\\Program Files\\Game Optimizer\\GameOptimizer.exe";
+    const std::wstring command = cd::AutostartCommand(exePath);
+    CHECK_EQ(command.substr(0, exePath.size() + 2), L"\"" + exePath + L"\"");
+}
+
+void Test_I3_EmptyAutostartDoesNotNeedMigration() {
+    Case("I3 an absent autostart value does not need migration");
+    CHECK(!cd::AutostartNeedsMigration(L""));
+}
+
+void Test_I4_BareAutostartNeedsMigration() {
+    Case("I4 a quoted bare executable path needs migration");
+    CHECK(cd::AutostartNeedsMigration(L"\"C:\\Game Optimizer\\GameOptimizer.exe\""));
+}
+
+void Test_I5_TrayAutostartDoesNotNeedMigration() {
+    Case("I5 an autostart command with --tray does not need migration");
+    CHECK(!cd::AutostartNeedsMigration(
+        L"\"C:\\Game Optimizer\\GameOptimizer.exe\" --tray"));
+}
+
+void Test_I6_TrayDetectionIsCaseInsensitive() {
+    Case("I6 an uppercase --TRAY flag does not need migration");
+    CHECK(!cd::AutostartNeedsMigration(
+        L"\"C:\\Game Optimizer\\GameOptimizer.exe\" --TRAY"));
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -2161,6 +2644,14 @@ int main() {
     Test_B11_ProfilesForDisplay();
     Test_B12_ValidateAndRepairNewRules();
     Test_B13_MarkProfileUsed();
+    Test_B14_DefaultExclusionsProtectAtieclxx();
+    Test_B15_DefaultExclusionsProtectAtiesrxx();
+    Test_B16_DefaultExclusionsProtectAmdow();
+    Test_B17_DefaultExclusionsProtectAmd3dvcachePrefix();
+    Test_B18_DefaultExclusionsProtectAmdfendrPrefix();
+    Test_B19_DefaultExclusionsProtectAmdAppCompatPrefix();
+    Test_B20_DefaultExclusionsProtectAmdPpkgPrefix();
+    Test_B21_DefaultExclusionsProtectAmdRsSourceExtension();
 
     std::printf("\n== C. ComputeDesired ==\n");
     Test_C1_NoMatch();
@@ -2168,6 +2659,10 @@ int main() {
     Test_C8b_ZeroAndFourViaHeavyList();
     Test_C6_AutoPinInertWhenForegroundNotInGameSet();
     Test_C7_Stickiness();
+    Test_C9_SelfSubtreeIsNeverAutoPinned();
+    Test_C10_SelfSubtreeVetoesAStickyName();
+    Test_C11_AutoPinnedOutIsExactlyRuleFour();
+    Test_C12_AutoPinExpandsExeGroupWithPerPidVetoes();
 
     std::printf("\n== D. BuildTooltip ==\n");
     Test_D_BuildTooltip();
@@ -2178,6 +2673,27 @@ int main() {
     Test_E3_LabelsAreDistinct();
     Test_E4_PidReuseGuard();
     Test_E5_LiveReadbackChecksIdentity();
+
+    std::printf("\n== F. Auto-pin readout and foreground ==\n");
+    Test_F1_AutoPinnedExeNames();
+    Test_F2_ResolveForegroundPid();
+
+    std::printf("\n== G. Parked-mask warning ==\n");
+    Test_G1_FullyParkedWarningWithoutVCacheServiceIsUnchanged();
+    Test_G2_FullyParkedWarningNamesLikelyVCacheCause();
+
+    std::printf("\n== H. Live environment wording ==\n");
+    Test_H1_GameModeEnvironmentWordingCoversEveryState();
+    Test_H2_AmdVCacheEnvironmentWordingCoversEveryState();
+    Test_H3_RunningVCacheEffectMatchesTheParkedMaskWarning();
+
+    std::printf("\n== I. Autostart command ==\n");
+    Test_I1_AutostartCommandEndsWithTrayFlag();
+    Test_I2_AutostartCommandQuotesExePath();
+    Test_I3_EmptyAutostartDoesNotNeedMigration();
+    Test_I4_BareAutostartNeedsMigration();
+    Test_I5_TrayAutostartDoesNotNeedMigration();
+    Test_I6_TrayDetectionIsCaseInsensitive();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

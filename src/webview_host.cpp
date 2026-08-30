@@ -658,12 +658,18 @@ std::wstring UserDataFolder() {
 // ===========================================================================
 // Public API.
 // ===========================================================================
-SIZE WebSponsorNaturalSize(int dpi) {
+SIZE WebSponsorMinSize(int dpi) {
     // MulDiv rather than a float: it rounds to nearest and cannot overflow on the ranges dpi
-    // takes, and it is what every other size in this project is scaled with.
+    // takes, and it is what every other size in this project is scaled with. The window
+    // minimum and theme::metric::kGap go through the SAME call, which is the only reason the
+    // fit can be reasoned about in CSS px at all - see the budget block in
+    // tools\gen-sponsor-html.py.
+    //
+    // cx is the FLOOR, not the width to draw at. SettingsLayout hands the host the whole
+    // content row and only WM_GETMINMAXINFO cares about this number.
     if (dpi <= 0) dpi = 96;
     SIZE s;
-    s.cx = ::MulDiv(kSponsorCssWidth, dpi, 96);
+    s.cx = ::MulDiv(kSponsorCssMinWidth, dpi, 96);
     s.cy = ::MulDiv(kSponsorCssHeight, dpi, 96);
     return s;
 }
@@ -723,8 +729,10 @@ void WebSponsorMove(WebSponsor* w, const RECT& rc) {
     if (w == nullptr || w->closed) return;
     w->rc = rc;
     if (w->host != nullptr) {
+        // Match settings.cpp's PosBatch: NOCOPYBITS prevents moved child pixels from ghosting.
         ::SetWindowPos(w->host, nullptr, rc.left, rc.top, rc.right - rc.left,
-                       rc.bottom - rc.top, SWP_NOZORDER | SWP_NOACTIVATE);
+                       rc.bottom - rc.top,
+                       SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS);
     }
     if (w->controller != nullptr) {
         RECT client;

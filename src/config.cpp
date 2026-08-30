@@ -291,7 +291,17 @@ bool Config::IsExcluded(const std::wstring& exeBaseName) const {
     const std::wstring want = BaseName(exeBaseName);
     if (want.empty()) return false;
     for (size_t i = 0; i < exclusions.size(); ++i) {
-        if (IEquals(BaseName(exclusions[i]), want)) return true;
+        const std::wstring spec = BaseName(exclusions[i]);
+        if (spec == L"*") continue;  // Never let one malformed entry exclude every process.
+        if (spec.size() > 1 && spec[spec.size() - 1] == L'*') {
+            const std::wstring prefix = spec.substr(0, spec.size() - 1);
+            if (want.size() >= prefix.size() &&
+                IEquals(want.substr(0, prefix.size()), prefix)) {
+                return true;
+            }
+            continue;
+        }
+        if (IEquals(spec, want)) return true;
     }
     return false;
 }
@@ -306,6 +316,9 @@ std::vector<std::wstring> DefaultExclusions() {
     v.push_back(L"vgc.exe");
     v.push_back(L"vgtray.exe");
     v.push_back(L"audiodg.exe");
+    // Real-time camera/mic processing, like the audio engine above; moving it to a
+    // background or parked mask risks live-stream dropouts.
+    v.push_back(L"NVIDIA Broadcast*");
     v.push_back(L"dwm.exe");
     v.push_back(L"csrss.exe");
     v.push_back(L"services.exe");
@@ -319,6 +332,22 @@ std::vector<std::wstring> DefaultExclusions() {
     v.push_back(L"nvcontainer.exe");
     v.push_back(L"AMDRSServ.exe");
     v.push_back(L"RadeonSoftware.exe");
+    // AMD display-driver client core; a timeout here can leave the user with a black screen.
+    v.push_back(L"atieclxx.exe");
+    // AMD display-driver service core; starving it can cause a driver timeout or black screen.
+    v.push_back(L"atiesrxx.exe");
+    // AMD display-driver helper; moving vendor driver helpers risks destabilizing the driver path.
+    v.push_back(L"amdow.exe");
+    // AMD V-Cache optimizer owns CCD parking decisions; pinning that coordinator defeats its job.
+    v.push_back(L"amd3dvcache*");
+    // AMD Crash Defender is the driver-timeout recovery path; it must remain unconstrained.
+    v.push_back(L"amdfendr*");
+    // AMD driver app-compatibility service; moving it risks disrupting the protected driver path.
+    v.push_back(L"AmdAppCompat*");
+    // AMD driver provisioning-package service; vendor driver services are never auto-pin targets.
+    v.push_back(L"AmdPpkg*");
+    // AMD Radeon source extension is real-time driver media plumbing; do not move that path.
+    v.push_back(L"AMDRSSrcExt.exe");
     v.push_back(L"steam.exe");
     v.push_back(L"EpicGamesLauncher.exe");
     v.push_back(L"Battle.net.exe");
@@ -343,7 +372,8 @@ Config DefaultConfig(const Topology& t) {
     heavy.push_back(L"claude.exe");
     heavy.push_back(L"node.exe");
     heavy.push_back(L"obs64.exe");
-    heavy.push_back(L"NVIDIA Broadcast.exe");
+    // NVIDIA Broadcast is deliberately absent: its real-time media work is excluded by
+    // default from background or parked masks; see DefaultExclusions().
     heavy.push_back(L"firefox.exe");
 
     // A worked example, ENABLED - operator decision, reversing the original "ships disabled"

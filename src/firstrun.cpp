@@ -251,13 +251,16 @@ std::wstring Page1Masks(const Topology& t) {
 
 std::wstring Page2GameModeText(const EnvironmentInfo& env, const Topology& t, bool& warnOut) {
     const bool multiDomain = t.domains.size() > 1;
-    warnOut = (env.autoGameModeEnabled != 0) && multiDomain && env.isAmd;
+    warnOut = env.gameModeState == GameModeState::On && multiDomain && env.isAmd;
 
     std::wstring s = L"CPU: ";
     s += env.cpuBrand.empty() ? std::wstring(L"(not reported by the registry)") : env.cpuBrand;
     s += L"\r\n\r\n";
 
-    if (warnOut) {
+    if (env.gameModeState == GameModeState::NotDeterminable) {
+        s += L"Windows Game Mode is not determinable because the AutoGameModeEnabled "
+             L"registry value could not be read for this account.";
+    } else if (warnOut) {
         s += L"Windows Game Mode is ON "
              L"(HKCU\\Software\\Microsoft\\GameBar\\AutoGameModeEnabled = 1).\r\n\r\n"
              L"On a multi-CCD AMD part Game Mode applies its own GLOBAL CCD preference to "
@@ -267,11 +270,7 @@ std::wstring Page2GameModeText(const EnvironmentInfo& env, const Topology& t, bo
              L"is the first thing to check.\r\n\r\n"
              L"Game Optimizer will not change this setting for you. The button below just "
              L"opens the Windows page so you can decide.";
-    } else if (!env.gameModeKeyPresent) {
-        s += L"Windows Game Mode: the GameBar key is not present for this account, so Game "
-             L"Mode has never been configured here. Nothing on this page needs your "
-             L"attention.";
-    } else if (env.autoGameModeEnabled == 0) {
+    } else if (env.gameModeState == GameModeState::Off) {
         s += L"Windows Game Mode is OFF "
              L"(HKCU\\Software\\Microsoft\\GameBar\\AutoGameModeEnabled = 0). It is not "
              L"applying a global CCD preference, so it is not competing with the per-game "
@@ -287,12 +286,16 @@ std::wstring Page2GameModeText(const EnvironmentInfo& env, const Topology& t, bo
 
 std::wstring Page2VCacheText(const EnvironmentInfo& env) {
     std::wstring s = L"Separately, and regardless of the Game Mode setting above:\r\n\r\n";
-    if (!env.amdVCacheServicePresent) {
+    if (env.amdVCacheServiceState == AmdVCacheServiceState::NotDeterminable) {
+        s += L"The AMD 3D V-Cache Performance Optimizer service state is not determinable.";
+        return s;
+    }
+    if (env.amdVCacheServiceState == AmdVCacheServiceState::NotInstalled) {
         s += L"The AMD 3D V-Cache Performance Optimizer service (amd3dvcacheSvc) is NOT "
              L"installed on this machine, so it is not influencing scheduling here.";
         return s;
     }
-    if (env.amdVCacheServiceRunning) {
+    if (env.amdVCacheServiceState == AmdVCacheServiceState::Running) {
         s += L"The AMD 3D V-Cache Performance Optimizer service (amd3dvcacheSvc) is "
              L"INSTALLED and RUNNING.\r\n\r\n"
              L"This is a second, independent global influence on where threads are "
@@ -313,15 +316,23 @@ std::wstring Page2VCacheText(const EnvironmentInfo& env) {
 // The one-line technical tag drawn in monospace on the right of each page-2 fact row. It
 // restates, in the raw form, exactly the value the prose below it describes.
 std::wstring Page2GameModeTag(const EnvironmentInfo& env) {
-    if (!env.gameModeKeyPresent) return L"AutoGameModeEnabled: absent";
-    return env.autoGameModeEnabled != 0 ? L"AutoGameModeEnabled = 1"
-                                        : L"AutoGameModeEnabled = 0";
+    if (env.gameModeState == GameModeState::NotDeterminable)
+        return L"AutoGameModeEnabled: not determinable";
+    return env.gameModeState == GameModeState::On ? L"AutoGameModeEnabled = 1"
+                                                   : L"AutoGameModeEnabled = 0";
 }
 
 std::wstring Page2VCacheTag(const EnvironmentInfo& env) {
-    if (!env.amdVCacheServicePresent) return L"amd3dvcacheSvc: not installed";
-    return env.amdVCacheServiceRunning ? L"amd3dvcacheSvc: running"
-                                       : L"amd3dvcacheSvc: stopped";
+    switch (env.amdVCacheServiceState) {
+        case AmdVCacheServiceState::NotInstalled:
+            return L"amd3dvcacheSvc: not installed";
+        case AmdVCacheServiceState::InstalledButStopped:
+            return L"amd3dvcacheSvc: stopped";
+        case AmdVCacheServiceState::Running:
+            return L"amd3dvcacheSvc: running";
+        default:
+            return L"amd3dvcacheSvc: not determinable";
+    }
 }
 
 // ---------------------------------------------------------------------------

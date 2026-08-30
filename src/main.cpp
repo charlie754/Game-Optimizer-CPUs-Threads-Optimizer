@@ -373,8 +373,9 @@ void StopGameDetection() {
 // ---- Command line ----------------------------------------------------------
 struct CmdOptions {
     bool bench = false;
-    bool tray  = false;   // no-op; the autostart entry passes it so the Run value is
-                          // self-describing in regedit
+    // The Run entry passes --tray so login stays silent; MigrateAutostartCommand repairs the
+    // flagless entries written by older builds before this value controls launch visibility.
+    bool tray  = false;
 };
 
 CmdOptions ParseCommandLine() {
@@ -591,20 +592,25 @@ bool RegisterAndCreateWindow() {
     // not receive broadcast messages, and "TaskbarCreated" is a broadcast.
     g_hwnd = CreateWindowExW(0, kWndClass, kAppTitle, WS_OVERLAPPED,
                              0, 0, 0, 0, nullptr, nullptr, g_hInst, nullptr);
-    return g_hwnd != nullptr;
+    if (g_hwnd == nullptr) return false;
+
+    HICON big = LoadIconW(g_hInst, MAKEINTRESOURCEW(IDI_APPICON));
+    if (big != nullptr) {
+        SendMessageW(g_hwnd, WM_SETICON, ICON_BIG,   reinterpret_cast<LPARAM>(big));
+        SendMessageW(g_hwnd, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(big));
+    } else {
+        // The message window is deliberately allowed to survive a missing resource. The
+        // measured consequence is cosmetic; refusing startup would also remove the tray UI.
+        LogLine(L"[main] app icon resource %u could not be loaded, err=%lu; continuing",
+                IDI_APPICON, GetLastError());
+    }
+    return true;
 }
 
 // ---- Startup steps ---------------------------------------------------------
 // Everything that can fail on a strange machine. Returns with g_cfg usable in every case.
 void LoadEverything(bool& outTopologyChanged) {
     outTopologyChanged = false;
-
-    // FIRST, before RecoverFromJournal reads the journal and before LoadConfig reads the ini.
-    // The product was renamed, and without these two an existing user silently loses their
-    // settings and keeps a dead HKCU\...\Run entry that fails at every login. Both are
-    // idempotent and log what they did; neither deletes anything the user owns.
-    MigrateLegacyConfigDir();
-    MigrateLegacyAutostart();
 
     g_topoOk = DetectTopology(g_topo, &g_topoError);
     if (!g_topoOk) {
@@ -697,6 +703,13 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
         return 0;
     }
 
+    // FIRST, before config/journal reads and before --tray controls launch visibility. The
+    // rename migrations preserve existing state; the command migration prevents the old,
+    // measured flagless Run value from opening Settings at every login.
+    MigrateLegacyConfigDir();
+    MigrateLegacyAutostart();
+    MigrateAutostartCommand();
+
     const CmdOptions opt = ParseCommandLine();
     if (opt.tray) LogLine(L"[main] started with --tray");
 
@@ -784,8 +797,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
     }
 
     // ---- Foreground hook, first run, engine ---------------------------------
-    // Set inside the try below, read after it: a brand-new user has just finished the wizard
-    // and would otherwise be looking at an empty desktop with no idea where anything is.
     bool wizardWasShown = false;
     try {
         StartForegroundTracking();
@@ -800,12 +811,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
                         kAppTitle, MB_OK | MB_ICONINFORMATION);
         }
 
-        // Captured BEFORE SaveConfigQuiet writes first_run_done=true, because that write is
-        // exactly what makes this condition false for every later launch. This is the one
-        // run that had no usable config.ini and actually showed the wizard.
         wizardWasShown = !g_cfg.firstRunDone;
-
-        if (!g_cfg.firstRunDone) {
+        if (wizardWasShown) {
             RunFirstRunWizard(g_hwnd, g_cfg, g_topo);
             g_cfg.firstRunDone = true;   // contractually already true; never ask twice
             SaveConfigQuiet();
@@ -839,14 +846,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
                     kAppTitle, MB_OK | MB_ICONERROR);
     }
 
-    // ---- First run: land the new user on the Profiles page -------------------
-    // Genuine first run only - no config.ini, wizard actually shown. NOT when the autostart
-    // entry launched us with --tray: someone who asked for start-with-Windows wants it quiet
-    // at login, and the very first login after enabling it is precisely when this would fire.
-    // --bench never reaches here; it returned above. ShowSettings is modeless and opens on
-    // PAGE_PROFILES, which is its default page, so this lands where the operator asked.
-    if (wizardWasShown && !opt.tray) {
-        LogLine(L"[main] first run - opening Settings on the Profiles page");
+    // ---- Launch visibility --------------------------------------------------
+    // The wizard above still finishes before a manual launch reaches Settings. --bench never
+    // reaches here because it returned above, and --tray is reserved for the Run entry so a
+    // login start stays quiet even for entries migrated from older builds.
+    if (!opt.tray) {
+        LogLine(wizardWasShown
+                    ? L"[main] first run - opening Settings on the Profiles page"
+                    : L"[main] ordinary launch - opening Settings on the Profiles page");
         OpenSettings(g_hwnd);
     }
 

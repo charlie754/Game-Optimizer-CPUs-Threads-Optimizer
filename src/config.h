@@ -65,7 +65,9 @@ struct Config {
     std::wstring topologySignature;       // guards stale CPU Set Ids - see topology.h
     std::vector<Mask> masks;
     std::vector<Profile> profiles;
-    std::vector<std::wstring> exclusions; // basenames, applied to gameSet and autoPin
+    // Basenames applied to gameSet and autoPin. A final '*' is an exclusion-only prefix
+    // wildcard; a bare '*' is ignored so it cannot disable the feature globally.
+    std::vector<std::wstring> exclusions;
 
     // Verbatim lines from sections/keys this version did not recognise. Key is the
     // section name; value is the raw "key=value" lines. Re-emitted on save.

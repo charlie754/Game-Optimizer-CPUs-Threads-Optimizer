@@ -1,8 +1,12 @@
 # WebView2Loader.dll — a Microsoft redistributable, vendored here
 
-`x64\WebView2Loader.dll` in this directory is **Microsoft's redistributable WebView2 loader**.
-It is not Game Optimizer's code and not the author's work. It is checked in so the app can be
-built and run without fetching anything.
+`WebView2Loader.dll` is **Microsoft's redistributable WebView2 loader**. It is not Game
+Optimizer's code and not the author's work.
+
+**Where it is depends on what you are holding.** In the source repository it is checked in at
+`third_party\webview2\x64\WebView2Loader.dll`, so the app builds and runs without fetching
+anything. In a downloaded release it sits beside `GameOptimizer.exe` at the top level, and this
+folder carries only the licence text below.
 
 ## What it is
 
@@ -42,13 +46,13 @@ this DLL** — which is why the licence section below matters rather than being 
 
 The copy here was taken from the `webview2-com-sys` crate's vendored binaries on the development
 machine — `webview2-com-sys-0.38.2`, `x64\WebView2Loader.dll`. The exact path is recorded in
-`NOTICE.md`.
+the project's `NOTICE.md` at the archive/repository root, two levels above this file.
 
 That is provenance by hearsay, so it was checked against what Microsoft actually publishes. The
 `Microsoft.Web.WebView2` 1.0.3650.58 package was downloaded from nuget.org, and both copies of
 the 64-bit loader inside it — `build\native\x64\WebView2Loader.dll` and
 `runtimes\win-x64\native\WebView2Loader.dll` — hash to the SHA-256 above. They are
-**byte-identical to the file in this directory**. So this is Microsoft's published
+**byte-identical to the loader this project ships**. So this is Microsoft's published
 redistributable at that exact version, unmodified, and the crate was only the delivery route.
 
 The crate ships no licence file for the binary at all; its own MIT licence covers the Rust
@@ -95,7 +99,7 @@ ends up shipping the wrong one, so this file links to the authoritative source i
 - Distribution guidance — <https://learn.microsoft.com/en-us/microsoft-edge/webview2/concepts/distribution>
 
 That SDK package carries its own `LICENSE.txt` (1,487 bytes) and `NOTICE.txt` (3,894 bytes).
-**Neither is copied into this repository.**
+Both files are reproduced beside this README.
 
 This page is provenance, not a licence review, and it is not legal advice. If you redistribute a
 build that includes this DLL, read Microsoft's terms at the first link and satisfy them yourself

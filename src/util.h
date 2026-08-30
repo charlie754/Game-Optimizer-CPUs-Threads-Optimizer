@@ -35,8 +35,13 @@ bool WriteFileUtf8Atomic(const std::wstring& path, const std::wstring& text);
 
 // ---- Autostart (HKCU\Software\Microsoft\Windows\CurrentVersion\Run) ---------
 // The value is named "GameOptimizer".
+std::wstring AutostartCommand(const std::wstring& exePath);
+bool AutostartNeedsMigration(const std::wstring& existingValue);
 bool GetStartWithWindows();
 bool SetStartWithWindows(bool on);
+// Older builds wrote a flagless command, which would make login startup open Settings.
+// Repairs only an existing value; an absent value means the user left autostart disabled.
+void MigrateAutostartCommand();
 
 // ---- Migration from the previous product name ("CoreDirector") --------------
 // Idempotent, safe to call on every start, and both log what they did.  Call BOTH before
@@ -56,17 +61,31 @@ void MigrateLegacyConfigDir();
 void MigrateLegacyAutostart();
 
 // ---- Environment probes, for the first-run wizard and the risk warnings -----
+enum class GameModeState { NotDeterminable, Off, On };
+enum class AmdVCacheServiceState {
+    NotDeterminable,
+    NotInstalled,
+    InstalledButStopped,
+    Running
+};
+
 struct EnvironmentInfo {
     std::wstring cpuBrand;                  // from the registry, e.g. "AMD Ryzen 9 9950X3D..."
     bool  isAmd = false;
     bool  isIntel = false;
     bool  gameModeKeyPresent = false;       // HKCU\Software\Microsoft\GameBar exists
     DWORD autoGameModeEnabled = 0;          // ...\AutoGameModeEnabled (0 == Game Mode off)
+    GameModeState gameModeState = GameModeState::NotDeterminable;
     bool  amdVCacheServicePresent = false;  // service "amd3dvcacheSvc"
     bool  amdVCacheServiceRunning = false;
+    AmdVCacheServiceState amdVCacheServiceState =
+        AmdVCacheServiceState::NotDeterminable;
     bool  isElevated = false;
 };
 EnvironmentInfo ProbeEnvironment();
+// Refreshes only the two live scheduling influences: one HKCU value read and one named
+// service status query. It never enumerates services and never writes either source.
+void RefreshEnvironmentStatus(EnvironmentInfo& info);
 
 void OpenGameModeSettings();                    // ms-settings:gaming-gamemode
 void OpenFolder(const std::wstring& path);

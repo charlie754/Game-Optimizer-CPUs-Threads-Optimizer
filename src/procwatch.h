@@ -71,6 +71,23 @@ void  StopForegroundTracking();
 // The hooked value; falls back to GetForegroundWindow() when the hook has not fired yet.
 DWORD GetForegroundPid();
 
+// PURE, and the whole of the decision GetForegroundPid makes - separated out so it can be
+// unit-tested, because nothing about a WinEvent hook can be.
+//
+// OUR OWN WINDOWS ARE NOT A FOREGROUND CHANGE. That is not a new policy: the hook above is
+// installed with WINEVENT_SKIPOWNPROCESS precisely so that opening Settings or the tray menu
+// leaves `cached` holding the last foreground that was NOT ours. The fallback path did not
+// honour it - GetForegroundWindow() answers with our own Settings window quite happily - so
+// on the one path where the hook has not fired yet, the act of opening the window to watch
+// the auto-pin rule was enough to close its foreground gate.
+//
+//   cached != 0            -> cached. The hook already applied the rule.
+//   live is ours           -> 0, i.e. NOT KNOWN. There is no earlier value to fall back to
+//                             and inventing one would be worse than admitting it; 0 is
+//                             already "no such process" everywhere else here.
+//   otherwise              -> live.
+DWORD ResolveForegroundPid(DWORD cached, DWORD live, DWORD selfPid);
+
 // Total logical processors across all groups, cached.
 int GetTotalLogicalProcessors();
 

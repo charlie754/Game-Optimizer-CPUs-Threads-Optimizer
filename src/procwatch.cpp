@@ -282,6 +282,18 @@ void StartForegroundTracking() {
     g_foregroundHook = SetWinEventHook(EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND,
                                        nullptr, &ForegroundWinEventProc, 0, 0,
                                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+    // SEED IT. The hook only reports CHANGES, so until something moves the foreground there
+    // is nothing cached and every read falls through to GetForegroundWindow(). This runs at
+    // startup, before any window of ours can be in front, so whatever is there now is a real
+    // answer and recording it means the fallback is never needed on the one path where it
+    // gives the wrong one - the user opening Settings as the first thing they do.
+    HWND hwnd = GetForegroundWindow();
+    if (hwnd == nullptr) return;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != 0 && pid != GetCurrentProcessId())
+        InterlockedExchange(&g_foregroundPid, static_cast<LONG>(pid));
 }
 
 void StopForegroundTracking() {
@@ -290,6 +302,12 @@ void StopForegroundTracking() {
         g_foregroundHook = nullptr;
     }
     InterlockedExchange(&g_foregroundPid, 0);
+}
+
+DWORD ResolveForegroundPid(DWORD cached, DWORD live, DWORD selfPid) {
+    if (cached != 0) return cached;
+    if (selfPid != 0 && live == selfPid) return 0;
+    return live;
 }
 
 DWORD GetForegroundPid() {
@@ -301,7 +319,7 @@ DWORD GetForegroundPid() {
     if (hwnd == nullptr) return 0;
     DWORD pid = 0;
     GetWindowThreadProcessId(hwnd, &pid);
-    return pid;
+    return ResolveForegroundPid(0, pid, GetCurrentProcessId());
 }
 
 int GetTotalLogicalProcessors() {

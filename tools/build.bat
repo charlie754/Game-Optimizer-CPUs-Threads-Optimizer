@@ -12,9 +12,17 @@ if not exist "%ROOT%\build\obj" mkdir "%ROOT%\build\obj"
 set "SRCS="
 for %%F in ("%ROOT%\src\*.cpp") do set "SRCS=!SRCS! "%%F""
 if "!SRCS!"=="" ( echo ERROR: no sources in src\ & exit /b 92 )
+REM The shell icon and Explorer Details fields are release identity, so a resource compiler
+REM failure is a build failure rather than an optional packaging warning.
+rc /nologo /fo "%ROOT%\build\GameOptimizer.res" "%ROOT%\src\GameOptimizer.rc"
+if errorlevel 1 (
+  set "RC=!ERRORLEVEL!"
+  echo ERROR: GameOptimizer.rc failed to compile
+  exit /b !RC!
+)
 pushd "%ROOT%\build"
 cl /nologo /EHsc /O2 /std:c++17 /W3 /permissive- /DUNICODE /D_UNICODE /MT ^
-   /I"%ROOT%\src" /Fo"obj\\" /Fe"GameOptimizer.exe" !SRCS! ^
+   /I"%ROOT%\src" /Fo"obj\\" /Fe"GameOptimizer.exe" !SRCS! "%ROOT%\build\GameOptimizer.res" ^
    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:"%ROOT%\src\GameOptimizer.manifest" ^
    user32.lib shell32.lib gdi32.lib advapi32.lib comctl32.lib ole32.lib shlwapi.lib psapi.lib comdlg32.lib msimg32.lib
 set RC=%ERRORLEVEL%

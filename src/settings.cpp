@@ -25,6 +25,8 @@
 #include "config.h"
 #include "engine.h"
 #include "procwatch.h"
+#include "settings_environment.h"
+#include "settings_warning.h"
 #include "sponsor.h"
 #include "theme.h"
 #include "topology.h"
@@ -862,6 +864,15 @@ enum class AutoPinState {
     Active     // the game is running AND owns the foreground
 };
 
+// A heavy row is one executable but auto-pin admits by pid. Keep the counts so a grouped row
+// can say all, none, or only some instances were applied without disturbing the independent
+// Windows readback column (whose "Mixed" result is deliberately left as-is).
+struct AutoApplySummary {
+    size_t applied = 0;
+    size_t accessDenied = 0;
+    size_t failed = 0;
+};
+
 struct SettingsState {
     Config* out = nullptr;
     const Topology* topo = nullptr;
@@ -873,6 +884,10 @@ struct SettingsState {
     // under load, so every parked warning and the Inspect action read this one instead.
     Topology live;
     bool haveLive = false;
+
+    // CPU identity/elevation come from the full probe once. The two mutable scheduling
+    // influences inside this value are refreshed query-only on the existing 1 s timer.
+    EnvironmentInfo env;
 
     // The blocked-processes line grows by a paragraph when the engine reports a stale
     // topology, so the layout has to reserve more height for it. Tracked rather than
@@ -927,6 +942,7 @@ struct SettingsState {
     // readback, because the disagreement is the interesting case: Windows can accept an
     // assignment and ignore it, and other software writes this API too.
     std::map<std::wstring, CpuSetStageInfo> stageByHeavy;  // heavy list ENTRY (lowercased)
+    std::map<std::wstring, AutoApplySummary> autoApplyByExe; // auto row basename (lowercased)
     CpuSetStageInfo targetStage;                           // the profile's game
     // Last drawn target label. The target's stage is painted by the PARENT, which repaints
     // only when something changed, so the previous string is what says whether it did.
@@ -936,6 +952,21 @@ struct SettingsState {
     // timer as everything else and cached here because BOTH the parent's paint (the status
     // dot) and the heavy list's owner-draw (the meter's colour ramp) read it.
     AutoPinState autoState = AutoPinState::Hidden;
+
+    // ---- What auto-pin has actually MOVED, as rows in the heavy list ---------
+    // The defect this exists for: nothing in this window ever said which processes the rule
+    // picked, so a working auto-pin and a broken one looked identical and the operator
+    // reported the working one as broken. These are the row TEXTS currently appended to
+    // hHeavy - including the trailing "+N more" caption when there is one - cached so the
+    // list is only rebuilt when the set really moved. Rebuilding it every second would reset
+    // the selection and the scroll position under the user's hand.
+    //
+    // THEY ARE NOT THE USER'S CONFIG AND MUST NEVER BECOME IT. Profile::heavy is written from
+    // HeavyItems(), which reads back only rows stamped kHeavyRowManual; see the enum there.
+    std::vector<std::wstring> autoRows;
+    // Distinct auto-pinned executables BEFORE the display cap, for the "+N more" row and for
+    // the status sentence's count.
+    size_t autoTotal = 0;
 
     // Owned. Returned from WM_CTLCOLOR* so a static/checkbox erases to the card it sits on
     // and an edit/listbox to the input surface. Deleted in WM_NCDESTROY.
@@ -966,6 +997,7 @@ struct SettingsState {
     HWND hMapFail = nullptr;
     HWND hGenHdr = nullptr, hStartup = nullptr, hNotify = nullptr;
     HWND hPollLbl = nullptr, hPoll = nullptr;
+    HWND hGameModeStatus = nullptr, hVCacheStatus = nullptr, hVCacheEffect = nullptr;
     HWND hBlocked = nullptr, hInspect = nullptr;
     // The sponsor strip. It belongs to the WINDOW, not to a page - it sits directly above the
     // footer on every page - so it is deliberately absent from PageControls.
@@ -997,10 +1029,10 @@ void SettingsLayout(SettingsState* st, HWND hwnd);
 // ---- how much room the sponsor panel needs ----------------------------------------------
 // THE TWO RENDERINGS ARE DIFFERENT SHAPES, so the band cannot be one number.
 //
-//   WebView2  a WIDE TWO-GROUP ROW, ~462 x 150 logical px: on the left Ko-fi above the
-//             GitHub pill, on the right the disease-research copy above the
-//             GOATPROJECT lockup card. It was a 272 x 261 vertical stack until
-//             2026-08-29; the numbers here are measured, see tools\measure-panel.py.
+//   WebView2  ONE ROW OF THREE GROUPS - Ko-fi, Star-on-Github, and the disease-research copy
+//             beside the GOATPROJECT lockup - ~76 logical px tall and as wide as the window
+//             gives it. It was a 272 x 261 vertical stack, then a fixed 831 x 65 row; the
+//             numbers here are measured, see tools\measure-panel.py.
 //   GDI       the fallback in sponsor.cpp - a short horizontal ROW, ~45 logical px tall.
 //
 // Reserving the row's height for the stack clips three quarters of the panel; reserving the
@@ -1010,13 +1042,20 @@ void SettingsLayout(SettingsState* st, HWND hwnd);
 // creation refused synchronously or because SponsorWebReady reported failure, and that
 // function re-runs the layout precisely so this answer changes with it.
 //
+// THE cx IT RETURNS FOR THE WEBVIEW2 PANEL IS A FLOOR, NOT A WIDTH, and the two callers use it
+// differently on purpose. WebSponsorMinSize hands back kSponsorCssMinWidth - the narrowest host
+// the three groups fit in - because the panel itself has no width of its own any more: it fills
+// whatever it is given. SettingsLayout therefore OVERRIDES cx with the full content row and uses
+// this only to ask "is there a panel at all"; WM_GETMINMAXINFO is the one that has to respect it,
+// and it does so through the window minimum. For the GDI strip cx really is its width.
+//
 // A zero comes back when there is nothing to show at all, and the caller collapses the band.
 SIZE SponsorBandSize(const SettingsState* st, int dpi) {
     SIZE z;
     z.cx = 0;
     z.cy = 0;
     if (st == nullptr) return z;
-    if (st->web != nullptr && !st->webLate) return WebSponsorNaturalSize(dpi);
+    if (st->web != nullptr && !st->webLate) return WebSponsorMinSize(dpi);
     // The GDI control's own measure, cached when the control was created. Guarded on BOTH
     // axes: a measure with no width is not a strip, and must reserve no band.
     if (st->sponsorW > 0 && st->sponsorH > 0) {
@@ -1080,6 +1119,8 @@ void OverdrawSearchChrome(SettingsState* st, HWND hwnd);
 bool PromptName(HWND owner, const wchar_t* prompt, std::wstring& io);
 // Returns true when the state or the sentence changed, i.e. the caller must repaint.
 bool RefreshAutoPinStatus(SettingsState* st);
+// Returns true when the auto-pin rows in the heavy list were rebuilt.
+bool SyncAutoPinRows(SettingsState* st);
 
 // The owner-draw button kind, parked on the control itself. GWLP_USERDATA is zero for a
 // control nobody stamped, so the stored value is kind+1 and 0 reads back as Secondary -
@@ -1377,13 +1418,35 @@ std::wstring ComboText(HWND combo) {
 // The heavy-apps LISTBOX. It replaced a multi-line EDIT, so the two directions that used to
 // be GetText/SetWindowText live here instead. Everything else - what a heavy entry MEANS,
 // and Profile::heavy itself - is unchanged.
+//
+// IT NOW CARRIES TWO KINDS OF ROW, and the difference is load-bearing rather than cosmetic.
+// The user's own entries are their configuration and are saved. The auto-pin rows are a LIVE
+// READBACK of what rule 4 has moved this session; they are transient, they belong to no
+// profile, and writing one into heavy= would silently turn a momentary observation into a
+// permanent setting the user never asked for. The row's item data is what tells them apart,
+// and HeavyItems - the one and only function that feeds Profile::heavy - filters on it.
 // ---------------------------------------------------------------------------
 
-std::vector<std::wstring> HeavyItems(const SettingsState* st) {
+// LB_GETITEMDATA on a row nobody stamped returns 0, so kHeavyRowManual MUST be 0: a row that
+// somehow escaped its stamp is then treated as the user's, which is the harmless direction.
+// The dangerous direction - an auto row read back as configuration - needs a positive value
+// that only this file ever writes.
+enum : LPARAM {
+    kHeavyRowManual = 0,   // the user's entry; the ONLY kind that reaches Profile::heavy
+    kHeavyRowAuto   = 1,   // auto-pin moved this executable; never saved
+    kHeavyRowMore   = 2    // the "+N more" caption; a sentence, not a process
+};
+
+// Row texts. manualOnly is the guard described above, not an optimisation.
+std::vector<std::wstring> HeavyRows(const SettingsState* st, bool manualOnly) {
     std::vector<std::wstring> out;
     if (!st->hHeavy) return out;
     const LRESULT n = SendMessageW(st->hHeavy, LB_GETCOUNT, 0, 0);
     for (LRESULT i = 0; i < n; ++i) {
+        const LRESULT origin = SendMessageW(st->hHeavy, LB_GETITEMDATA,
+                                            static_cast<WPARAM>(i), 0);
+        if (manualOnly && origin != kHeavyRowManual) continue;
+        if (origin == kHeavyRowMore) continue;      // a caption is never a process name
         const LRESULT len = SendMessageW(st->hHeavy, LB_GETTEXTLEN,
                                          static_cast<WPARAM>(i), 0);
         if (len <= 0) continue;
@@ -1397,12 +1460,42 @@ std::vector<std::wstring> HeavyItems(const SettingsState* st) {
     return out;
 }
 
+// THE CONFIG-FACING DIRECTION. StoreUiToProfile writes Profile::heavy from this and from
+// nothing else, so this is the single place the auto-pin rows have to be kept out of - and
+// they are kept out by construction rather than by every caller remembering to.
+std::vector<std::wstring> HeavyItems(const SettingsState* st) {
+    return HeavyRows(st, true);
+}
+
+// How many rows at the FRONT of the list are the user's. The auto-pin rows are always a
+// contiguous tail, which is what lets SyncAutoPinRows delete them without disturbing a single
+// manual index, and what makes this a count rather than a search.
+int ManualRowCount(const SettingsState* st) {
+    if (!st->hHeavy) return 0;
+    const LRESULT n = SendMessageW(st->hHeavy, LB_GETCOUNT, 0, 0);
+    LRESULT i = 0;
+    while (i < n &&
+           SendMessageW(st->hHeavy, LB_GETITEMDATA, static_cast<WPARAM>(i), 0)
+               == kHeavyRowManual) {
+        ++i;
+    }
+    return static_cast<int>(i);
+}
+
 void SetHeavyItems(SettingsState* st, const std::vector<std::wstring>& v) {
     if (!st->hHeavy) return;
     SendMessageW(st->hHeavy, LB_RESETCONTENT, 0, 0);
-    for (size_t i = 0; i < v.size(); ++i)
-        SendMessageW(st->hHeavy, LB_ADDSTRING, 0,
-                     reinterpret_cast<LPARAM>(v[i].c_str()));
+    for (size_t i = 0; i < v.size(); ++i) {
+        const LRESULT row = SendMessageW(st->hHeavy, LB_ADDSTRING, 0,
+                                         reinterpret_cast<LPARAM>(v[i].c_str()));
+        if (row >= 0)
+            SendMessageW(st->hHeavy, LB_SETITEMDATA, static_cast<WPARAM>(row),
+                         kHeavyRowManual);
+    }
+    // The reset took the auto rows with it, so the cache no longer describes the control.
+    // Left stale, the next sync would compare equal and never put them back.
+    st->autoRows.clear();
+    st->autoTotal = 0;
 }
 
 // Appends one entry, case-insensitively de-duplicated, and selects it.
@@ -1412,9 +1505,18 @@ void HeavyAppend(SettingsState* st, const std::wstring& raw) {
     std::vector<std::wstring> v = HeavyItems(st);
     for (size_t i = 0; i < v.size(); ++i)
         if (IEquals(v[i], name)) return;
-    const LRESULT row = SendMessageW(st->hHeavy, LB_ADDSTRING, 0,
+    // INSERTED at the end of the manual block, not appended to the list: the auto rows are a
+    // tail and every other function here relies on that. LB_ADDSTRING would put the user's
+    // new entry after them and break the invariant on the very first use of this button.
+    const LRESULT row = SendMessageW(st->hHeavy, LB_INSERTSTRING,
+                                     static_cast<WPARAM>(ManualRowCount(st)),
                                      reinterpret_cast<LPARAM>(name.c_str()));
-    if (row >= 0) SendMessageW(st->hHeavy, LB_SETCURSEL, static_cast<WPARAM>(row), 0);
+    if (row < 0) return;
+    SendMessageW(st->hHeavy, LB_SETITEMDATA, static_cast<WPARAM>(row), kHeavyRowManual);
+    SendMessageW(st->hHeavy, LB_SETCURSEL, static_cast<WPARAM>(row), 0);
+    // The executable the user has just named themselves must stop being reported as one the
+    // app chose, or it sits in the list twice with two different explanations.
+    SyncAutoPinRows(st);
 }
 
 // ---------------------------------------------------------------------------
@@ -1549,6 +1651,11 @@ void LoadProfileToUi(SettingsState* st) {
     FillMaskCombo(st->hGameMask, st->work, p.gameMask);
     SetHeavyItems(st, p.heavy);
     FillMaskCombo(st->hHeavyMask, st->work, p.heavyMask);
+    // SetHeavyItems has just dropped the previous profile's readback rows along with its
+    // entries. Refilled here rather than left to the timer: a second of a profile's heavy
+    // list with the auto rows missing reads as "the rule has stopped", which is the exact
+    // misreading this feature exists to prevent.
+    SyncAutoPinRows(st);
     SetChecked(st->hAutoPin, p.autoPin);
     SetWindowTextW(st->hPct, std::to_wstring(p.autoPinPercent).c_str());
     // p.autoPinSeconds is deliberately NOT loaded: the seconds control is gone and this UI
@@ -1714,7 +1821,12 @@ bool RefreshCpuSetStages(SettingsState* st) {
     // the user hand-edited on the core map page is still their mask and still has their name.
     const std::vector<Mask>& masks = st->work.masks;
 
-    const std::vector<std::wstring> heavy = HeavyItems(st);
+    // EVERY row, the auto-pin ones included: "which mask is it on RIGHT NOW" is the single
+    // strongest piece of evidence that the rule did what it says, and a row that showed the
+    // tag but no readback would be asking the user to take our word for it. HeavyRows(false)
+    // rather than HeavyItems() - this direction only READS, so the config guard does not
+    // apply, and applying it here would leave exactly the new rows blank.
+    const std::vector<std::wstring> heavy = HeavyRows(st, false);
     for (size_t i = 0; i < heavy.size(); ++i) {
         const std::wstring key = ToLower(heavy[i]);
         if (st->stageByHeavy.find(key) != st->stageByHeavy.end()) continue;   // duplicate row
@@ -1824,6 +1936,123 @@ std::wstring AutoPinTargetMask(const SettingsState* st, const Profile& p) {
     return m.empty() ? std::wstring(L"the background mask") : m;
 }
 
+// ---------------------------------------------------------------------------
+// The auto-pin rows
+// ---------------------------------------------------------------------------
+
+// HOW MANY AUTO ROWS ARE SHOWN AT ONCE, and why there is a limit at all.
+//
+// The set is unbounded in principle: rule 4 admits every process over the threshold and the
+// user may set that threshold to 1%. The list has a minimum of Dp(52) and grows with the window -
+// and the user's OWN entries are the editable half of it. Letting the readback grow without
+// limit would push the rows they came here to edit out of view behind a scrollbar, so the
+// feature that explains auto-pin would break the control it was added to.
+//
+// Scrolling was the alternative and it is worse: the manual rows stay reachable but only by
+// scrolling past a readout, and the row a user is looking for moves every time the auto set
+// changes. Capping keeps the editable rows where they were and costs one honest caption.
+//
+// Eight, and the caption, rather than three: the measured case had SEVEN governed processes,
+// so a cap that hides the normal case would report the feature as busier than it is.
+const size_t kAutoRowsShown = 8;
+
+// Rebuilds the auto-pin rows at the END of the heavy list from what the ENGINE published.
+// Returns true when the rows actually moved.
+//
+// Called from the one 1 s status timer this window already runs - no second timer; this app
+// exists to save CPU and a timer that fires four times a minute to redraw a list nobody is
+// looking at would be the wrong kind of feature. Costs one GetStatus (a mutex and a copy)
+// plus one pass over the governed vector, and touches the control at all only when the set
+// differs from the cached one - LB_DELETESTRING/LB_ADDSTRING churn once a second would reset
+// the selection and the scroll position while the user was reading the list.
+bool SyncAutoPinRows(SettingsState* st) {
+    if (!st || !st->hHeavy) return false;
+
+    std::vector<std::wstring> rows;
+    st->autoApplyByExe.clear();
+    size_t total = 0;
+    bool haveMore = false;
+
+    const bool has = st->selProfile >= 0 &&
+                     st->selProfile < static_cast<int>(st->work.profiles.size());
+    if (has && st->engine) {
+        const Profile& p = st->work.profiles[static_cast<size_t>(st->selProfile)];
+        const EngineStatus s = st->engine->GetStatus();
+        // ONLY while the engine is actually running THIS profile. Rule 1 picks one profile
+        // and the rest are inert, so listing another profile's auto-pinned processes under
+        // this editor would attribute them to a rule that is not running. Paused governs
+        // nothing at all, and the status sentence says so on its own line.
+        if (!s.paused && StatusDescribesProfile(s, p)) {
+            for (size_t i = 0; i < s.governed.size(); ++i) {
+                const GovernedProcess& g = s.governed[i];
+                if (!g.autoPinned) continue;
+                const std::wstring key = ToLower(BaseName(Trim(g.name)));
+                if (key.empty()) continue;
+                AutoApplySummary& summary = st->autoApplyByExe[key];
+                if (g.applyResult == ApplyResult::Ok) {
+                    ++summary.applied;
+                } else if (g.applyResult == ApplyResult::AccessDenied) {
+                    ++summary.accessDenied;
+                } else {
+                    ++summary.failed;
+                }
+            }
+            // The set comes from the ENGINE, collapsed to executables by the pure helper in
+            // engine.h. Nothing about rule 4 is re-decided here: a second implementation in
+            // the window would be free to disagree with the first, and the disagreement
+            // would look exactly like the bug this feature exists to rule out.
+            std::vector<std::wstring> names = AutoPinnedExeNames(s, HeavyItems(st));
+            total = names.size();
+            if (names.size() > kAutoRowsShown) {
+                haveMore = true;
+                names.resize(kAutoRowsShown);
+            }
+            rows.swap(names);
+            if (haveMore) {
+                rows.push_back(L"+" + std::to_wstring(total - kAutoRowsShown) +
+                               L" more auto-pinned");
+            }
+        }
+    }
+
+    st->autoTotal = total;
+    if (rows == st->autoRows) return false;
+    st->autoRows = rows;
+
+    const int sel = static_cast<int>(SendMessageW(st->hHeavy, LB_GETCURSEL, 0, 0));
+    const int top = static_cast<int>(SendMessageW(st->hHeavy, LB_GETTOPINDEX, 0, 0));
+
+    // Drop the old readback. It is a contiguous TAIL - HeavyAppend inserts the user's entries
+    // in front of it - so this walks back from the end and stops at the first manual row, and
+    // no manual index moves.
+    for (int i = static_cast<int>(SendMessageW(st->hHeavy, LB_GETCOUNT, 0, 0)) - 1;
+         i >= 0; --i) {
+        if (SendMessageW(st->hHeavy, LB_GETITEMDATA, static_cast<WPARAM>(i), 0)
+                == kHeavyRowManual) {
+            break;
+        }
+        SendMessageW(st->hHeavy, LB_DELETESTRING, static_cast<WPARAM>(i), 0);
+    }
+    const int manual = static_cast<int>(SendMessageW(st->hHeavy, LB_GETCOUNT, 0, 0));
+
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const LRESULT row = SendMessageW(st->hHeavy, LB_ADDSTRING, 0,
+                                         reinterpret_cast<LPARAM>(rows[i].c_str()));
+        if (row < 0) continue;                       // LB_ERR / LB_ERRSPACE
+        SendMessageW(st->hHeavy, LB_SETITEMDATA, static_cast<WPARAM>(row),
+                     (haveMore && i + 1 == rows.size()) ? kHeavyRowMore : kHeavyRowAuto);
+    }
+
+    // A selection on one of the user's rows is exactly where they left it. A selection that
+    // was on an auto row is CLEARED rather than moved to whatever now occupies that index -
+    // the Remove button acts on the selection, and silently sliding it onto a different
+    // process is how a user deletes an entry they never selected.
+    SendMessageW(st->hHeavy, LB_SETCURSEL,
+                 static_cast<WPARAM>(sel >= 0 && sel < manual ? sel : -1), 0);
+    if (top >= 0) SendMessageW(st->hHeavy, LB_SETTOPINDEX, static_cast<WPARAM>(top), 0);
+    return true;
+}
+
 // Recomputes the state and the sentence. Returns true when either changed - the status dot is
 // drawn by the PARENT, so a colour change needs the parent's repaint, not the label's.
 bool RefreshAutoPinStatus(SettingsState* st) {
@@ -1861,8 +2090,20 @@ bool RefreshAutoPinStatus(SettingsState* st) {
             } else if (StatusDescribesProfile(s, p)) {
                 if (GameOwnsForeground(s)) {
                     want = AutoPinState::Active;
-                    line = L"Active - processes above " + pctText +
-                           L"% are being moved to " + AutoPinTargetMask(st, p) + L".";
+                    // WITH THE COUNT, once there is one. "processes above 1% are being moved"
+                    // is a description of the rule; "3 apps above 1% are on Freq" is a report
+                    // of what happened, and the operator's complaint was that the window only
+                    // ever offered the first. The rows carry the names; this carries the
+                    // number and teaches the tag those rows are marked with.
+                    if (st->autoTotal > 0) {
+                        line = L"Active - " + std::to_wstring(st->autoTotal) +
+                               L" app" + (st->autoTotal == 1 ? L"" : L"s") + L" above " +
+                               pctText + L"% moved to " + AutoPinTargetMask(st, p) +
+                               L", tagged AUTO above.";
+                    } else {
+                        line = L"Active - processes above " + pctText +
+                               L"% are being moved to " + AutoPinTargetMask(st, p) + L".";
+                    }
                 } else {
                     want = AutoPinState::Paused;
                     line = L"Paused - " + game +
@@ -2038,9 +2279,8 @@ std::wstring MaskParkedWarning(const SettingsState* st, const std::wstring& mask
     const std::wstring n = std::to_wstring(total);
     const std::wstring p = std::to_wstring(parked);
     if (parked == total) {
-        return L"Warning: all " + n + L" processors in \"" + maskName +
-               L"\" are currently parked. Windows can accept an assignment to a fully "
-               L"parked mask and then ignore it - the process keeps running elsewhere.";
+        return FormatFullyParkedMaskWarning(maskName, total,
+                                            st->env.amdVCacheServiceRunning);
     }
     if (parked * 2 > total) {
         return p + L" of " + n + L" processors in \"" + maskName +
@@ -2106,6 +2346,37 @@ bool RefreshBlockedLine(SettingsState* st) {
     st->blockedTall = tall;
     st->blockedBad = bad;
     return changed;
+}
+
+// Updates the General page's environment card from the already-probed value. Returns true
+// only when the running-service explanation appeared or disappeared, because that is the
+// only change that alters the card's height and therefore requires a layout pass.
+bool UpdateEnvironmentSection(SettingsState* st) {
+    if (!st) return false;
+
+    const std::wstring game = FormatGameModeEnvironmentStatus(st->env.gameModeState);
+    const std::wstring service =
+        FormatAmdVCacheEnvironmentStatus(st->env.amdVCacheServiceState);
+    const std::wstring effect =
+        st->env.amdVCacheServiceState == AmdVCacheServiceState::Running
+            ? AmdVCacheRunningEffectText()
+            : std::wstring();
+
+    const bool hadEffect = st->hVCacheEffect &&
+                           GetWindowTextLengthW(st->hVCacheEffect) > 0;
+    const bool hasEffect = !effect.empty();
+
+    if (st->hGameModeStatus && GetText(st->hGameModeStatus) != game)
+        SetWindowTextW(st->hGameModeStatus, game.c_str());
+    if (st->hVCacheStatus && GetText(st->hVCacheStatus) != service)
+        SetWindowTextW(st->hVCacheStatus, service.c_str());
+    if (st->hVCacheEffect && GetText(st->hVCacheEffect) != effect)
+        SetWindowTextW(st->hVCacheEffect, effect.c_str());
+    if (st->hVCacheEffect) {
+        ShowWindow(st->hVCacheEffect,
+                   hasEffect && st->page == PAGE_GENERAL ? SW_SHOW : SW_HIDE);
+    }
+    return hadEffect != hasEffect;
 }
 
 // ---------------------------------------------------------------------------
@@ -2204,8 +2475,88 @@ struct Geom {
     }
 };
 
+struct ProfileColumns {
+    int leftW;
+    int rightW;
+};
+
+ProfileColumns MeasureProfileColumns(int clientW, int dpi) {
+    const int gap = theme::Dp(theme::metric::kGap, dpi);
+    int contentW = clientW - 2 * gap;
+    if (contentW < theme::Dp(240, dpi)) contentW = theme::Dp(240, dpi);
+
+    ProfileColumns columns;
+    columns.leftW = contentW * 38 / 100;
+    if (columns.leftW < theme::Dp(260, dpi)) columns.leftW = theme::Dp(260, dpi);
+    if (columns.leftW > theme::Dp(400, dpi)) columns.leftW = theme::Dp(400, dpi);
+    if (columns.leftW > contentW - theme::Dp(320, dpi))
+        columns.leftW = contentW - theme::Dp(320, dpi);
+    if (columns.leftW < theme::Dp(200, dpi)) columns.leftW = theme::Dp(200, dpi);
+
+    columns.rightW = contentW - columns.leftW - gap;
+    if (columns.rightW < theme::Dp(240, dpi)) columns.rightW = theme::Dp(240, dpi);
+    return columns;
+}
+
+struct WarningLayout {
+    bool game;
+    bool heavy;
+    int gameH;
+    int heavyH;
+    int textW;
+    int cardH;
+};
+
+// The warning statics use UiSmall and SS_LEFT, whose default drawing path word-wraps.
+// Dp(36) preserves the old comfortable minimum; Dp(96) bounds pathological narrow-width
+// growth while leaving room for roughly six lines at the supported window widths.
+int MeasureWarningRow(HWND control, HDC dc, int textW, int dpi) {
+    const int floorH = theme::Dp(36, dpi);
+    const int capH = theme::Dp(96, dpi);
+    int height = floorH;
+
+    if (control && dc && textW > 0) {
+        const std::wstring text = GetText(control);
+        RECT measured = { 0, 0, textW, 0 };
+        HFONT font = reinterpret_cast<HFONT>(
+            SendMessageW(control, WM_GETFONT, 0, 0));
+        if (!font) font = theme::GetFont(theme::Font::UiSmall, dpi);
+        HGDIOBJ oldFont = SelectObject(dc, font);
+        const int wrappedH = ::DrawTextW(dc, text.c_str(), static_cast<int>(text.size()),
+                                         &measured, DT_CALCRECT | DT_WORDBREAK);
+        SelectObject(dc, oldFont);
+        if (wrappedH > height) height = wrappedH;
+    }
+
+    if (height > capH) height = capH;
+    return height;
+}
+
+WarningLayout MeasureWarningLayout(SettingsState* st, HDC dc, int cardW, int dpi) {
+    WarningLayout warning = {};
+    if (!st) return warning;
+
+    warning.game = st->hGameMaskWarn && GetWindowTextLengthW(st->hGameMaskWarn) > 0;
+    warning.heavy = st->hHeavyMaskWarn && GetWindowTextLengthW(st->hHeavyMaskWarn) > 0;
+
+    const int pad = theme::Dp(theme::metric::kCardPad, dpi);
+    const int gapTight = theme::Dp(theme::metric::kGapTight, dpi);
+    warning.textW = cardW - 2 * pad - theme::Dp(18, dpi);
+    if (warning.textW < 1) warning.textW = 1;
+
+    if (warning.game)
+        warning.gameH = MeasureWarningRow(st->hGameMaskWarn, dc, warning.textW, dpi);
+    if (warning.heavy)
+        warning.heavyH = MeasureWarningRow(st->hHeavyMaskWarn, dc, warning.textW, dpi);
+
+    const int rows = (warning.game ? 1 : 0) + (warning.heavy ? 1 : 0);
+    if (rows > 0)
+        warning.cardH = 2 * pad + warning.gameH + warning.heavyH + (rows - 1) * gapTight;
+    return warning;
+}
+
 // `put` may be null: PaintSettings needs the geometry without moving anything.
-void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put) {
+void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measureDc) {
     RECT rc;
     GetClientRect(hwnd, &rc);
     const int dpi = st->dpi;
@@ -2273,55 +2624,103 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put) {
     if (W < theme::Dp(240, dpi)) W = theme::Dp(240, dpi);
 
     // ---- the sponsor panel -------------------------------------------------------------
-    // NO width or height for it is written down in this file. SponsorBandSize above returns
-    // the natural size of whichever rendering is actually in play - the WebView2 panel's
-    // measured 462 x 150, or the GDI control's own cd::SponsorMeasure - so when either
-    // changes shape, this layout follows it instead of going stale silently. That claim was
-    // TESTED on 2026-08-29: the panel went 272x261 -> 462x150 and not one line in this file
-    // needed editing, because no width or height for it is written down here.
+    // NO HEIGHT for it is written down in this file, and there is no natural width left to
+    // write down. SponsorBandSize above returns whichever rendering is actually in play - the
+    // WebView2 panel's measured floor and height, or the GDI control's own cd::SponsorMeasure -
+    // so when either changes SIZE, this layout follows it instead of going stale silently. That
+    // held through 272x261 -> 462x150 -> 831x65 without one line here being edited.
     //
-    // BOTTOM RIGHT, above the footer. The panel's right edge lines up with the right edge of
-    // the Apply button - the same cw - GAP margin the footer row below uses - and it sits
-    // exactly kGap above that row. It is neither centred nor stretched: the WebView2 page
-    // draws a fixed-width card and stretching the host would only put transparent dead space
-    // beside it, while the GDI control packs its buttons from its own left edge.
+    // IT DID NOT HOLD THIS TIME, and the reason is worth recording rather than glossing: the
+    // panel did not change size, it changed KIND. It stopped having a width of its own, which is
+    // a question about PLACEMENT, and placement has always lived here. A layout that reads a
+    // measurement cannot follow a change in what the measurement means.
+    //
+    // THE TWO RENDERINGS ARE NOW PLACED DIFFERENTLY, AND THAT IS NOT AN INCONSISTENCY.
+    //
+    //   WebView2  FULL WIDTH, one kGap a side. Its centre line is the window's centre line by
+    //             construction rather than by arithmetic - it spans the whole content row, so
+    //             it cannot be anywhere else. The page is `.shell.is-open { width: 100% }` and
+    //             spreads its three groups across whatever host it is given with
+    //             `justify-content: space-between`, so the gaps between the groups grow with
+    //             the window. Handing it anything narrower would shrink those gaps for no
+    //             reason; handing it a right-anchored fixed width - which is what this did
+    //             until 2026-08-29 - pins the whole panel back into the bottom-right corner.
+    //             band.cx is that rendering's FLOOR and is DELIBERATELY UNUSED on this path -
+    //             it is overwritten below. The floor's one consumer is WM_GETMINMAXINFO, which
+    //             keeps the window wide enough that the full-width host is never narrower than
+    //             it. band.cy is what this path takes from the measurement.
+    //   GDI       ITS OWN NATURAL WIDTH, right-anchored, exactly as before: its right edge
+    //             lines up with the right edge of the Apply button, the same cw - GAP margin
+    //             the footer row below uses. It is a DIFFERENT CONTROL WITH A DIFFERENT DESIGN
+    //             - sponsor.cpp packs its buttons from its own left edge and paints nothing
+    //             behind them - so stretching it across the window would leave a wide empty
+    //             strip with three buttons huddled at one end.
     //
     // When there is nothing to show the size is zero and the band collapses entirely.
     const SIZE band = SponsorBandSize(st, dpi);
     int spW = static_cast<int>(band.cx);
     int spH = static_cast<int>(band.cy);
 
-    // IF IT DOES NOT FIT, IT CLIPS AT ITS OWN TOP AND LEFT - it never pushes the footer or
-    // the page content. The footer row and the gap above it are fixed points; the panel is
-    // decoration plus three links and is the thing that gives. `avail` is everything between
-    // the tab bar and that gap, so at a DPI or window size where the stack cannot fit, the
-    // user loses the top of the panel rather than the OK button.
+    // WHICH RENDERING THE BAND WAS MEASURED FOR. This is the SAME expression SponsorBandSize
+    // uses to choose, and it has to stay that way: if the two ever disagree the panel is laid
+    // out to the other one's shape. `webLate` means the patience timer put the GDI strip on
+    // screen because the page had not reported in, so the band is the GDI row's and so is the
+    // placement.
+    const bool webBand = (st->web != nullptr && !st->webLate);
+
+    // IF IT DOES NOT FIT, IT CLIPS - it never pushes the footer or the page content. The footer
+    // row and the gap above it are fixed points; the panel is decoration plus three links and is
+    // the thing that gives. `avail` is everything between the tab bar and that gap, so at a DPI
+    // or window size where it cannot fit, the user loses part of the panel rather than the OK
+    // button.
+    //
+    // WHICH part has changed with the placement, and it is worth saying plainly. The old
+    // fixed-width panel clipped at its own LEFT edge, so the lockup in the bottom-right survived.
+    // A `space-between` row that runs out of room overflows its END edge, so what disappears
+    // behind `.shell { overflow: hidden }` is the RIGHT-hand group - the GOATPROJECT lockup.
+    // Nothing degrades gracefully any more; what prevents it is the window minimum staying above
+    // kSponsorCssMinWidth, which is what WM_GETMINMAXINFO below is for.
     const int avail = (ch - footerH - GAP) - (TABH + GAP);
     if (spH > avail) spH = avail > 0 ? avail : 0;
-    if (spW > cw - 2 * GAP) spW = cw - 2 * GAP;
-    if (spW < 0) spW = 0;
+
+    int spLeft;
+    if (webBand) {
+        // THE HOST WINDOW IS THE CONTENT ROW.
+        spW = cw - 2 * GAP;
+        spLeft = GAP;
+    } else {
+        if (spW > cw - 2 * GAP) spW = cw - 2 * GAP;
+        spLeft = cw - GAP - spW;
+    }
+    if (spW < 0) {
+        spW = 0;
+        spLeft = GAP;
+    }
 
     const int spTop = ch - footerH - GAP - spH;
-    if (spH > 0 && spW > 0) {
-        // The left edge is what gives when the window is narrow: the panel clips against the
-        // client edge rather than moving the footer buttons or the page content.
-        const int spLeft = cw - GAP - spW;
-        if (st->web != nullptr) {
-            // The host window IS the panel - same rectangle, no margin. The page draws a card
-            // exactly kSponsorCssWidth wide, so any extra width here would be transparent
-            // filler that pushes the visible card away from the Apply button it lines up
-            // with.
-            RECT wr;
-            ::SetRect(&wr, spLeft, spTop, spLeft + spW, spTop + spH);
-            WebSponsorMove(st->web, wr);
-            // The GDI control is the fallback and is hidden while the webview is in play, but
-            // it is still moved into the SAME rectangle: SponsorWebReady can show it at any
-            // moment, and a control parked at a stale position would appear in the wrong place
-            // for the one frame before the next layout.
-            Put(st->hSponsor, spLeft, spTop, spW, spH);
-        } else {
-            Put(st->hSponsor, spLeft, spTop, spW, spH);
-        }
+    if (spH > 0 && spW > 0 && st->web != nullptr) {
+        // The host window IS the panel - same rectangle, no margin, transparent behind it.
+        // It is moved even when the GDI strip is the one on screen (webLate): the host is
+        // hidden then, and this only stops it sitting where it was created for the one frame
+        // before SponsorWebReady re-runs this layout.
+        RECT wr;
+        ::SetRect(&wr, spLeft, spTop, spLeft + spW, spTop + spH);
+        WebSponsorMove(st->web, wr);
+    }
+    // THE FALLBACK IS PARKED AT ITS OWN RECTANGLE, NEVER THE PANEL'S. When the GDI strip is the
+    // band, this is the same rectangle the block above computed, so nothing moved. When the
+    // WebView2 panel is up the strip is hidden - but SponsorWebReady and the patience timer both
+    // call ShowWindow BEFORE they re-run this layout, so whatever position it is holding is what
+    // the user sees for one frame. Until 2026-08-29 that was the panel's rectangle, which was at
+    // least a strip-shaped one; the panel is now the whole content row and a 45px strip stretched
+    // across it is not. Parking it where it actually belongs costs one SetWindowPos per layout.
+    if (st->sponsorW > 0 && st->sponsorH > 0) {
+        int gW = st->sponsorW;
+        int gH = st->sponsorH;
+        if (gW > cw - 2 * GAP) gW = cw - 2 * GAP;
+        if (gH > avail) gH = avail > 0 ? avail : 0;
+        if (gW > 0 && gH > 0)
+            Put(st->hSponsor, cw - GAP - gW, ch - footerH - GAP - gH, gW, gH);
     }
     // The page content stops a gap above the panel; with no panel this is the old value
     // (ch - footerH - GAP) unchanged.
@@ -2342,23 +2741,16 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put) {
         // the auto-pin rule that used to have a page of its own. Stacked in one column that
         // does not fit the minimum window height; side by side it does, and the horizontal
         // space the rail used to occupy is what pays for it.
-        int LW = W * 38 / 100;
-        if (LW < theme::Dp(260, dpi)) LW = theme::Dp(260, dpi);
-        if (LW > theme::Dp(400, dpi)) LW = theme::Dp(400, dpi);
-        if (LW > W - theme::Dp(320, dpi)) LW = W - theme::Dp(320, dpi);
-        if (LW < theme::Dp(200, dpi)) LW = theme::Dp(200, dpi);
+        const ProfileColumns columns = MeasureProfileColumns(cw, dpi);
+        const int LW = columns.leftW;
         const int RX = x0 + LW + GAP;
-        int RW = W - LW - GAP;
-        if (RW < theme::Dp(240, dpi)) RW = theme::Dp(240, dpi);
+        const int RW = columns.rightW;
 
-        const bool warnGame  = st->hGameMaskWarn  &&
-                               GetWindowTextLengthW(st->hGameMaskWarn) > 0;
-        const bool warnHeavy = st->hHeavyMaskWarn &&
-                               GetWindowTextLengthW(st->hHeavyMaskWarn) > 0;
+        const WarningLayout warning = MeasureWarningLayout(st, measureDc, RW, dpi);
+        const bool warnGame = warning.game;
+        const bool warnHeavy = warning.heavy;
         const int warnRows = (warnGame ? 1 : 0) + (warnHeavy ? 1 : 0);
-        const int warnRowH = theme::Dp(36, dpi);
-        const int warnCardH = warnRows > 0
-            ? 2 * PAD + warnRows * warnRowH + (warnRows - 1) * GT : 0;
+        const int warnCardH = warning.cardH;
 
         // ---- left column: the profile list ----------------------------------
         // Header row, search box, list, four buttons. The list takes every pixel the column
@@ -2401,7 +2793,7 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put) {
             // The live status line. Two lines of UiSmall at the narrowest column this page
             // allows, because the longest sentence names an executable and a mask name.
             const int statusH = theme::Dp(34, dpi);
-            const int minHeavy = theme::Dp(52, dpi), maxHeavy = theme::Dp(140, dpi);
+            const int minHeavy = theme::Dp(52, dpi);
             // header, enabled, game, game mask, heavy label, [heavy], heavy mask,
             // auto-pin, description, percent row, status row.
             const int fixedR = 2 * PAD + HH + GT + ROW + GT + ROW + GT + ROW + GT +
@@ -2412,7 +2804,6 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put) {
                         (warnRows > 0 ? warnCardH + GAP : 0);
             if (slack > 0) {
                 int take = slack;
-                if (take > maxHeavy - minHeavy) take = maxHeavy - minHeavy;
                 heavyH += take;
             }
 
@@ -2532,13 +2923,13 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put) {
             if (warnGame) {
                 DotItem d = { wc.left + PAD + dotR, wy + theme::Dp(9, dpi), dotR, pal.warn };
                 if (g.nDot < 4) g.dot[g.nDot++] = d;
-                Put(st->hGameMaskWarn, tx, wy, wc.right - PAD - tx, warnRowH);
-                wy += warnRowH + GT;
+                Put(st->hGameMaskWarn, tx, wy, warning.textW, warning.gameH);
+                wy += warning.gameH + GT;
             }
             if (warnHeavy) {
                 DotItem d = { wc.left + PAD + dotR, wy + theme::Dp(9, dpi), dotR, pal.warn };
                 if (g.nDot < 4) g.dot[g.nDot++] = d;
-                Put(st->hHeavyMaskWarn, tx, wy, wc.right - PAD - tx, warnRowH);
+                Put(st->hHeavyMaskWarn, tx, wy, warning.textW, warning.heavyH);
             }
             ry = wc.bottom + GAP;
         }
@@ -2672,6 +3063,28 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put) {
             theme::Dp(80, dpi), RH);
         y = c.bottom + GAP;
 
+        // Live scheduling influences. The two state rows use the same card/row rhythm as
+        // the General controls above. The explanation exists only while the AMD service is
+        // RUNNING, and its pure wording is shared with the parked-mask warning.
+        const bool showEffect = st->hVCacheEffect &&
+                                GetWindowTextLengthW(st->hVCacheEffect) > 0;
+        const int effectH = theme::Dp(34, dpi);
+        int envH = 2 * PAD + HH + GT + ROW + GT + ROW;
+        if (showEffect) envH += GT + effectH;
+        RECT envCard = AddCard(y, envH, x0, W);
+        ix = envCard.left + PAD; iy = envCard.top + PAD; iw = W - 2 * PAD;
+        Say(ix, iy, ix + iw, iy + HH, L"Environment",
+            theme::Font::UiHeading, pal.textPrimary, kL);
+        iy += HH + GT;
+        Put(st->hGameModeStatus, ix, iy + (ROW - LH) / 2, iw, LH);
+        iy += ROW + GT;
+        Put(st->hVCacheStatus, ix, iy + (ROW - LH) / 2, iw, LH);
+        if (showEffect) {
+            iy += ROW + GT;
+            Put(st->hVCacheEffect, ix, iy, iw, effectH);
+        }
+        y = envCard.bottom + GAP;
+
         const int blockedH = theme::Dp(st->blockedTall ? 84 : 52, dpi);
         const int headRow = BH > HH ? BH : HH;
         RECT c2 = AddCard(y, 2 * PAD + headRow + GT + blockedH, x0, W);
@@ -2698,7 +3111,9 @@ void SettingsLayout(SettingsState* st, HWND hwnd) {
     PosBatch put;
     put.n = 0;
     Geom g;
-    LayoutPage(st, hwnd, g, &put);
+    HDC dc = GetDC(hwnd);
+    LayoutPage(st, hwnd, g, &put, dc);
+    if (dc) ReleaseDC(hwnd, dc);
     put.Flush();
 }
 
@@ -2707,7 +3122,7 @@ void SettingsLayout(SettingsState* st, HWND hwnd) {
 // drawn straight under the controls that sit on it.
 void PaintSettings(SettingsState* st, HWND hwnd, HDC dc) {
     Geom g;
-    LayoutPage(st, hwnd, g, nullptr);
+    LayoutPage(st, hwnd, g, nullptr, dc);
     const int dpi = st->dpi;
     const theme::Palette& pal = theme::P();
 
@@ -2865,6 +3280,21 @@ BOOL DrawHeavyItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
         if (got > 0) name.assign(buf.data(), static_cast<size_t>(got));
     }
 
+    const LRESULT origin = SendMessageW(di->hwndItem, LB_GETITEMDATA,
+                                        static_cast<WPARAM>(di->itemID), 0);
+
+    // The "+N more" row is a SENTENCE, not a process. It gets no meter, no readback and no
+    // percentage: every one of those would be a claim about a process this row does not name,
+    // and an empty meter beside a caption reads as "that process is idle".
+    if (origin == kHeavyRowMore) {
+        if (t.right > t.left && !name.empty()) {
+            theme::DrawText(di->hDC, t, name, theme::Font::UiSmall, dpi, pal.textDim,
+                            DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
+                                DT_END_ELLIPSIS);
+        }
+        return TRUE;
+    }
+
     bool running = false;
     const double pct = CpuForExe(st, name, running);
 
@@ -2946,6 +3376,66 @@ BOOL DrawHeavyItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
             if (t.right < t.left) t.right = t.left;
         }
     }
+
+    // WHICH KIND OF ROW IS THIS. The two are the same shape and carry the same three columns,
+    // so without a mark the user cannot tell an entry they chose from one the app chose - and
+    // the whole point of showing the second kind is that they are different things. An accent
+    // pill is this window's existing idiom for exactly that: the profile list marks its All
+    // Games row the same way, in the same place, in the same colours.
+    //
+    // Anchored to the RIGHT edge of the name column, which is a fixed x for every row, so the
+    // pills line up in a column and the names stay left-aligned. A leading badge would have
+    // indented the auto rows' names away from the manual ones and made the list read ragged.
+    // No gutter is reserved on manual rows: at the narrowest column this page allows, Dp(44)
+    // taken from every name is the difference between reading an executable and reading an
+    // ellipsis, and the rows that pay for the tag should be the rows that carry it.
+    if (origin == kHeavyRowAuto) {
+        std::wstring pillText = L"AUTO";
+        COLORREF pillBg = pal.accent;
+        bool failed = false;
+        const std::map<std::wstring, AutoApplySummary>::const_iterator ai =
+            st->autoApplyByExe.find(ToLower(BaseName(Trim(name))));
+        if (ai != st->autoApplyByExe.end()) {
+            const AutoApplySummary& summary = ai->second;
+            if (summary.accessDenied > 0) {
+                pillText = summary.applied == 0 && summary.failed == 0
+                               ? L"ACCESS DENIED"
+                               : L"SOME DENIED";
+                pillBg = pal.danger;
+                failed = true;
+            } else if (summary.failed > 0) {
+                pillText = summary.applied == 0 ? L"AUTO FAILED" : L"SOME FAILED";
+                pillBg = pal.danger;
+                failed = true;
+            }
+        }
+        SIZE pillTextSize = theme::MeasureText(
+            di->hDC, pillText, theme::Font::UiSmall, dpi);
+        // DrawPill consumes Dp(8) per side; Dp(20) covers that Dp(16) plus slack.
+        const int pillHorizontalPadding = theme::Dp(20, dpi);
+        int pw = pillTextSize.cx + pillHorizontalPadding;
+        // Failure is the important claim. If the full phrase would disappear at the
+        // existing name-width floor, keep the reason visible in a shorter form instead.
+        if (failed && t.right - pw <= t.left + theme::Dp(56, dpi)) {
+            pillText = ai->second.accessDenied > 0 ? L"DENIED" : L"FAILED";
+            pillTextSize = theme::MeasureText(
+                di->hDC, pillText, theme::Font::UiSmall, dpi);
+            pw = pillTextSize.cx + pillHorizontalPadding;
+        }
+        const int ph = theme::Dp(15, dpi);
+        const int mid2 = (di->rcItem.top + di->rcItem.bottom) / 2;
+        RECT pill;
+        SetRect(&pill, t.right - pw, mid2 - ph / 2, t.right, mid2 - ph / 2 + ph);
+        // Successful AUTO keeps the original name floor. A failure gets priority and needs
+        // only enough remaining room to identify a short executable such as HYP.exe.
+        const int nameFloor = theme::Dp(failed ? 32 : 56, dpi);
+        if (pill.left > t.left + nameFloor) {
+            theme::DrawPill(di->hDC, pill, pillText, dpi, pillBg, pal.textOnAccent);
+            t.right = pill.left - theme::Dp(6, dpi);
+            if (t.right < t.left) t.right = t.left;
+        }
+    }
+
     if (t.right > t.left && !name.empty()) {
         theme::DrawText(di->hDC, t, name, theme::Font::MonoBody, dpi,
                         running ? pal.textPrimary : pal.textDim,
@@ -2972,6 +3462,7 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
     HWND coremap[]  = { st->hMapHdr, st->hTopoText, st->hMapMaskLbl, st->hMapMask,
                         st->hMapReset, st->hMap, st->hMapFail };
     HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify, st->hPollLbl, st->hPoll,
+                        st->hGameModeStatus, st->hVCacheStatus, st->hVCacheEffect,
                         st->hBlocked, st->hInspect };
 
     const HWND* src = nullptr;
@@ -2996,7 +3487,8 @@ void ApplyPageVisibility(SettingsState* st) {
             bool show = on;
             // The two parked warnings and the auto-pin status line take part in the page's
             // visibility, but only when they actually have something to say.
-            if (h == st->hGameMaskWarn || h == st->hHeavyMaskWarn || h == st->hAutoStatus)
+            if (h == st->hGameMaskWarn || h == st->hHeavyMaskWarn ||
+                h == st->hAutoStatus || h == st->hVCacheEffect)
                 show = on && GetWindowTextLengthW(h) > 0;
             ShowWindow(h, show ? SW_SHOW : SW_HIDE);
         }
@@ -3026,7 +3518,7 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
     HWND smalls[] = { st->hGameLbl, st->hGameMaskLbl, st->hHeavyLbl, st->hHeavyMaskLbl,
                       st->hGameMaskWarn, st->hHeavyMaskWarn, st->hAutoDesc, st->hPctLbl,
                       st->hAutoStatus, st->hTopoText, st->hMapMaskLbl,
-                      st->hPollLbl, st->hBlocked, st->hMapFail };
+                      st->hPollLbl, st->hVCacheEffect, st->hBlocked, st->hMapFail };
     for (HWND h : smalls)
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(small), TRUE);
 
@@ -3336,10 +3828,14 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // seconds field for the user to set. The debounce still exists - it is fixed at
             // kAutoPinDebounceTicks and is not a setting - so the wording does not promise
             // that the rule fires on a single sample either.
+            // The legend for the AUTO tag lives HERE rather than in the list's caption or in
+            // a fourth static, and the sentence was tightened to pay for it in the same two
+            // lines: descH is a fixed Dp(34) and the right-hand card has no slack to give -
+            // see fixedR in SettingsLayout, which already competes with the list's own floor.
             st->hAutoDesc = Mk(hwnd, L"STATIC",
-                               L"While this game is in the foreground, move any process that "
-                               L"stays above the threshold onto the background mask. It stays "
-                               L"there until the game exits.",
+                               L"While this game is in front, processes that stay above the "
+                               L"threshold move to the background mask until the game exits. "
+                               L"The list above tags them AUTO.",
                                SS_LEFT, -1);
             st->hPctLbl = Mk(hwnd, L"STATIC", L"Pin a process above", SS_LEFT, -1);
             st->hPct = Mk(hwnd, L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
@@ -3391,6 +3887,10 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             st->hPollLbl = Mk(hwnd, L"STATIC", L"Poll interval (ms):", SS_LEFT, -1);
             st->hPoll = Mk(hwnd, L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
                            IDC_POLL);
+            st->hGameModeStatus = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
+            st->hVCacheStatus = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
+            st->hVCacheEffect = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
+            if (st->hVCacheEffect) ShowWindow(st->hVCacheEffect, SW_HIDE);
             st->hBlocked = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
             st->hInspect = Mk(hwnd, L"BUTTON", L"Inspect processes...",
                               BS_OWNERDRAW | WS_TABSTOP, IDC_INSPECT);
@@ -3499,6 +3999,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             LoadProfileToUi(st);
             SelectMapMask(st);
             RefreshBlockedLine(st);
+            UpdateEnvironmentSection(st);
             // The first snapshot has no predecessor, so every percentage in it is 0. The
             // meters fill in on the next timer tick; they never show a made-up figure.
             RefreshCpuTable(st);
@@ -3541,48 +4042,79 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // pixels instead of leaving a band of dead space above the footer.
             //
             // AND IT SHRANK AGAIN ON 2026-08-29. The panel was re-grouped from the plugin's
-            // 261px VERTICAL STACK into a ~150px wide row, so this minimum dropped by ~111px.
-            // needH adds only the panel's HEIGHT; the minimum WIDTH stays Dp(860), which the
-            // 462px panel fits inside with room to spare.
+            // 261px VERTICAL STACK into a single row, so this minimum dropped by ~111px. needH
+            // adds only the panel's HEIGHT; the minimum WIDTH is argued separately below.
             MINMAXINFO* mm = reinterpret_cast<MINMAXINFO*>(lp);
             if (!mm) break;
             const int dpi = st ? st->dpi : DpiOf(hwnd);
-            // 660 + the status row (Dp 34) + its gap (kGapTight, Dp 6).
+            // 660 + the status row (Dp 34) + its gap (kGapTight, Dp 6). That
+            // existing floor already budgets the old worst case: two Dp(36)
+            // warning rows. Wrapped warnings can be taller, so add only the
+            // measured excess over that legacy card at the minimum client width.
+            const int minClientW = theme::Dp(880, dpi);
+            const ProfileColumns minColumns = MeasureProfileColumns(minClientW, dpi);
+            HDC measureDc = st ? GetDC(hwnd) : nullptr;
+            const WarningLayout warning =
+                MeasureWarningLayout(st, measureDc, minColumns.rightW, dpi);
+            if (measureDc) ReleaseDC(hwnd, measureDc);
+            const int legacyWarningCardH =
+                2 * theme::Dp(theme::metric::kCardPad, dpi) + 2 * theme::Dp(36, dpi) +
+                theme::Dp(theme::metric::kGapTight, dpi);
             int needH = theme::Dp(700, dpi);
+            if (warning.cardH > legacyWarningCardH)
+                needH += warning.cardH - legacyWarningCardH;
             {
                 const SIZE band = SponsorBandSize(st, dpi);
                 if (band.cx > 0 && band.cy > 0)
                     needH += static_cast<int>(band.cy) + theme::Dp(theme::metric::kGap, dpi);
             }
-            // 860 -> 880 ON 2026-08-29. THIS IS A ROBUSTNESS AND LAYOUT CHOICE, NOT A CLIPPING
-            // FIX, and the distinction matters because the clipping argument does NOT support
-            // it - an earlier version of this comment claimed it did, and that was wrong.
+            // THE MINIMUM WIDTH IS Dp(880), AND WHAT IT IS FOR HAS CHANGED. It used to be a
+            // robustness choice with no clipping argument behind it, because the panel was a
+            // fixed 831 CSS px card that could not be too wide for a window this size. THE PANEL
+            // NOW FILLS THE WINDOW, so the question is the mirror image - is this minimum WIDE
+            // ENOUGH for the panel? - and it is a hard requirement rather than a preference.
             //
-            // What actually prevents a clipped panel is the generator's own ceiling:
-            // tools\gen-sponsor-html.py refuses to write src\sponsor_html.h above 835 CSS px.
-            // That fires at generation time, before a build exists, which is strictly earlier
-            // than a wider window could help. 835 rather than the naive 860-2*12=836, because
-            // 836 yields a -1px margin at 144 of the 385 integer DPI values custom scaling
-            // allows (dpi 100, 101, 108...) - correct in CSS px and wrong as a guard.
+            // The panel is one row of three groups spread with `justify-content: space-between`,
+            // and it has a FLOOR: kSponsorCssMinWidth, the narrowest host at which the three
+            // groups still fit. Below it the row overflows its end edge and
+            // `.shell { overflow: hidden }` cuts the GOATPROJECT lockup off, silently, with no
+            // error anywhere.
             //
-            // The panel is 831 and a sweep of every integer dpi 96..480 puts the worst margin
-            // at 4px (dpi 100). So it never clips, and 880 buys no safety the guard lacks.
+            // RE-DERIVED 2026-08-29, and the numbers are measured, not reasoned about:
             //
-            // The honest reasons for 880 are:
-            //   * defence in depth. The guard lives in a Python script; a regression there is
-            //     silent in a way this constant is not. 4px is thin enough that a future change
-            //     to kGap, to the frame, or to the panel would eat it without warning.
-            //   * layout. At Dp(860) the 831px panel spans 831 of the 836 available - edge to
-            //     edge across the whole content row at the minimum size.
-            //   * it is nearly free HERE, because the same turn shrank the panel from 150 to 65
-            //     CSS px tall and needH fell with it: the minimum went 860x862 -> 880x777.
-            //     20px wider, 85px shorter. On the laptops where a minimum actually binds, the
-            //     height was the binding constraint, so this is a net loosening.
+            //   [M] kSponsorCssMinWidth = 849 (src\sponsor_html.h). tools\measure-panel.py
+            //       renders the shipped page and sweeps the host width 1000px down to 640px in
+            //       1px steps: the first break is at 848 (row-overflow), so the floor is 849.
+            //       The generator's own --measure pass reports the same 848.83 intrinsic width
+            //       from `width:max-content` - two independent routes, one answer.
+            //   [M] The panel gets cw - 2 * theme::metric::kGap, so at this minimum it has
+            //       880 - 2 * 12 = 856 CSS px. 849 fits with 7 to spare.
+            //   [M] 856 is the CSS-px answer and not the guard: the three MulDiv calls round
+            //       independently, so the largest floor that is safe at EVERY integer dpi from
+            //       96 to 480 (custom scaling runs 100%..500%) is 855. 849 is inside it.
+            //   [M] Sweeping every one of those 385 DPI values, the worst margin is 7 DEVICE px,
+            //       at dpi 96; it GROWS with DPI (9 at 125%, 10 at 150%, 12 at 175%) because
+            //       7 CSS px scale up while the rounding error stays at most 1px. The thin case
+            //       is 100% and even there nothing rounds it away.
+            //
+            // COULD IT BE SMALLER? Yes: Dp(874) is the smallest minimum at which a 849px floor
+            // is safe at every DPI. It is not taken. 880 costs 6 CSS px against 874, and buys:
+            //   * headroom for the panel's floor to move. The floor is a MEASUREMENT of four
+            //     intrinsic widths and two gaps; a font-metric change moves it, and at 874 the
+            //     margin is zero, so the next re-measure would fail the generator's guard rather
+            //     than absorb it.
+            //   * defence in depth. What refuses an over-budget panel is a Python script's
+            //     guard; a regression there is silent in a way this constant is not.
+            //   * it is already the shipped minimum, so keeping it changes nothing for anyone.
             //
             // Not more than 880: at 150% scaling Dp(880) is 1320 device px and still fits a
             // 1366-wide screen with 30px spare. Dp(900) leaves exactly ZERO there; Dp(920)
             // does not fit at all.
-            RECT need = { 0, 0, theme::Dp(880, dpi), needH };
+            //
+            // MIN_CLIENT_CSS_W in tools\gen-sponsor-html.py AND in tools\measure-panel.py is
+            // this same 880. All three have to move together or the guard is measuring a window
+            // that does not exist.
+            RECT need = { 0, 0, minClientW, needH };
             AdjustWindowRectEx(&need, WS_OVERLAPPEDWINDOW, FALSE, 0);
             mm->ptMinTrackSize.x = need.right - need.left;
             mm->ptMinTrackSize.y = need.bottom - need.top;
@@ -3655,15 +4187,27 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (st && wp == kStatusTimer) {
                 bool relayout = RefreshBlockedLine(st);
+                // Query-only live refresh: one Game Mode registry value and exactly the
+                // named AMD service. CPU brand/elevation stay on the full one-time probe;
+                // no service enumeration and no second timer are introduced.
+                RefreshEnvironmentStatus(st->env);
+                if (UpdateEnvironmentSection(st)) relayout = true;
                 // Parked state moves under load, so the warnings are re-checked on the same
                 // beat as the core map's own parked refresh rather than only at selection.
                 RefreshLiveTopology(st);
                 if (UpdateMaskWarnings(st)) relayout = true;
+                // BEFORE the status sentence, which reports the count this sets. Same timer,
+                // no second one: see kAutoRowsShown for what this costs and why it is not
+                // behind the visibility guard the CPU sampling is - it opens no process and
+                // enumerates nothing, so gating it would save nothing and let the rows go
+                // stale for a second every time the page came back.
+                bool autoRowsMoved = SyncAutoPinRows(st);
                 // The auto-pin state is live: the game starts, the user alt-tabs, another
                 // profile takes over. The sentence and the dot both move with it, and so does
                 // the meters' colour ramp - which is why the heavy list is invalidated below
                 // whenever this reports a change, not only when a percentage moved.
                 bool autoChanged = RefreshAutoPinStatus(st);
+                if (autoRowsMoved) autoChanged = true;
                 if (st->hMap) CoreMapRefreshParked(st->hMap);
                 // The heavy-apps meters live on this same beat. Sampled only while their list
                 // is actually on screen - a hidden page has nothing to show and the snapshot
@@ -3726,6 +4270,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // card going quiet.
                     fg = (st->autoState == AutoPinState::Off) ? pal.textDim
                                                               : pal.textSecondary;
+                } else if (ctl == st->hVCacheEffect) {
+                    fg = pal.textDim;
                 } else if (IsAutoPinLabel(st, ctl) && AutoPinLabelsAreDim(st)) {
                     // These three stay enabled on purpose - see SyncAutoPinEnable - so the
                     // "off" state has to be carried by the colour rather than by the control's
@@ -3897,14 +4443,29 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     const int row = static_cast<int>(
                         SendMessageW(st->hHeavy, LB_GETCURSEL, 0, 0));
                     if (row < 0) return 0;
+                    // An auto-pin row is a readback, not a setting: there is nothing in the
+                    // profile to remove, and deleting it would put back a row the next tick
+                    // while the user believed they had changed something. Refused silently -
+                    // SyncAutoPinRows never leaves such a row selected, so reaching this
+                    // needs a keyboard selection between two ticks.
+                    if (SendMessageW(st->hHeavy, LB_GETITEMDATA,
+                                     static_cast<WPARAM>(row), 0) != kHeavyRowManual) {
+                        return 0;
+                    }
                     SendMessageW(st->hHeavy, LB_DELETESTRING,
                                  static_cast<WPARAM>(row), 0);
-                    const LRESULT left = SendMessageW(st->hHeavy, LB_GETCOUNT, 0, 0);
+                    // The selection follows the delete, but only within the user's OWN rows.
+                    // Deleting the last manual entry used to leave the cursor on whatever
+                    // occupied that index, which is now the first auto-pin row - a readback
+                    // sitting under a Remove button that would refuse to act on it.
+                    const int left = ManualRowCount(st);
                     if (left > 0) {
-                        const int next = row < static_cast<int>(left)
-                                             ? row : static_cast<int>(left) - 1;
+                        const int next = row < left ? row : left - 1;
                         SendMessageW(st->hHeavy, LB_SETCURSEL,
                                      static_cast<WPARAM>(next), 0);
+                    } else {
+                        SendMessageW(st->hHeavy, LB_SETCURSEL,
+                                     static_cast<WPARAM>(-1), 0);
                     }
                     return 0;
                 }
@@ -4010,19 +4571,22 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 void RegisterSettingsClass() {
     static bool done = false;
     if (done) return;
+    HINSTANCE hInst = GetModuleHandleW(nullptr);
     // Registering the tab bar again is harmless - RegisterClassExW simply fails with
     // ERROR_CLASS_ALREADY_EXISTS - and it means this window does not depend on the host
     // having got there first.
-    theme::TabBarRegister(GetModuleHandleW(nullptr));
+    theme::TabBarRegister(hInst);
     // Same reasoning for the sponsor strip: registering twice is harmless - RegisterClassExW
     // simply fails with ERROR_CLASS_ALREADY_EXISTS - and it means this window does not depend
     // on the host having got there first.
-    SponsorRegister(GetModuleHandleW(nullptr));
+    SponsorRegister(hInst);
     WNDCLASSEXW wc;
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
     wc.lpfnWndProc = SettingsProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
+    wc.hInstance = hInst;
+    wc.hIcon = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPICON));
+    wc.hIconSm = LoadIconW(hInst, MAKEINTRESOURCEW(IDI_APPICON));
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = nullptr;   // WM_ERASEBKGND paints appBg; no light flash
     wc.lpszClassName = kSettingsClass;
@@ -4471,6 +5035,7 @@ void ShowSettings(HWND owner, Config& cfg, const Topology& topo, Engine& engine)
     st->topo = &topo;
     st->engine = &engine;
     st->work = cfg;
+    st->env = ProbeEnvironment();
     st->selProfile = st->work.profiles.empty() ? -1 : 0;
 
     int dpi = DpiOf(owner ? owner : GetDesktopWindow());
@@ -4496,7 +5061,7 @@ void ShowSettings(HWND owner, Config& cfg, const Topology& topo, Engine& engine)
     // mistake cannot be repaired the same way.
     int wantH = MulDiv(740, dpi, 96);
     {
-        const SIZE sp = WebSponsorNaturalSize(dpi);
+        const SIZE sp = WebSponsorMinSize(dpi);
         if (sp.cx > 0 && sp.cy > 0)
             wantH += static_cast<int>(sp.cy) + theme::Dp(theme::metric::kGap, dpi);
     }
@@ -4512,7 +5077,9 @@ void ShowSettings(HWND owner, Config& cfg, const Topology& topo, Engine& engine)
     if (y < work.top) y = work.top;
 
     // No WS_VSCROLL: the sidebar replaced the scrolling column outright.
-    HWND hwnd = CreateWindowExW(0, kSettingsClass, L"Game Optimizer - Settings",
+    // An owned window is otherwise excluded from the taskbar and Alt+Tab. Keep the owner
+    // deliberately: it keeps Settings above the tray window and preserves correct closing.
+    HWND hwnd = CreateWindowExW(WS_EX_APPWINDOW, kSettingsClass, L"Game Optimizer - Settings",
                                 WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
                                 x, y, w, h, owner, nullptr,
                                 GetModuleHandleW(nullptr), st);

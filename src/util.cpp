@@ -413,6 +413,15 @@ bool WriteFileUtf8Atomic(const std::wstring& path, const std::wstring& text) {
 
 // ---- Autostart -------------------------------------------------------------
 
+std::wstring AutostartCommand(const std::wstring& exePath) {
+    return L"\"" + exePath + L"\" --tray";
+}
+
+bool AutostartNeedsMigration(const std::wstring& existingValue) {
+    return !existingValue.empty() && ToLower(existingValue).find(L"--tray") ==
+                                         std::wstring::npos;
+}
+
 bool GetStartWithWindows() {
     HKEY key = nullptr;
     if (::RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_QUERY_VALUE,
@@ -431,7 +440,7 @@ bool SetStartWithWindows(bool on) {
     if (on) {
         const std::wstring exe = GetExePath();
         if (exe.empty()) return false;
-        const std::wstring quoted = L"\"" + exe + L"\"";
+        const std::wstring command = AutostartCommand(exe);
 
         HKEY key = nullptr;
         if (::RegCreateKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, nullptr,
@@ -440,10 +449,10 @@ bool SetStartWithWindows(bool on) {
             return false;
         }
         const DWORD bytes =
-            static_cast<DWORD>((quoted.size() + 1) * sizeof(wchar_t));
+            static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
         LONG rc = ::RegSetValueExW(
             key, kRunValueName, 0, REG_SZ,
-            reinterpret_cast<const BYTE*>(quoted.c_str()), bytes);
+            reinterpret_cast<const BYTE*>(command.c_str()), bytes);
         ::RegCloseKey(key);
         return rc == ERROR_SUCCESS;
     }
@@ -457,6 +466,60 @@ bool SetStartWithWindows(bool on) {
     LONG rc = ::RegDeleteValueW(key, kRunValueName);
     ::RegCloseKey(key);
     return rc == ERROR_SUCCESS || rc == ERROR_FILE_NOT_FOUND;
+}
+
+void MigrateAutostartCommand() {
+    // Builds before the manual-launch Settings behavior wrote only the quoted exe path. Once
+    // manual launches became visible, leaving that measured flagless form in place would
+    // turn every existing user's next login into an unwanted Settings popup.
+    HKEY key = nullptr;
+    if (::RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0, KEY_QUERY_VALUE,
+                        &key) != ERROR_SUCCESS) {
+        return;
+    }
+
+    DWORD type = 0;
+    DWORD bytes = 0;
+    LONG query = ::RegQueryValueExW(key, kRunValueName, nullptr, &type, nullptr, &bytes);
+    if (query != ERROR_SUCCESS || bytes == 0 ||
+        (type != REG_SZ && type != REG_EXPAND_SZ)) {
+        ::RegCloseKey(key);
+        return;
+    }
+
+    std::vector<wchar_t> value(static_cast<size_t>(bytes / sizeof(wchar_t)) + 1, L'\0');
+    query = ::RegQueryValueExW(key, kRunValueName, nullptr, &type,
+                              reinterpret_cast<BYTE*>(value.data()), &bytes);
+    ::RegCloseKey(key);
+    if (query != ERROR_SUCCESS) return;
+
+    const std::wstring existingValue(value.data());
+    if (!AutostartNeedsMigration(existingValue)) return;
+
+    const std::wstring exe = GetExePath();
+    if (exe.empty()) return;
+    const std::wstring command = AutostartCommand(exe);
+    const DWORD commandBytes =
+        static_cast<DWORD>((command.size() + 1) * sizeof(wchar_t));
+
+    HKEY writeKey = nullptr;
+    const LONG open = ::RegOpenKeyExW(HKEY_CURRENT_USER, kRunKeyPath, 0,
+                                      KEY_SET_VALUE, &writeKey);
+    if (open != ERROR_SUCCESS) {
+        LogLine(L"[migrate] flagless autostart command could not be updated, err=%ld", open);
+        return;
+    }
+    const LONG write = ::RegSetValueExW(
+        writeKey, kRunValueName, 0, REG_SZ,
+        reinterpret_cast<const BYTE*>(command.c_str()), commandBytes);
+    ::RegCloseKey(writeKey);
+
+    if (write == ERROR_SUCCESS) {
+        LogLine(L"[migrate] autostart command updated from '%s' to '%s'",
+                existingValue.c_str(), command.c_str());
+    } else {
+        LogLine(L"[migrate] flagless autostart command could not be updated, err=%ld", write);
+    }
 }
 
 // ---- Migration from the previous product name ------------------------------
@@ -549,6 +612,68 @@ void MigrateLegacyAutostart() {
 
 // ---- Environment probes ----------------------------------------------------
 
+void RefreshEnvironmentStatus(EnvironmentInfo& info) {
+    // Reset first so a failed refresh can never leave a stale, confident answer on screen.
+    info.gameModeKeyPresent = false;
+    info.autoGameModeEnabled = 0;
+    info.gameModeState = GameModeState::NotDeterminable;
+
+    // One key open and one value query. A missing/unreadable value is not the same fact as
+    // OFF, so only a successfully read DWORD produces an On/Off state.
+    HKEY gameBar = nullptr;
+    if (::RegOpenKeyExW(HKEY_CURRENT_USER, kGameBarKeyPath, 0, KEY_QUERY_VALUE,
+                        &gameBar) == ERROR_SUCCESS) {
+        info.gameModeKeyPresent = true;
+        DWORD type = 0;
+        DWORD value = 0;
+        DWORD bytes = sizeof(value);
+        if (::RegQueryValueExW(gameBar, kGameBarValue, nullptr, &type,
+                               reinterpret_cast<LPBYTE>(&value), &bytes) == ERROR_SUCCESS &&
+            type == REG_DWORD && bytes == sizeof(value)) {
+            info.autoGameModeEnabled = value;
+            info.gameModeState = value == 0 ? GameModeState::Off : GameModeState::On;
+        }
+        ::RegCloseKey(gameBar);
+    }
+
+    info.amdVCacheServicePresent = false;
+    info.amdVCacheServiceRunning = false;
+    info.amdVCacheServiceState = AmdVCacheServiceState::NotDeterminable;
+
+    // Open exactly the service we care about. No EnumServicesStatusEx call belongs on a
+    // one-second UI timer. Every operation here is query-only.
+    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (scm == nullptr) return;
+
+    ::SetLastError(ERROR_SUCCESS);
+    SC_HANDLE svc = ::OpenServiceW(scm, kVCacheServiceName, SERVICE_QUERY_STATUS);
+    if (svc == nullptr) {
+        if (::GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
+            info.amdVCacheServiceState = AmdVCacheServiceState::NotInstalled;
+        }
+        ::CloseServiceHandle(scm);
+        return;
+    }
+
+    info.amdVCacheServicePresent = true;
+    SERVICE_STATUS_PROCESS ssp;
+    ::ZeroMemory(&ssp, sizeof(ssp));
+    DWORD needed = 0;
+    if (::QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
+                               reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed)) {
+        if (ssp.dwCurrentState == SERVICE_RUNNING) {
+            info.amdVCacheServiceRunning = true;
+            info.amdVCacheServiceState = AmdVCacheServiceState::Running;
+        } else if (ssp.dwCurrentState == SERVICE_STOPPED) {
+            info.amdVCacheServiceState = AmdVCacheServiceState::InstalledButStopped;
+        }
+        // Paused and transition states are deliberately NotDeterminable: calling either one
+        // "stopped" would be a claim the service manager did not return.
+    }
+    ::CloseServiceHandle(svc);
+    ::CloseServiceHandle(scm);
+}
+
 EnvironmentInfo ProbeEnvironment() {
     EnvironmentInfo info;
 
@@ -563,38 +688,7 @@ EnvironmentInfo ProbeEnvironment() {
         info.isIntel = lower.find(L"intel") != std::wstring::npos;
     }
 
-    // Game Mode.  The key existing and the value reading 0 are different facts;
-    // the caller needs both, so report them separately.
-    info.gameModeKeyPresent = RegKeyExists(HKEY_CURRENT_USER, kGameBarKeyPath);
-    DWORD gm = 0;
-    if (RegReadDword(HKEY_CURRENT_USER, kGameBarKeyPath, kGameBarValue, gm)) {
-        info.autoGameModeEnabled = gm;
-    } else {
-        info.autoGameModeEnabled = 0;
-    }
-
-    // AMD 3D V-Cache performance optimizer service.  Query only - needs no
-    // elevation, and we never attempt to start or stop it.
-    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-    if (scm != nullptr) {
-        SC_HANDLE svc = ::OpenServiceW(scm, kVCacheServiceName,
-                                       SERVICE_QUERY_STATUS);
-        if (svc != nullptr) {
-            info.amdVCacheServicePresent = true;
-
-            SERVICE_STATUS_PROCESS ssp;
-            ::ZeroMemory(&ssp, sizeof(ssp));
-            DWORD needed = 0;
-            if (::QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
-                                       reinterpret_cast<LPBYTE>(&ssp),
-                                       sizeof(ssp), &needed)) {
-                info.amdVCacheServiceRunning =
-                    (ssp.dwCurrentState == SERVICE_RUNNING);
-            }
-            ::CloseServiceHandle(svc);
-        }
-        ::CloseServiceHandle(scm);
-    }
+    RefreshEnvironmentStatus(info);
 
     // Elevation.
     HANDLE token = nullptr;

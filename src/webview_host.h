@@ -41,19 +41,31 @@ namespace cd {
 // Opaque. Created by WebSponsorCreate, freed by WebSponsorDestroy, and by nothing else.
 struct WebSponsor;
 
-// The panel's natural size in DEVICE pixels at `dpi`.
+// The panel's MINIMUM width and its height, in DEVICE pixels at `dpi`.
 //
-// The panel is a VERTICAL STACK - Ko-fi, then the GitHub pill, then the disease-research copy
-// and the GOATPROJECT lockup - roughly 272 x 261 logical px, not the short row the layout used
-// to reserve. The figure comes from the generated header, where it was MEASURED by rendering
-// the page (tools\measure-panel.py), so it tracks the plugin rather than a constant typed
-// here. The caller reserves this much room and passes the same rectangle to WebSponsorCreate
-// and WebSponsorMove.
+// cy IS THE HEIGHT TO RESERVE. cx IS NOT THE WIDTH TO USE. The two halves of this SIZE are
+// different kinds of number and the name says so - it was WebSponsorNaturalSize until the panel
+// stopped having a natural width.
+//
+// The panel is ONE ROW OF THREE GROUPS - Ko-fi, the GitHub pill, and the disease-research copy
+// beside the GOATPROJECT lockup - and it FILLS whatever width it is given
+// (`.shell.is-open { width: 100% }`). So there is no natural width any more, only a floor:
+// kSponsorCssMinWidth, the narrowest host at which the three groups still fit. Below it the row
+// overflows its end edge and `.shell { overflow: hidden }` cuts the right-hand group off in
+// silence, which is why WM_GETMINMAXINFO has to keep the window above it.
+//
+// The height does NOT vary with the width - every item in the row is the Ko-fi button's height
+// and the row never wraps - so one constant is right at every window size.
+//
+// Both figures come from the generated header, where they were MEASURED by rendering the page
+// at a range of widths (tools\measure-panel.py), so they track the plugin rather than a
+// constant typed here. The caller reserves cy of height, gives the panel the full content width,
+// and passes that rectangle to WebSponsorCreate and WebSponsorMove.
 //
 // Available WITHOUT creating anything: it reads two compile-time constants and does no
 // LoadLibrary, so the layout can ask for it on any code path, including one where WebView2
 // will turn out to be unavailable.
-SIZE WebSponsorNaturalSize(int dpi);
+SIZE WebSponsorMinSize(int dpi);
 
 // Called on the UI thread when creation finishes, exactly once per successful
 // WebSponsorCreate. ok == false means WebView2 could not be used and the caller MUST show
