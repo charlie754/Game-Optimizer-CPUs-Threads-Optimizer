@@ -76,6 +76,48 @@ Ids, which are not scoped to a processor group, so this is expected to work, but
 measured. Windows on Arm has never been run either — there is no Arm64 build, and while Windows 11
 on Arm emulates x64 applications, nobody has checked what topology this app sees under emulation.
 
+### Example CPUs by class
+
+These are examples, not a compatibility list — the app reads your machine's topology at first run, and that screen is the authoritative answer for your CPU.
+
+**Intel hybrid (P/E cores)**
+- Core Ultra 9 285K, Ultra 7 265K, Ultra 5 245K — Arrow Lake-S
+- Core i9-14900K, i7-14700K, i5-14600K, i5-14400F — Raptor Lake Refresh
+- Core i9-13900K, i7-13700K, i5-13600K — Raptor Lake
+- Core i9-12900K, i7-12700K, i5-12600K — Alder Lake
+
+🔴 **Trap — a hybrid generation is not a hybrid CPU.** Plenty of 12th–14th gen parts ship with zero E-cores and land in the single cache domain row instead: i5-12400, i3-12100, i3-12300, i3-13100, i3-14100, Pentium Gold G7400, Celeron G6900. Generation name tells you nothing.
+
+**AMD asymmetric cache (X3D)**
+- Ryzen 9 9950X3D — measured directly on a 9950X3D: 96 MB of L3 on one chiplet, 32 MB on the other
+- Ryzen 9 9900X3D
+- Ryzen 9 7950X3D, 7900X3D
+
+Two chiplets, 3D V-Cache stacked on one of them. This is the layout the app exists for.
+
+🔴 **Trap — most X3D parts are not in this row.** Single-chiplet X3D CPUs have one cache domain and nothing to steer between: 9800X3D, 9850X3D, 7800X3D, 5800X3D, 5700X3D, 5600X3D. The X3D name says cache, not asymmetry.
+
+🔴 **Trap — the 9950X3D2 Dual Edition is not here either.** V-Cache sits under both chiplets, 96 MB each, so it is Multi-CCD symmetric.
+
+**Multi-CCD symmetric**
+- Ryzen 9 9950X, 9900X, PRO 9965, PRO 9955, PRO 9945
+- Ryzen 9 9950X3D2 Dual Edition — 96 MB per chiplet, equal
+- Ryzen 9 7950X, 7900X, 7900, PRO 7945
+- Ryzen 9 5950X, 5900X, 5900XT, 5900, PRO 5945
+- Ryzen 9 3950X, 3900X and Ryzen 7 3700X, 2700X — see the note below
+
+Zen 2 and earlier split each die into two four-core complexes with their own L3, so a cache domain there is four cores, not eight. The 3700X has one chiplet and two domains; the 2700X has no chiplets at all and still has two. Confining a game to one of those domains gives it four cores.
+
+**Single cache domain**
+- Ryzen 7 9700X, 9700F and Ryzen 5 9600X, 9600, 9500F
+- Ryzen 7 7700X, 7700 and Ryzen 5 7600X, 7600, 7500F
+- Ryzen 7 5800X, 5800XT, 5700X and Ryzen 5 5600X, 5600
+- Ryzen 7 8700G, Ryzen 5 8600G — monolithic APUs
+- Single-chiplet X3D parts: 9800X3D, 9850X3D, 7800X3D, 5800X3D, 5700X3D, 5600X3D
+- Intel parts without E-cores: i5-12400, i3-12100, i3-13100, i3-14100, i9-9900K, i7-9700K, i5-9600K, i7-2600K
+
+One cache domain means there is nothing to steer between. The app will say so rather than pretend otherwise.
+
 ## Status
 
 **Pre-release.** Read [what has actually been tested](#what-has-actually-been-tested) before
