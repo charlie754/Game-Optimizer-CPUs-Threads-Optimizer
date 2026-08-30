@@ -35,4 +35,25 @@ inline std::vector<std::wstring> OrderHeavyByActivity(
     return ordered;
 }
 
+// The listbox is both the view and the model. Without restoring this canonical order, the
+// activity sort would overwrite the user's saved order every time they clicked a profile.
+inline std::vector<std::wstring> RestoreCanonicalOrder(
+    const std::vector<std::wstring>& displayed,
+    const std::vector<std::wstring>& canonical) {
+    if (displayed.empty() || canonical.empty()) return displayed;
+
+    std::vector<std::size_t> order;
+    order.reserve(displayed.size());
+    for (std::size_t i = 0; i < displayed.size(); ++i) order.push_back(i);
+    std::stable_sort(order.begin(), order.end(), [&](std::size_t a, std::size_t b) {
+        return std::find(canonical.begin(), canonical.end(), displayed[a]) <
+               std::find(canonical.begin(), canonical.end(), displayed[b]);
+    });
+
+    std::vector<std::wstring> restored;
+    restored.reserve(displayed.size());
+    for (std::size_t i : order) restored.push_back(displayed[i]);
+    return restored;
+}
+
 }  // namespace cd

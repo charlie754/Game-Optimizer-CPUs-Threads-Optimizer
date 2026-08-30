@@ -2692,6 +2692,58 @@ void Test_J9_CaseDifferentItemUsesCallerSuppliedKey() {
     CHECK_EQ(cd::OrderHeavyByActivity(items, keys, {L"active.exe"}), expected);
 }
 
+void Test_J10_DisplayedActivityOrderRestoresCanonicalOrder() {
+    Case("J10 displayed activity order restores canonical heavy-app order");
+    const std::vector<std::wstring> displayed = {L"live.exe", L"first.exe", L"second.exe"};
+    const std::vector<std::wstring> canonical = {L"first.exe", L"second.exe", L"live.exe"};
+    CHECK_EQ(cd::RestoreCanonicalOrder(displayed, canonical), canonical);
+}
+
+void Test_J11_NewHeavyAppIsAppendedAfterCanonicalEntries() {
+    Case("J11 a heavy app absent from canonical order is appended last");
+    const std::vector<std::wstring> displayed = {L"new.exe", L"second.exe", L"first.exe"};
+    const std::vector<std::wstring> canonical = {L"first.exe", L"second.exe"};
+    const std::vector<std::wstring> expected = {L"first.exe", L"second.exe", L"new.exe"};
+    CHECK_EQ(cd::RestoreCanonicalOrder(displayed, canonical), expected);
+}
+
+void Test_J12_NewHeavyAppsKeepDisplayedRelativeOrder() {
+    Case("J12 new heavy apps keep their displayed relative order at the end");
+    const std::vector<std::wstring> displayed = {
+        L"new-b.exe", L"second.exe", L"new-a.exe", L"first.exe"};
+    const std::vector<std::wstring> canonical = {L"first.exe", L"second.exe"};
+    const std::vector<std::wstring> expected = {
+        L"first.exe", L"second.exe", L"new-b.exe", L"new-a.exe"};
+    CHECK_EQ(cd::RestoreCanonicalOrder(displayed, canonical), expected);
+}
+
+void Test_J13_RemovedHeavyAppDoesNotReturnFromCanonicalOrder() {
+    Case("J13 a removed heavy app does not return from canonical order");
+    const std::vector<std::wstring> displayed = {L"third.exe", L"first.exe"};
+    const std::vector<std::wstring> canonical = {L"first.exe", L"second.exe", L"third.exe"};
+    const std::vector<std::wstring> expected = {L"first.exe", L"third.exe"};
+    CHECK_EQ(cd::RestoreCanonicalOrder(displayed, canonical), expected);
+}
+
+void Test_J14_EmptyCanonicalOrderKeepsDisplayedOrder() {
+    Case("J14 an empty canonical order keeps displayed order unchanged");
+    const std::vector<std::wstring> displayed = {L"second.exe", L"first.exe"};
+    CHECK_EQ(cd::RestoreCanonicalOrder(displayed, std::vector<std::wstring>()), displayed);
+}
+
+void Test_J15_EmptyDisplayedOrderStaysEmpty() {
+    Case("J15 an empty displayed order stays empty");
+    CHECK(cd::RestoreCanonicalOrder(std::vector<std::wstring>(), {L"first.exe"}).empty());
+}
+
+void Test_J16_DuplicateCanonicalStringsUseFirstIndexWithoutDroppingEntries() {
+    Case("J16 duplicate canonical strings use the first index without dropping an entry");
+    const std::vector<std::wstring> displayed = {L"second.exe", L"dup.exe", L"dup.exe"};
+    const std::vector<std::wstring> canonical = {L"dup.exe", L"second.exe", L"dup.exe"};
+    const std::vector<std::wstring> expected = {L"dup.exe", L"dup.exe", L"second.exe"};
+    CHECK_EQ(cd::RestoreCanonicalOrder(displayed, canonical), expected);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -2783,6 +2835,13 @@ int main() {
     Test_J7_HeavyAppMatchingIsCaseInsensitive();
     Test_J8_MismatchedItemAndKeyCountsKeepInputOrder();
     Test_J9_CaseDifferentItemUsesCallerSuppliedKey();
+    Test_J10_DisplayedActivityOrderRestoresCanonicalOrder();
+    Test_J11_NewHeavyAppIsAppendedAfterCanonicalEntries();
+    Test_J12_NewHeavyAppsKeepDisplayedRelativeOrder();
+    Test_J13_RemovedHeavyAppDoesNotReturnFromCanonicalOrder();
+    Test_J14_EmptyCanonicalOrderKeepsDisplayedOrder();
+    Test_J15_EmptyDisplayedOrderStaysEmpty();
+    Test_J16_DuplicateCanonicalStringsUseFirstIndexWithoutDroppingEntries();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

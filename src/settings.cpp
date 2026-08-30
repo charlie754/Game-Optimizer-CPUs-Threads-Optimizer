@@ -931,6 +931,7 @@ struct SettingsState {
     ProcessSnapshot cpuSnap;
     bool haveCpu = false;
     std::map<std::wstring, double> cpuByExe;   // lowercased basename -> machine-wide %
+    std::vector<std::wstring> heavyCanonical;   // user's order, independent of display order
 
     // ---- Which mask each of those processes is ON, read back from Windows ----
     // Refreshed on the SAME 1 s beat and from the SAME snapshot as the percentages above -
@@ -1484,6 +1485,7 @@ int ManualRowCount(const SettingsState* st) {
 }
 
 void SetHeavyItems(SettingsState* st, const std::vector<std::wstring>& v) {
+    st->heavyCanonical = v;
     if (!st->hHeavy) return;
     std::set<std::wstring> running;
     for (const auto& entry : st->cpuByExe) running.insert(entry.first);
@@ -1521,6 +1523,7 @@ void HeavyAppend(SettingsState* st, const std::wstring& raw) {
                                      static_cast<WPARAM>(ManualRowCount(st)),
                                      reinterpret_cast<LPARAM>(name.c_str()));
     if (row < 0) return;
+    st->heavyCanonical.push_back(name);
     SendMessageW(st->hHeavy, LB_SETITEMDATA, static_cast<WPARAM>(row), kHeavyRowManual);
     SendMessageW(st->hHeavy, LB_SETCURSEL, static_cast<WPARAM>(row), 0);
     // The executable the user has just named themselves must stop being reported as one the
@@ -1698,7 +1701,9 @@ void StoreUiToProfile(SettingsState* st) {
     p.game = Trim(GetText(st->hGame));
     std::wstring gm = ComboText(st->hGameMask);
     if (!gm.empty()) p.gameMask = gm;
-    p.heavy = HeavyItems(st);
+    // Membership still comes from the listbox so adds and removes work. Order comes from the
+    // user's canonical list so clicking between profiles can no longer silently rewrite it.
+    p.heavy = RestoreCanonicalOrder(HeavyItems(st), st->heavyCanonical);
     std::wstring hm = ComboText(st->hHeavyMask);
     if (!hm.empty()) p.heavyMask = hm;
     p.autoPin = IsChecked(st->hAutoPin);
