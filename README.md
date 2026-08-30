@@ -223,14 +223,16 @@ two systems placing your game by different rules.
 Separately, "AMD/ASUS Turbo Game Mode" and Gigabyte's "X3D Turbo Mode" are **BIOS** features
 unrelated to Windows Game Mode; they hard-disable SMT and the second CCD at boot.
 
-Some boards also offer an **adaptive** version of the same idea — a game-aware CCD parking
+Some boards also offer an **adaptive** version of this, working differently — a game-aware CCD parking
 option that parks the second CCD while a game runs, rather than disabling it at boot. That
 one is easy to miss, because it looks exactly like the Windows-side optimizer doing it: the
 AMD service can be stopped, Windows core parking can be off, and a CCD still parks. Names
-vary by vendor; look under **AMD CBS** or **Power Management** for a *3D V-Cache* or *CCD
-parking* option. **While firmware is parking a CCD, no application can make it usable** —
-Game Optimizer's background mask included. If your background apps are assigned to a mask
-that is always parked, check the BIOS before assuming the app is at fault.
+vary by vendor, and no reliable menu location can be given here. Look for a *game-aware* or
+*adaptive* CCD parking option — and note that this is **not** the boot-time *CCD Control* or
+*SMT Control* setting described above, which disables a CCD outright. **While firmware is
+parking a CCD, no application can make it usable** — Game Optimizer's background mask included.
+If your background apps are assigned to a mask that parks whenever a game is running, check the
+BIOS before assuming the app is at fault.
 
 ## What has actually been tested
 

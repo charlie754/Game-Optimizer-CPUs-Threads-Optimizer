@@ -2393,6 +2393,7 @@ std::wstring MaskParkedWarning(const SettingsState* st, const std::wstring& mask
     if (parked == total) {
         return FormatFullyParkedMaskWarning(maskName, total,
                                             st->env.amdVCacheServiceRunning,
+                                            st->env.amdVCacheDriverRunning,
                                             st->env.amdVCacheServicePresent ||
                                                 st->env.amdVCacheDriverPresent);
     }
@@ -4065,7 +4066,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 L"you restart Windows. It stays off until you turn it back on here. AMD's "
                 L"optimizer parks the non-cache CCD while a game runs; disabling it stops the "
                 L"Windows side only. If your BIOS also has a 3D V-Cache or CCD parking option, "
-                L"that one is separate and is not affected by this setting.",
+                L"changing this setting does not change your BIOS setting.",
                 SS_LEFT, -1);
             st->hPollLbl = Mk(hwnd, L"STATIC", L"Poll interval (ms):", SS_LEFT, -1);
             st->hPoll = Mk(hwnd, L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,

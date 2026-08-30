@@ -2526,30 +2526,74 @@ void Test_F2_ResolveForegroundPid() {
 
 void Test_G1_FullyParkedWarningNamesRunningVCacheCause() {
     Case("G1 fully parked warning names the running AMD V-Cache cause");
-    CHECK_EQ(
-        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, true),
+    const std::wstring expected =
         L"Warning: all 16 processors in \"Freq\" are currently parked. The running AMD 3D "
+        L"V-Cache Performance Optimizer service is the likely cause. It normally parks the "
+        L"non-cache CCD while a game is running. While that CCD is parked, a background mask "
+        L"pointing at it is effectively inert. Windows can accept assignments to that CCD "
+        L"and then ignore them.";
+    CHECK_EQ(
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, false, true), expected);
+    CHECK_EQ(
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, false, false), expected);
+    CHECK_EQ(
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, true, true, true),
+        L"Warning: all 8 processors in \"Cache\" are currently parked. The running AMD 3D "
         L"V-Cache Performance Optimizer service is the likely cause. It normally parks the "
         L"non-cache CCD while a game is running. While that CCD is parked, a background mask "
         L"pointing at it is effectively inert. Windows can accept assignments to that CCD "
         L"and then ignore them.");
 }
 
-void Test_G2_FullyParkedWarningPointsToFirmwareWhenVCacheIsPresent() {
-    Case("G2 fully parked warning points to firmware when AMD V-Cache is present but stopped");
+void Test_G2_FullyParkedWarningNamesRunningVCacheDriverCause() {
+    Case("G2 fully parked warning names the running AMD V-Cache driver cause");
+    const std::wstring warning =
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, true, true);
     CHECK_EQ(
-        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, true),
+        warning,
+        L"Warning: all 16 processors in \"Freq\" are currently parked. The AMD 3D V-Cache "
+        L"Performance Optimizer service is stopped, but its kernel driver is still running, "
+        L"so this may still be coming from Windows rather than from firmware. That driver has "
+        L"no stop routine and only goes away after a restart. Windows can accept assignments "
+        L"to a parked CCD and then ignore them.");
+    CHECK(warning.find(L"BIOS") == std::wstring::npos);
+
+    const std::wstring otherWarning =
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, true, true);
+    CHECK_EQ(
+        otherWarning,
+        L"Warning: all 8 processors in \"Cache\" are currently parked. The AMD 3D V-Cache "
+        L"Performance Optimizer service is stopped, but its kernel driver is still running, "
+        L"so this may still be coming from Windows rather than from firmware. That driver has "
+        L"no stop routine and only goes away after a restart. Windows can accept assignments "
+        L"to a parked CCD and then ignore them.");
+    CHECK(otherWarning.find(L"BIOS") == std::wstring::npos);
+}
+
+void Test_G3_FullyParkedWarningPointsToFirmwareWhenVCacheIsPresent() {
+    Case("G3 fully parked warning points to firmware when AMD V-Cache is present but stopped");
+    CHECK_EQ(
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, false, true),
         L"Warning: all 16 processors in \"Freq\" are currently parked. AMD's 3D V-Cache "
-        L"optimizer is installed but not running, so nothing on the Windows side explains "
-        L"this. A BIOS option can park a CCD below the operating system; names vary by vendor, "
-        L"but look under AMD CBS or Power Management for a 3D V-Cache or CCD parking setting. "
+        L"optimizer is installed, and neither its service nor its driver is running, so "
+        L"nothing on the Windows side explains this. A BIOS option can park a CCD below the "
+        L"operating system. Look for a game-aware or adaptive CCD parking setting - not the "
+        L"CCD or SMT controls that disable a CCD at boot, which are a different feature. "
+        L"Windows can accept assignments to a parked CCD and then ignore them.");
+    CHECK_EQ(
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, false, true),
+        L"Warning: all 8 processors in \"Cache\" are currently parked. AMD's 3D V-Cache "
+        L"optimizer is installed, and neither its service nor its driver is running, so "
+        L"nothing on the Windows side explains this. A BIOS option can park a CCD below the "
+        L"operating system. Look for a game-aware or adaptive CCD parking setting - not the "
+        L"CCD or SMT controls that disable a CCD at boot, which are a different feature. "
         L"Windows can accept assignments to a parked CCD and then ignore them.");
 }
 
-void Test_G3_FullyParkedWarningStaysGenericWithoutVCache() {
-    Case("G3 fully parked warning stays generic without AMD V-Cache");
+void Test_G4_FullyParkedWarningStaysGenericWithoutVCache() {
+    Case("G4 fully parked warning stays generic without AMD V-Cache");
     const std::wstring warning =
-        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, false);
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, false, false);
     CHECK_EQ(
         warning,
         L"Warning: all 16 processors in \"Freq\" are currently parked. Windows can accept "
@@ -2557,6 +2601,16 @@ void Test_G3_FullyParkedWarningStaysGenericWithoutVCache() {
         L"running elsewhere.");
     CHECK(warning.find(L"BIOS") == std::wstring::npos);
     CHECK(warning.find(L"V-Cache") == std::wstring::npos);
+
+    const std::wstring otherWarning =
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, false, false);
+    CHECK_EQ(
+        otherWarning,
+        L"Warning: all 8 processors in \"Cache\" are currently parked. Windows can accept "
+        L"an assignment to a fully parked mask and then ignore it - the process keeps "
+        L"running elsewhere.");
+    CHECK(otherWarning.find(L"BIOS") == std::wstring::npos);
+    CHECK(otherWarning.find(L"V-Cache") == std::wstring::npos);
 }
 
 void Test_H1_GameModeEnvironmentWordingCoversEveryState() {
@@ -2589,7 +2643,7 @@ void Test_H3_RunningVCacheEffectMatchesTheParkedMaskWarning() {
     CHECK_EQ(effect,
              L"It normally parks the non-cache CCD while a game is running. While that CCD "
              L"is parked, a background mask pointing at it is effectively inert.");
-    CHECK(cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, true).find(effect) !=
+    CHECK(cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, false, true).find(effect) !=
           std::wstring::npos);
 }
 
@@ -2939,8 +2993,9 @@ int main() {
 
     std::printf("\n== G. Parked-mask warning ==\n");
     Test_G1_FullyParkedWarningNamesRunningVCacheCause();
-    Test_G2_FullyParkedWarningPointsToFirmwareWhenVCacheIsPresent();
-    Test_G3_FullyParkedWarningStaysGenericWithoutVCache();
+    Test_G2_FullyParkedWarningNamesRunningVCacheDriverCause();
+    Test_G3_FullyParkedWarningPointsToFirmwareWhenVCacheIsPresent();
+    Test_G4_FullyParkedWarningStaysGenericWithoutVCache();
 
     std::printf("\n== H. Live environment wording ==\n");
     Test_H1_GameModeEnvironmentWordingCoversEveryState();
