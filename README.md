@@ -35,6 +35,47 @@ else, and clears every mask the moment the game exits.
 **Runs on:** Windows 10 or 11, x64. The manifest declares no older Windows, and there is no
 32-bit or ARM build.
 
+## Which CPUs this helps
+
+The app works this out for itself. On first run it asks Windows for the machine's core and cache
+layout, classifies it, and tells you on screen which of the cases below you are in, along with a
+confidence level and a map of which logical processors are in each group. There is no list of CPU
+models anywhere in the app — the decision comes from what Windows reports, so nothing here goes
+stale. Run it and read the first-run screen; that answer is authoritative for your machine and this
+table is only a guide. The first matching row wins, so a machine reporting more than one core type
+is classified by core type and never by cache size.
+
+| What Windows reports | Shown as | Masks you get | How much it helps |
+|---|---|---|---|
+| More than one distinct efficiency class | Intel hybrid (P/E cores) | `P-cores`, `E-cores`, `All`, plus `no SMT` variants where they differ | A real split. Game on P-cores, background apps on E-cores. High confidence |
+| Two or more last-level-cache domains, sizes differ | AMD asymmetric cache (X3D) | `Cache`, `Freq`, `Freq 2`, …, `All` | A real split. Game on the largest-L3 domain, background apps on the rest. High confidence |
+| Two or more last-level-cache domains, same size | Multi-CCD symmetric | `CCD0`, `CCD1`, …, `All` | A real split, but which domain gets called `CCD0` is an ordering choice, not a measurement. Medium confidence — check the core map |
+| Exactly one last-level-cache domain | Single cache domain | `All`, and `All no SMT` if the CPU has SMT | Very little. There is no second group to move background work onto |
+| No cache domains reported at all | Unknown | the same as a single domain | Very little, and the first-run screen says so |
+
+Most CPUs are a single cache domain, and on those this app can only give the game one thread per
+physical core. That is the whole of it — no isolated cores, no background separation. If the CPU has
+no SMT either, `All no SMT` is not offered at all, both defaults fall back to `All` — every
+processor — and the app changes nothing on that machine.
+
+The multi-domain cases are the ones worth installing for: parts such as AMD's dual-chiplet X3D
+desktop processors, where 3D V-Cache sits on one chiplet only, and Intel's hybrid parts with both
+performance and efficient cores. Those are examples rather than a specification — a single-chiplet
+X3D part is one cache domain, some chips in Intel's hybrid generations ship with no efficient cores
+at all, and a dual-chiplet part with V-Cache on both chiplets reports two equal domains and lands in
+the symmetric row instead. The group names borrow vendor vocabulary but the tests do not: no branch
+anywhere checks who made the CPU, so any processor Windows reports with two efficiency classes is
+shown under the Intel name whoever built it.
+
+If Windows cannot describe the topology at all, the app says so at startup and governs nothing —
+that is a failure to detect, not the Unknown row above.
+
+Two things are untested rather than unsupported. Machines with more than 64 logical processors,
+which Windows splits across several processor groups, have never been run: the masks are CPU Set
+Ids, which are not scoped to a processor group, so this is expected to work, but expected is not
+measured. Windows on Arm has never been run either — there is no Arm64 build, and while Windows 11
+on Arm emulates x64 applications, nobody has checked what topology this app sees under emulation.
+
 ## Status
 
 **Pre-release.** Read [what has actually been tested](#what-has-actually-been-tested) before
