@@ -857,7 +857,15 @@ void Engine::Impl::WatcherLoop() {
 Engine::Engine() : impl_(new Impl()) {}
 
 Engine::~Engine() {
-    Stop();
+    // RESOURCE RELEASE ONLY. A destructor may run at CRT teardown, where every
+    // function-local static this program owns is already destroyed. Shutdown WORK - mask
+    // restoration, journal truncation, logging - belongs to Stop(), which must be called
+    // while the program is still running. The join is mandatory: ~std::thread on a joinable
+    // thread calls std::terminate.
+    if (impl_->stopEvent) SetEvent(impl_->stopEvent);
+    if (impl_->worker.joinable()) impl_->worker.join();
+    if (impl_->stopEvent) { CloseHandle(impl_->stopEvent); impl_->stopEvent = nullptr; }
+    if (impl_->wakeEvent) { CloseHandle(impl_->wakeEvent); impl_->wakeEvent = nullptr; }
 }
 
 void Engine::Start(HWND notifyHwnd, UINT notifyMsg) {

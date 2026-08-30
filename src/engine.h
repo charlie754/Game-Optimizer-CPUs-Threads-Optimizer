@@ -131,6 +131,9 @@ std::wstring BuildTooltip(const EngineStatus& st);
 class Engine {
 public:
     Engine();
+    // Releases this object's own resources only: signals the stop event, joins the watcher,
+    // closes the handles. It touches no static, no file and no log, so it is safe to run at
+    // CRT teardown. It is NOT a shutdown path.
     ~Engine();
     Engine(const Engine&) = delete;
     Engine& operator=(const Engine&) = delete;
@@ -139,7 +142,12 @@ public:
     // status changes in a way the tray should reflect.
     void Start(HWND notifyHwnd, UINT notifyMsg);
 
-    // Clears every applied mask, joins the watcher, truncates the journal. Idempotent.
+    // Clears every applied mask, joins the watcher, truncates the journal.
+    // Safe to call more than once - the second call repeats the clear and the truncate; it
+    // is not a no-op. MUST be called while the program is still running: it reaches the
+    // journal lock, the log lock and the config-dir string, all of which are function-local
+    // statics destroyed before any namespace-scope object. Never call it from the destructor
+    // of an object with static storage duration.
     void Stop();
 
     void SetConfig(const Config& c);

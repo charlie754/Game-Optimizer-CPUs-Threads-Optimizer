@@ -56,7 +56,15 @@ HINSTANCE    g_hInst           = nullptr;
 HWND         g_hwnd            = nullptr;
 Config       g_cfg;
 Topology     g_topo;
-Engine       g_engine;
+// DELIBERATELY LEAKED, AND THAT IS THE FIX. A namespace-scope Engine registers ~Engine with
+// the CRT onexit table, so it ran AFTER every lazily-constructed function-local static in
+// this program had already been destroyed: applier.cpp:45 (the journal CRITICAL_SECTION),
+// util.cpp:127 (the log CRITICAL_SECTION), util.cpp:169 (the config-dir wstring). That is
+// the measured 0xC0000005 on every exit. A reference to a never-deleted object registers no
+// destructor, so there is no exit-time ordering left to get wrong. All shutdown work is
+// EngineShutdownGuard below, which runs while wWinMain is still on the stack and every
+// static is alive. DO NOT "fix" this leak: doing so restores the crash.
+Engine&      g_engine = *(new Engine());
 bool         g_topoOk          = false;
 std::wstring g_topoError;
 UINT         g_msgShowSettings = 0;
@@ -369,6 +377,15 @@ void StopGameDetection() {
         delete reinterpret_cast<DetectedGame*>(q.lParam);
     }
 }
+
+// The shutdown net that ~Engine used to be, relocated into wWinMain's lifetime where every
+// function-local static is still alive. Both calls are self-gated no-ops (g_detectStop,
+// g_engineStarted), so this is safe on the early-return paths where nothing was started.
+// StopGameDetection is included because ~std::thread on the joinable g_detectThread
+// (main.cpp:144) calls std::terminate.
+struct EngineShutdownGuard {
+    ~EngineShutdownGuard() { StopGameDetection(); StopEngineOnce(); }
+};
 
 // ---- Command line ----------------------------------------------------------
 struct CmdOptions {
@@ -815,6 +832,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
     (void)hPrevInst;
     (void)lpCmdLine;
     (void)nCmdShow;
+
+    EngineShutdownGuard shutdownGuard;   // declared first => destroyed last, on EVERY return
 
     // ELEVATED SET DISPATCH MUST STAY FIRST. The helper has one job and returns before the
     // single-instance mutex, COM, window classes, config, tray, CPU Sets or engine exist.
