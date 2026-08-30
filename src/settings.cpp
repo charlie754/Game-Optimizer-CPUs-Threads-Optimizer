@@ -12,6 +12,7 @@
 #include <windows.h>
 #include <commctrl.h>
 #include <commdlg.h>
+#include <shellapi.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -825,6 +826,9 @@ enum : int {
     IDC_HEAVYREM          // drop the selected heavy exe
 };
 
+// Added separately so the stable control ids above keep their numeric values.
+enum : int { IDC_VCACHE_MANAGE = 1600 };
+
 enum : int { PAGE_PROFILES = 0, PAGE_COREMAP, PAGE_GENERAL, PAGE_COUNT };
 
 const wchar_t kSettingsClass[] = L"GameOptimizerSettings";
@@ -1001,6 +1005,7 @@ struct SettingsState {
     // one of hMap / hMapFail is ever non-null, and they occupy the same rectangle.
     HWND hMapFail = nullptr;
     HWND hGenHdr = nullptr, hStartup = nullptr, hNotify = nullptr;
+    HWND hVCacheManage = nullptr, hVCacheManageDesc = nullptr;
     HWND hPollLbl = nullptr, hPoll = nullptr;
     HWND hGameModeStatus = nullptr, hVCacheStatus = nullptr, hVCacheEffect = nullptr;
     HWND hBlocked = nullptr, hInspect = nullptr;
@@ -1030,6 +1035,7 @@ HHOOK g_msgHook = nullptr;
 // Defined further down; declared here because the warning labels change the layout and the
 // profile loader has to be able to trigger a re-layout when it swaps the mask selection.
 void SettingsLayout(SettingsState* st, HWND hwnd);
+bool UpdateEnvironmentSection(SettingsState* st);
 
 // ---- how much room the sponsor panel needs ----------------------------------------------
 // THE TWO RENDERINGS ARE DIFFERENT SHAPES, so the band cannot be one number.
@@ -2243,6 +2249,95 @@ void StoreGeneralToWork(SettingsState* st) {
     if (ParseIntW(Trim(GetText(st->hPoll)), v)) st->work.pollMs = v;
 }
 
+bool LaunchVCacheSetElevated(bool disable, DWORD& outError) {
+    outError = ERROR_SUCCESS;
+    const std::wstring exe = GetExePath();
+    if (exe.empty()) {
+        outError = ERROR_FILE_NOT_FOUND;
+        return false;
+    }
+
+    const std::wstring parameters = disable ? L"--vcache-set 1" : L"--vcache-set 0";
+    SHELLEXECUTEINFOW sei;
+    ::ZeroMemory(&sei, sizeof(sei));
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe.c_str();
+    sei.lpParameters = parameters.c_str();
+    sei.nShow = SW_HIDE;
+    if (!::ShellExecuteExW(&sei)) {
+        outError = ::GetLastError();
+        return false;
+    }
+    if (sei.hProcess == nullptr) {
+        outError = ERROR_INVALID_HANDLE;
+        return false;
+    }
+
+    const DWORD waitResult = ::WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    const bool gotExitCode = waitResult == WAIT_OBJECT_0 &&
+                             ::GetExitCodeProcess(sei.hProcess, &exitCode) != FALSE;
+    if (!gotExitCode) outError = ::GetLastError();
+    ::CloseHandle(sei.hProcess);
+    if (!gotExitCode) return false;
+    if (exitCode != 0) {
+        outError = exitCode;
+        return false;
+    }
+    return true;
+}
+
+void OnVCacheManageToggle(SettingsState* st, HWND hwnd) {
+    const bool disable = IsChecked(st->hVCacheManage);
+    const bool previous = !disable;
+    const int previousDriverStart = ReadServiceStartValue(L"amd3dvcache");
+    DWORD error = ERROR_SUCCESS;
+    if (!LaunchVCacheSetElevated(disable, error)) {
+        // BS_AUTOCHECKBOX flips before WM_COMMAND. A declined UAC prompt changed neither
+        // registry nor config, so restore exactly the previous visual state.
+        if (error == ERROR_CANCELLED) {
+            SetChecked(st->hVCacheManage, previous);
+            LogLine(L"[settings] AMD V-Cache Start change approval declined; unchanged");
+        } else {
+            // A child failure normally rolls back. Read the driver again so even a failed
+            // rollback cannot leave the checkbox making a stale claim.
+            SetChecked(st->hVCacheManage, ReadServiceStartValue(L"amd3dvcache") == 4);
+            RefreshEnvironmentStatus(st->env);
+            if (UpdateEnvironmentSection(st)) SettingsLayout(st, hwnd);
+            RedrawSettings(hwnd);
+            LogLine(L"[settings] AMD V-Cache Start change failed, child/error=%lu", error);
+            MessageBoxW(hwnd,
+                        L"The AMD 3D V-Cache optimizer change did not complete. The current "
+                        L"configured state is shown here; see the log for details.",
+                        L"Game Optimizer", MB_OK | MB_ICONWARNING);
+        }
+        return;
+    }
+
+    int recordedStart = disable ? previousDriverStart : -1;
+    Config diskConfig;
+    std::wstring configError;
+    if (LoadConfig(GetConfigPath(), diskConfig, &configError)) {
+        recordedStart = diskConfig.vcacheOriginalStart;
+    }
+    st->work.vcacheOriginalStart = recordedStart;
+    st->baseline.vcacheOriginalStart = recordedStart;
+    st->out->vcacheOriginalStart = recordedStart;
+
+    RefreshEnvironmentStatus(st->env);
+    if (UpdateEnvironmentSection(st)) SettingsLayout(st, hwnd);
+    RedrawSettings(hwnd);
+    MessageBoxW(hwnd,
+                disable
+                    ? L"AMD's 3D V-Cache optimizer is configured to be disabled. "
+                      L"Restart Windows for the change to take effect."
+                    : L"AMD's 3D V-Cache optimizer is configured to be enabled. "
+                      L"Restart Windows for the change to take effect.",
+                L"Restart required", MB_OK | MB_ICONINFORMATION);
+}
+
 void SelectMapMask(SettingsState* st) {
     if (!st->hMap) return;
     std::wstring name = ComboText(st->hMapMask);
@@ -2365,15 +2460,22 @@ bool RefreshBlockedLine(SettingsState* st) {
     return changed;
 }
 
-// Updates the General page's environment card from the already-probed value. Returns true
+// Updates the General page's environment card from the already-probed running state and the
+// current configured Start values. Returns true
 // only when the running-service explanation appeared or disappeared, because that is the
 // only change that alters the card's height and therefore requires a layout pass.
 bool UpdateEnvironmentSection(SettingsState* st) {
     if (!st) return false;
 
     const std::wstring game = FormatGameModeEnvironmentStatus(st->env.gameModeState);
-    const std::wstring service =
-        FormatAmdVCacheEnvironmentStatus(st->env.amdVCacheServiceState);
+    const int serviceStart = ReadServiceStartValue(L"amd3dvcacheSvc");
+    const int driverStart = ReadServiceStartValue(L"amd3dvcache");
+    const std::wstring components =
+        std::wstring(L"AMD 3D V-Cache Performance Optimizer\r\n  ") +
+        FormatAmdVCacheComponentEnvironmentLine(
+            L"service", L"amd3dvcacheSvc", st->env.amdVCacheServiceState, serviceStart) +
+        L"\r\n  " + FormatAmdVCacheComponentEnvironmentLine(
+            L"driver", L"amd3dvcache", st->env.amdVCacheDriverState, driverStart);
     const std::wstring effect =
         st->env.amdVCacheServiceState == AmdVCacheServiceState::Running
             ? AmdVCacheRunningEffectText()
@@ -2385,8 +2487,8 @@ bool UpdateEnvironmentSection(SettingsState* st) {
 
     if (st->hGameModeStatus && GetText(st->hGameModeStatus) != game)
         SetWindowTextW(st->hGameModeStatus, game.c_str());
-    if (st->hVCacheStatus && GetText(st->hVCacheStatus) != service)
-        SetWindowTextW(st->hVCacheStatus, service.c_str());
+    if (st->hVCacheStatus && GetText(st->hVCacheStatus) != components)
+        SetWindowTextW(st->hVCacheStatus, components.c_str());
     if (st->hVCacheEffect && GetText(st->hVCacheEffect) != effect)
         SetWindowTextW(st->hVCacheEffect, effect.c_str());
     if (st->hVCacheEffect) {
@@ -3067,7 +3169,8 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hMapFail, ix, iy, iw, mapH);   // only ever one of the two exists
         y = c.bottom + GAP;
     } else {
-        const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW;
+        const int vCacheDescH = 5 * LH;
+        const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW + vCacheDescH + GT + ROW;
         RECT c = AddCard(y, cardH, x0, W);
         int ix = c.left + PAD, iy = c.top + PAD, iw = W - 2 * PAD;
         Put(st->hGenHdr, ix, iy, iw, HH);
@@ -3075,18 +3178,23 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hStartup, ix, iy, theme::Dp(200, dpi), ROW);
         Put(st->hNotify, ix + theme::Dp(212, dpi), iy, theme::Dp(240, dpi), ROW);
         iy += ROW + GT;
+        Put(st->hVCacheManage, ix, iy, iw, ROW);
+        iy += ROW;
+        Put(st->hVCacheManageDesc, ix, iy, iw, vCacheDescH);
+        iy += vCacheDescH + GT;
         Put(st->hPollLbl, ix, iy + (ROW - LH) / 2, theme::Dp(150, dpi), LH);
         Put(st->hPoll, ix + theme::Dp(150, dpi), iy + (ROW - RH) / 2,
             theme::Dp(80, dpi), RH);
         y = c.bottom + GAP;
 
-        // Live scheduling influences. The two state rows use the same card/row rhythm as
-        // the General controls above. The explanation exists only while the AMD service is
-        // RUNNING, and its pure wording is shared with the parked-mask warning.
+        // Live scheduling influences. The AMD block is three lines because its user-mode
+        // service and kernel driver are independent. The explanation exists only while the
+        // AMD service is RUNNING, and its pure wording is shared with the parked-mask warning.
         const bool showEffect = st->hVCacheEffect &&
                                 GetWindowTextLengthW(st->hVCacheEffect) > 0;
+        const int vCacheH = 3 * LH;
         const int effectH = theme::Dp(34, dpi);
-        int envH = 2 * PAD + HH + GT + ROW + GT + ROW;
+        int envH = 2 * PAD + HH + GT + ROW + GT + vCacheH;
         if (showEffect) envH += GT + effectH;
         RECT envCard = AddCard(y, envH, x0, W);
         ix = envCard.left + PAD; iy = envCard.top + PAD; iw = W - 2 * PAD;
@@ -3095,9 +3203,9 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         iy += HH + GT;
         Put(st->hGameModeStatus, ix, iy + (ROW - LH) / 2, iw, LH);
         iy += ROW + GT;
-        Put(st->hVCacheStatus, ix, iy + (ROW - LH) / 2, iw, LH);
+        Put(st->hVCacheStatus, ix, iy, iw, vCacheH);
         if (showEffect) {
-            iy += ROW + GT;
+            iy += vCacheH + GT;
             Put(st->hVCacheEffect, ix, iy, iw, effectH);
         }
         y = envCard.bottom + GAP;
@@ -3478,7 +3586,8 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
                         st->hAutoStatus };
     HWND coremap[]  = { st->hMapHdr, st->hTopoText, st->hMapMaskLbl, st->hMapMask,
                         st->hMapReset, st->hMap, st->hMapFail };
-    HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify, st->hPollLbl, st->hPoll,
+    HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify,
+                        st->hVCacheManage, st->hVCacheManageDesc, st->hPollLbl, st->hPoll,
                         st->hGameModeStatus, st->hVCacheStatus, st->hVCacheEffect,
                         st->hBlocked, st->hInspect };
 
@@ -3535,7 +3644,8 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
     HWND smalls[] = { st->hGameLbl, st->hGameMaskLbl, st->hHeavyLbl, st->hHeavyMaskLbl,
                       st->hGameMaskWarn, st->hHeavyMaskWarn, st->hAutoDesc, st->hPctLbl,
                       st->hAutoStatus, st->hTopoText, st->hMapMaskLbl,
-                      st->hPollLbl, st->hVCacheEffect, st->hBlocked, st->hMapFail };
+                      st->hVCacheManageDesc, st->hPollLbl, st->hVCacheEffect,
+                      st->hBlocked, st->hMapFail };
     for (HWND h : smalls)
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(small), TRUE);
 
@@ -3635,6 +3745,7 @@ void ApplyChanges(SettingsState* st, HWND hwnd) {
     SetWindowTextW(st->hPoll, std::to_wstring(st->work.pollMs).c_str());
     SetChecked(st->hNotify, st->work.notifications);
     SetChecked(st->hStartup, st->work.startWithWindows);
+    SetChecked(st->hVCacheManage, ReadServiceStartValue(L"amd3dvcache") == 4);
     RepaintChrome(hwnd);   // masks may have been repaired, so the stat row may have moved
 }
 
@@ -3940,6 +4051,18 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                               BS_AUTOCHECKBOX | WS_TABSTOP, IDC_STARTUP);
             st->hNotify = Mk(hwnd, L"BUTTON", L"Show notifications",
                              BS_AUTOCHECKBOX | WS_TABSTOP, IDC_NOTIFY);
+            st->hVCacheManage = Mk(
+                hwnd, L"BUTTON",
+                L"Disable AMD's 3D V-Cache optimizer (requires a restart)",
+                BS_AUTOCHECKBOX | WS_TABSTOP, IDC_VCACHE_MANAGE);
+            st->hVCacheManageDesc = Mk(
+                hwnd, L"STATIC",
+                L"Changing this needs administrator approval once and takes effect only after "
+                L"you restart Windows. It stays off until you turn it back on here. AMD's "
+                L"optimizer normally parks the non-cache CCD while a game runs; with it "
+                L"disabled that CCD stays available, so Game Optimizer's background mask can "
+                L"actually be used.",
+                SS_LEFT, -1);
             st->hPollLbl = Mk(hwnd, L"STATIC", L"Poll interval (ms):", SS_LEFT, -1);
             st->hPoll = Mk(hwnd, L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
                            IDC_POLL);
@@ -4030,7 +4153,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // so it stops asking to repaint on every mouse move. The pixels themselves
                 // are now ours - see CheckBoxProc for why this is a subclass and not
                 // BS_OWNERDRAW, which would destroy BM_GETCHECK on these controls.
-                HWND checks[] = { st->hEnabled, st->hAutoPin, st->hStartup, st->hNotify };
+                HWND checks[] = { st->hEnabled, st->hAutoPin, st->hStartup, st->hNotify,
+                                  st->hVCacheManage };
                 for (HWND h : checks) {
                     UseClassicChrome(h);
                     if (h) SetWindowSubclass(h, CheckBoxProc, kCheckSubclassId, 0);
@@ -4042,6 +4166,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             SetChecked(st->hStartup, st->work.startWithWindows);
             SetChecked(st->hNotify, st->work.notifications);
+            SetChecked(st->hVCacheManage, ReadServiceStartValue(L"amd3dvcache") == 4);
             SetWindowTextW(st->hPoll, std::to_wstring(st->work.pollMs).c_str());
 
             FillMaskCombo(st->hMapMask, st->work,
@@ -4245,8 +4370,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             if (st && wp == kStatusTimer) {
                 bool relayout = RefreshBlockedLine(st);
-                // Query-only live refresh: one Game Mode registry value and exactly the
-                // named AMD service. CPU brand/elevation stay on the full one-time probe;
+                // Query-only live refresh: one Game Mode registry value and exactly the two
+                // named AMD components. CPU brand/elevation stay on the full one-time probe;
                 // no service enumeration and no second timer are introduced.
                 RefreshEnvironmentStatus(st->env);
                 if (UpdateEnvironmentSection(st)) relayout = true;
@@ -4560,6 +4685,9 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case IDC_MAPRESET:
                     OnResetMask(st, hwnd);
+                    return 0;
+                case IDC_VCACHE_MANAGE:
+                    if (code == BN_CLICKED) OnVCacheManageToggle(st, hwnd);
                     return 0;
                 case IDC_STARTUP: {
                     bool on = IsChecked(st->hStartup);

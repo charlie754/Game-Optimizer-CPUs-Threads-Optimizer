@@ -771,6 +771,7 @@ void ExpectConfigEqual(const cd::Config& got, const cd::Config& want, const char
     CHECK_EQ(got.pollMs, want.pollMs);
     CHECK_EQ(got.notifications, want.notifications);
     CHECK_EQ(got.paused, want.paused);
+    CHECK_EQ(got.vcacheOriginalStart, want.vcacheOriginalStart);
     CHECK_EQ(got.firstRunDone, want.firstRunDone);
     CHECK_EQ(got.topologySignature, want.topologySignature);
 
@@ -2796,6 +2797,67 @@ void Test_K7_KeyComparisonIsExactAndDoesNotFoldCase() {
           expected);
 }
 
+void Test_L1_VCacheEnvironmentNamesServiceAndDriverSeparately() {
+    Case("L1 V-Cache environment wording names service and driver separately");
+    CHECK_EQ(cd::FormatAmdVCacheComponentsEnvironmentStatus(
+                 cd::AmdVCacheServiceState::InstalledButStopped,
+                 cd::AmdVCacheServiceState::Running),
+             L"AMD 3D V-Cache Performance Optimizer\r\n"
+             L"  service (amd3dvcacheSvc): Installed but stopped\r\n"
+             L"  driver (amd3dvcache): Running");
+}
+
+void Test_M1_MissingVCacheOriginalStartDefaultsMinusOne() {
+    Case("M1 missing vcache_original_start defaults -1");
+    cd::Config c;
+    std::wstring err;
+    CHECK(cd::ParseConfig(L"[general]\nnotifications=1\n", c, &err));
+    CHECK_EQ(c.vcacheOriginalStart, -1);
+}
+
+void Test_M2_VCacheOriginalStartThreeRoundTrips() {
+    Case("M2 vcache_original_start=3 parses and round-trips as 3");
+    cd::Config parsed;
+    std::wstring err;
+    CHECK(cd::ParseConfig(L"[general]\nvcache_original_start=3\n", parsed, &err));
+    CHECK_EQ(parsed.vcacheOriginalStart, 3);
+    const std::wstring serialized = cd::SerializeConfig(parsed);
+    CHECK(serialized.find(L"vcache_original_start=3") != std::wstring::npos);
+    cd::Config roundTripped;
+    CHECK(cd::ParseConfig(serialized, roundTripped, &err));
+    CHECK_EQ(roundTripped.vcacheOriginalStart, 3);
+}
+
+void Test_M3_DisabledWhileRunningRequiresRestart() {
+    Case("M3 configured Disabled plus Running says restart required");
+    CHECK_EQ(cd::FormatAmdVCacheComponentEnvironmentLine(
+                 L"driver", L"amd3dvcache", cd::AmdVCacheServiceState::Running, 4),
+             L"driver (amd3dvcache): Running, start type Disabled - restart required");
+}
+
+void Test_M4_ManualWhileRunningNeedsNoNotice() {
+    Case("M4 configured Manual plus Running has no restart notice");
+    CHECK_EQ(cd::FormatAmdVCacheComponentEnvironmentLine(
+                 L"driver", L"amd3dvcache", cd::AmdVCacheServiceState::Running, 3),
+             L"driver (amd3dvcache): Running, start type Manual");
+}
+
+void Test_M5_DisabledWhileStoppedNeedsNoNotice() {
+    Case("M5 configured Disabled plus Stopped has no restart notice");
+    CHECK_EQ(cd::FormatAmdVCacheComponentEnvironmentLine(
+                 L"driver", L"amd3dvcache",
+                 cd::AmdVCacheServiceState::InstalledButStopped, 4),
+             L"driver (amd3dvcache): Installed but stopped, start type Disabled");
+}
+
+void Test_M6_ManualWhileStoppedRequiresRestart() {
+    Case("M6 configured Manual plus Stopped says restart required");
+    CHECK_EQ(cd::FormatAmdVCacheComponentEnvironmentLine(
+                 L"driver", L"amd3dvcache",
+                 cd::AmdVCacheServiceState::InstalledButStopped, 3),
+             L"driver (amd3dvcache): Installed but stopped, start type Manual - restart required");
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -2903,6 +2965,17 @@ int main() {
     Test_K5_EmptyLiveConfigReturnsNoIndices();
     Test_K6_EmptyBaselineAndWorkReportEveryLiveIndex();
     Test_K7_KeyComparisonIsExactAndDoesNotFoldCase();
+
+    std::printf("\n== L. AMD V-Cache driver detection ==\n");
+    Test_L1_VCacheEnvironmentNamesServiceAndDriverSeparately();
+
+    std::printf("\n== M. AMD V-Cache persistent switch ==\n");
+    Test_M1_MissingVCacheOriginalStartDefaultsMinusOne();
+    Test_M2_VCacheOriginalStartThreeRoundTrips();
+    Test_M3_DisabledWhileRunningRequiresRestart();
+    Test_M4_ManualWhileRunningNeedsNoNotice();
+    Test_M5_DisabledWhileStoppedNeedsNoNotice();
+    Test_M6_ManualWhileStoppedRequiresRestart();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

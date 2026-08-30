@@ -362,6 +362,7 @@ Config DefaultConfig(const Topology& t) {
     c.pollMs = 250;
     c.notifications = false;
     c.paused = false;
+    c.vcacheOriginalStart = -1;
     c.firstRunDone = false;
     c.topologySignature = t.signature;
     c.masks = DeriveMasks(t);
@@ -474,6 +475,12 @@ bool ParseConfig(const std::wstring& text, Config& out, std::wstring* error) {
                     ParseBoolW(value, out.notifications);
                 } else if (IEquals(key, std::wstring(L"paused"))) {
                     ParseBoolW(value, out.paused);
+                } else if (IEquals(key, std::wstring(L"vcache_original_start"))) {
+                    int v = out.vcacheOriginalStart;
+                    if (ParseIntW(value, v)) out.vcacheOriginalStart = v;
+                } else if (IEquals(key, std::wstring(L"manage_vcache_driver"))) {
+                    // Consume, but never preserve, the Part B/C opt-in. The measured SCM stop
+                    // request failed with ERROR_INVALID_SERVICE_CONTROL, so that mechanism is gone.
                 } else if (IEquals(key, std::wstring(L"first_run_done"))) {
                     ParseBoolW(value, out.firstRunDone);
                 } else {
@@ -593,6 +600,7 @@ std::wstring SerializeConfig(const Config& c) {
     AppendKv(out, L"poll_ms", std::to_wstring(c.pollMs));
     AppendKv(out, L"notifications", BoolText(c.notifications));
     AppendKv(out, L"paused", BoolText(c.paused));
+    AppendKv(out, L"vcache_original_start", std::to_wstring(c.vcacheOriginalStart));
     AppendKv(out, L"first_run_done", BoolText(c.firstRunDone));
     AppendUnknownFor(out, c, std::wstring(kSecGeneral), consumed);
     out += L"\r\n";

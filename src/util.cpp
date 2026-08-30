@@ -49,7 +49,11 @@ const wchar_t* const kCpu0KeyPath =
     L"HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0";
 const wchar_t* const kCpuBrandValue = L"ProcessorNameString";
 
+// The Svc name is the user-mode service; the other name is the kernel driver. They start
+// and stop independently. Measured failure: the operator disabled the service while the
+// driver kept running, and the old single-component UI made that look like both were gone.
 const wchar_t* const kVCacheServiceName = L"amd3dvcacheSvc";
+const wchar_t* const kVCacheDriverName  = L"amd3dvcache";
 
 // Log file is rotated (truncated) once it passes this size.
 const unsigned long long kMaxLogBytes = 1024ull * 1024ull;
@@ -411,6 +415,29 @@ bool WriteFileUtf8Atomic(const std::wstring& path, const std::wstring& text) {
     return true;
 }
 
+int ReadServiceStartValue(const wchar_t* serviceName) {
+    if (serviceName == nullptr || serviceName[0] == L'\0') return -1;
+    const std::wstring keyPath =
+        std::wstring(L"SYSTEM\\CurrentControlSet\\Services\\") + serviceName;
+    HKEY key = nullptr;
+    if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0, KEY_QUERY_VALUE, &key) !=
+        ERROR_SUCCESS) {
+        return -1;
+    }
+
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD bytes = sizeof(value);
+    const LONG rc = ::RegQueryValueExW(key, L"Start", nullptr, &type,
+                                       reinterpret_cast<LPBYTE>(&value), &bytes);
+    ::RegCloseKey(key);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD || bytes != sizeof(value) ||
+        value > 0x7ffffffful) {
+        return -1;
+    }
+    return static_cast<int>(value);
+}
+
 // ---- Autostart -------------------------------------------------------------
 
 std::wstring AutostartCommand(const std::wstring& exePath) {
@@ -639,38 +666,48 @@ void RefreshEnvironmentStatus(EnvironmentInfo& info) {
     info.amdVCacheServicePresent = false;
     info.amdVCacheServiceRunning = false;
     info.amdVCacheServiceState = AmdVCacheServiceState::NotDeterminable;
+    info.amdVCacheDriverPresent = false;
+    info.amdVCacheDriverRunning = false;
+    info.amdVCacheDriverState = AmdVCacheServiceState::NotDeterminable;
 
-    // Open exactly the service we care about. No EnumServicesStatusEx call belongs on a
-    // one-second UI timer. Every operation here is query-only.
+    // Open exactly the two components we care about. No EnumServicesStatusEx call belongs
+    // on a one-second UI timer. Every operation here is query-only.
     SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (scm == nullptr) return;
 
-    ::SetLastError(ERROR_SUCCESS);
-    SC_HANDLE svc = ::OpenServiceW(scm, kVCacheServiceName, SERVICE_QUERY_STATUS);
-    if (svc == nullptr) {
-        if (::GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
-            info.amdVCacheServiceState = AmdVCacheServiceState::NotInstalled;
+    const auto queryComponent = [scm](const wchar_t* name, bool& present, bool& running,
+                                      AmdVCacheServiceState& state) {
+        ::SetLastError(ERROR_SUCCESS);
+        SC_HANDLE component = ::OpenServiceW(scm, name, SERVICE_QUERY_STATUS);
+        if (component == nullptr) {
+            if (::GetLastError() == ERROR_SERVICE_DOES_NOT_EXIST) {
+                state = AmdVCacheServiceState::NotInstalled;
+            }
+            return;
         }
-        ::CloseServiceHandle(scm);
-        return;
-    }
 
-    info.amdVCacheServicePresent = true;
-    SERVICE_STATUS_PROCESS ssp;
-    ::ZeroMemory(&ssp, sizeof(ssp));
-    DWORD needed = 0;
-    if (::QueryServiceStatusEx(svc, SC_STATUS_PROCESS_INFO,
-                               reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed)) {
-        if (ssp.dwCurrentState == SERVICE_RUNNING) {
-            info.amdVCacheServiceRunning = true;
-            info.amdVCacheServiceState = AmdVCacheServiceState::Running;
-        } else if (ssp.dwCurrentState == SERVICE_STOPPED) {
-            info.amdVCacheServiceState = AmdVCacheServiceState::InstalledButStopped;
+        present = true;
+        SERVICE_STATUS_PROCESS ssp;
+        ::ZeroMemory(&ssp, sizeof(ssp));
+        DWORD needed = 0;
+        if (::QueryServiceStatusEx(component, SC_STATUS_PROCESS_INFO,
+                                   reinterpret_cast<LPBYTE>(&ssp), sizeof(ssp), &needed)) {
+            if (ssp.dwCurrentState == SERVICE_RUNNING) {
+                running = true;
+                state = AmdVCacheServiceState::Running;
+            } else if (ssp.dwCurrentState == SERVICE_STOPPED) {
+                state = AmdVCacheServiceState::InstalledButStopped;
+            }
+            // Paused and transition states are deliberately NotDeterminable: calling either
+            // one "stopped" would be a claim the service manager did not return.
         }
-        // Paused and transition states are deliberately NotDeterminable: calling either one
-        // "stopped" would be a claim the service manager did not return.
-    }
-    ::CloseServiceHandle(svc);
+        ::CloseServiceHandle(component);
+    };
+
+    queryComponent(kVCacheServiceName, info.amdVCacheServicePresent,
+                   info.amdVCacheServiceRunning, info.amdVCacheServiceState);
+    queryComponent(kVCacheDriverName, info.amdVCacheDriverPresent,
+                   info.amdVCacheDriverRunning, info.amdVCacheDriverState);
     ::CloseServiceHandle(scm);
 }
 

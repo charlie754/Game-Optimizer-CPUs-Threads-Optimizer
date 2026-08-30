@@ -376,6 +376,8 @@ struct CmdOptions {
     // The Run entry passes --tray so login stays silent; MigrateAutostartCommand repairs the
     // flagless entries written by older builds before this value controls launch visibility.
     bool tray  = false;
+    bool vcacheSet = false;
+    int vcacheSetValue = -1;
 };
 
 CmdOptions ParseCommandLine() {
@@ -387,11 +389,136 @@ CmdOptions ParseCommandLine() {
         const std::wstring a = ToLower(argv[i] ? argv[i] : L"");
         if (a == L"--bench")      opt.bench = true;
         else if (a == L"--tray")  opt.tray  = true;
+        else if (a == L"--vcache-set") {
+            // Presence selects this mode even when the argument is malformed. Falling through to
+            // normal startup would turn a bad elevated helper invocation into an elevated tray.
+            opt.vcacheSet = true;
+            if (i + 1 < argc) {
+                const std::wstring value = argv[++i] ? argv[i] : L"";
+                if (value == L"0") opt.vcacheSetValue = 0;
+                if (value == L"1") opt.vcacheSetValue = 1;
+            }
+        }
         // Anything else is ignored on purpose: an unknown switch must not stop the app
         // from starting up in the tray.
     }
     LocalFree(argv);
     return opt;
+}
+
+const wchar_t* const kVCacheDriverKeyPath =
+    L"SYSTEM\\CurrentControlSet\\Services\\amd3dvcache";
+const wchar_t* const kVCacheServiceKeyPath =
+    L"SYSTEM\\CurrentControlSet\\Services\\amd3dvcacheSvc";
+
+LONG WriteFixedServiceStartValue(const wchar_t* fixedKeyPath, DWORD startValue) {
+    HKEY key = nullptr;
+    LONG rc = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE, fixedKeyPath, 0, KEY_SET_VALUE, &key);
+    if (rc != ERROR_SUCCESS) return rc;
+    rc = ::RegSetValueExW(key, L"Start", 0, REG_DWORD,
+                          reinterpret_cast<const BYTE*>(&startValue), sizeof(startValue));
+    ::RegCloseKey(key);
+    return rc;
+}
+
+void RestoreVCacheConfigValue(Config& cfg, int priorValue, const std::wstring& configPath) {
+    cfg.vcacheOriginalStart = priorValue;
+    std::wstring restoreError;
+    if (!SaveConfig(configPath, cfg, &restoreError)) {
+        LogLine(L"[vcache-set] config rollback failed: %s",
+                restoreError.empty() ? L"(no detail)" : restoreError.c_str());
+    }
+}
+
+int RunVCacheSet(int requestedValue) {
+    if (requestedValue != 0 && requestedValue != 1) {
+        LogLine(L"[vcache-set] invalid or missing value; exiting without changes");
+        return 2;
+    }
+
+    // The measured SCM stop request failed with ERROR_INVALID_SERVICE_CONTROL (1052), and the
+    // device is CR_NOT_DISABLEABLE. Changing these two fixed Start values followed by a reboot
+    // is the measured working route; no service-control operation belongs in this mode.
+    const int driverStart = ReadServiceStartValue(L"amd3dvcache");
+    const int serviceStart = ReadServiceStartValue(L"amd3dvcacheSvc");
+    if (driverStart < 0 || serviceStart < 0) {
+        LogLine(L"[vcache-set] could not read both fixed Start values (driver=%d, service=%d); "
+                L"exiting without changes", driverStart, serviceStart);
+        return 3;
+    }
+
+    const std::wstring configPath = GetConfigPath();
+    if (configPath.empty()) {
+        LogLine(L"[vcache-set] config path is unavailable; exiting without changes");
+        return 4;
+    }
+
+    Config cfg;
+    std::wstring configError;
+    if (!LoadConfig(configPath, cfg, &configError) && !configError.empty()) {
+        LogLine(L"[vcache-set] config is unreadable: %s; exiting without changes",
+                configError.c_str());
+        return 4;
+    }
+
+    const int priorRecordedStart = cfg.vcacheOriginalStart;
+    const DWORD targetStart = requestedValue == 1
+        ? 4u
+        : static_cast<DWORD>(cfg.vcacheOriginalStart >= 0 ? cfg.vcacheOriginalStart : 3);
+    if (requestedValue == 1) {
+        // Record the measured driver value before disabling anything. Manual (3) is common,
+        // not guaranteed; a guessed restore value would silently change the user's setup.
+        cfg.vcacheOriginalStart = driverStart;
+        if (!SaveConfig(configPath, cfg, &configError)) {
+            LogLine(L"[vcache-set] could not persist vcache_original_start: %s; "
+                    L"exiting without registry changes",
+                    configError.empty() ? L"(no detail)" : configError.c_str());
+            return 5;
+        }
+    }
+
+    LONG driverWrite = WriteFixedServiceStartValue(kVCacheDriverKeyPath, targetStart);
+    if (driverWrite != ERROR_SUCCESS) {
+        if (requestedValue == 1)
+            RestoreVCacheConfigValue(cfg, priorRecordedStart, configPath);
+        LogLine(L"[vcache-set] amd3dvcache Start write failed, err=%ld", driverWrite);
+        return 6;
+    }
+
+    LONG serviceWrite = WriteFixedServiceStartValue(kVCacheServiceKeyPath, targetStart);
+    if (serviceWrite != ERROR_SUCCESS) {
+        const LONG driverRollback =
+            WriteFixedServiceStartValue(kVCacheDriverKeyPath, static_cast<DWORD>(driverStart));
+        const LONG serviceRollback =
+            WriteFixedServiceStartValue(kVCacheServiceKeyPath, static_cast<DWORD>(serviceStart));
+        if (requestedValue == 1)
+            RestoreVCacheConfigValue(cfg, priorRecordedStart, configPath);
+        LogLine(L"[vcache-set] amd3dvcacheSvc Start write failed, err=%ld; rollback "
+                L"driver=%ld service=%ld", serviceWrite, driverRollback, serviceRollback);
+        return 7;
+    }
+
+    if (requestedValue == 0) {
+        // Clear only after both fixed Start values were restored. If the atomic config save
+        // fails, put both values back so the visible checkbox can honestly remain unchanged.
+        cfg.vcacheOriginalStart = -1;
+        if (!SaveConfig(configPath, cfg, &configError)) {
+            const LONG driverRollback = WriteFixedServiceStartValue(
+                kVCacheDriverKeyPath, static_cast<DWORD>(driverStart));
+            const LONG serviceRollback = WriteFixedServiceStartValue(
+                kVCacheServiceKeyPath, static_cast<DWORD>(serviceStart));
+            LogLine(L"[vcache-set] restored Start values but could not clear config: %s; "
+                    L"rollback driver=%ld service=%ld",
+                    configError.empty() ? L"(no detail)" : configError.c_str(),
+                    driverRollback, serviceRollback);
+            return 8;
+        }
+    }
+
+    LogLine(L"[vcache-set] configured amd3dvcache and amd3dvcacheSvc Start=%lu; "
+            L"vcache_original_start=%d; restart required",
+            static_cast<unsigned long>(targetStart), cfg.vcacheOriginalStart);
+    return 0;
 }
 
 int RunBench() {
@@ -689,6 +816,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
     (void)lpCmdLine;
     (void)nCmdShow;
 
+    // ELEVATED SET DISPATCH MUST STAY FIRST. The helper has one job and returns before the
+    // single-instance mutex, COM, window classes, config, tray, CPU Sets or engine exist.
+    const CmdOptions opt = ParseCommandLine();
+    if (opt.vcacheSet) return RunVCacheSet(opt.vcacheSetValue);
+
     g_hInst           = hInst;
     g_msgShowSettings = RegisterWindowMessageW(L"GameOptimizer.ShowSettings");
 
@@ -710,7 +842,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
     MigrateLegacyAutostart();
     MigrateAutostartCommand();
 
-    const CmdOptions opt = ParseCommandLine();
     if (opt.tray) LogLine(L"[main] started with --tray");
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);

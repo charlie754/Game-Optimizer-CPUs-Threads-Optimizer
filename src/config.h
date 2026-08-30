@@ -60,6 +60,9 @@ struct Config {
     int  pollMs = 250;                    // clamped to 100..2000 on load
     bool notifications = false;
     bool paused = false;
+    // The driver's configured Start value before this app disabled it. -1 means the app has
+    // changed nothing. Restoring a guessed Manual value would silently rewrite a user's setup.
+    int  vcacheOriginalStart = -1;
     bool firstRunDone = false;
 
     std::wstring topologySignature;       // guards stale CPU Set Ids - see topology.h

@@ -33,6 +33,11 @@ bool ReadFileUtf8(const std::wstring& path, std::wstring& out);
 // Writes via a .tmp + MoveFileEx replace, so an interrupted write cannot truncate config.
 bool WriteFileUtf8Atomic(const std::wstring& path, const std::wstring& text);
 
+// ---- AMD 3D V-Cache status ------------------------------------------------
+// Returns the Start value from HKLM\SYSTEM\CurrentControlSet\Services\<name>, or -1.
+// This is query-only and does not require elevation.
+int ReadServiceStartValue(const wchar_t* serviceName);
+
 // ---- Autostart (HKCU\Software\Microsoft\Windows\CurrentVersion\Run) ---------
 // The value is named "GameOptimizer".
 std::wstring AutostartCommand(const std::wstring& exePath);
@@ -80,11 +85,15 @@ struct EnvironmentInfo {
     bool  amdVCacheServiceRunning = false;
     AmdVCacheServiceState amdVCacheServiceState =
         AmdVCacheServiceState::NotDeterminable;
+    bool  amdVCacheDriverPresent = false;   // kernel driver "amd3dvcache"
+    bool  amdVCacheDriverRunning = false;
+    AmdVCacheServiceState amdVCacheDriverState =
+        AmdVCacheServiceState::NotDeterminable;
     bool  isElevated = false;
 };
 EnvironmentInfo ProbeEnvironment();
-// Refreshes only the two live scheduling influences: one HKCU value read and one named
-// service status query. It never enumerates services and never writes either source.
+// Refreshes only the live scheduling influences: one HKCU value read and two named status
+// queries. It never enumerates services and never writes any source.
 void RefreshEnvironmentStatus(EnvironmentInfo& info);
 
 void OpenGameModeSettings();                    // ms-settings:gaming-gamemode
