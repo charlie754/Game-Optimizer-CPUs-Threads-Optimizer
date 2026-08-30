@@ -2,6 +2,10 @@
 
 **CPU threads optimizer.**
 
+![Game Optimizer in use](video/gameoptimizer.gif)
+
+Settings window, recorded on the author's machine.
+
 Per-game CPU Set isolation for split-topology CPUs — the isolation of BIOS "Turbo Game Mode",
 applied only to the game you chose, and only while it is running.
 
@@ -22,57 +26,14 @@ else, and clears every mask the moment the game exits.
 - **No injection, no overlay.** One native exe, no .NET runtime. Nothing needs elevation except
   the optional AMD 3D V-Cache setting, which asks for it once.
 - **Local config only.** No account, no telemetry, and the app itself makes no network
-  requests. See the WebView2 note below for the one component that is a browser engine.
-- **One optional runtime dependency: WebView2.** It is used for the sponsor strip in the
-  Settings window and for nothing else. See below — the app runs, and looks right, without it.
+  requests.
+- **One optional runtime dependency: WebView2.** It renders the sponsor strip at the
+  bottom of the Settings window and nothing else. If it is absent the strip is drawn
+  with GDI instead and nothing else changes — the app always starts. It is never
+  touched while the app sits in the tray. See `NOTICE.md` and the file table below.
 
 **Runs on:** Windows 10 or 11, x64. The manifest declares no older Windows, and there is no
 32-bit or ARM build.
-
-## WebView2 — the one optional runtime dependency
-
-It was true until 2026-08-29 that this app had **no** runtime dependency at all. That sentence
-is corrected here rather than left standing.
-
-The three sponsor buttons at the bottom of the Settings window are the author's own browser
-extension elements — the Ko-fi button, a GitHub star button, and the animated GoatProject
-lockup with its meteors, spark and glyph cross-fade. They were first hand-ported into GDI
-drawing code, which cannot reproduce CSS transitions, blur filters and a radial mask exactly
-and never looked right. They are now **copied verbatim** and rendered by an embedded
-**Microsoft Edge WebView2**, so the pixels are the original's pixels.
-
-What that does and does not mean:
-
-- **It is optional.** If the WebView2 runtime is not installed, or `WebView2Loader.dll` is
-  missing, or creation fails for any other reason, the Settings window shows the original GDI
-  sponsor strip in exactly the same place. **The app always starts and never loses the strip.**
-  The *loader-missing* path was exercised deliberately rather than reasoned about: the loader
-  filename was pointed at a file that does not exist, the app was rebuilt and run, and the GDI
-  strip appeared at its own size with the window healthy. The later failure points — runtime
-  absent, environment or controller creation refused — run the same fallback but have not each
-  been forced individually on this machine.
-- **It is lazy.** Nothing web-related is created until the Settings window opens, and it is
-  all destroyed when that window closes. While the app sits in the tray — which is nearly all
-  of its life — there is no browser and no extra process. Nothing on the startup path touches
-  it.
-- **The page is inside the binary.** In the repository it is generated into `src\sponsor_html.h`
-  by `python tools\gen-sponsor-html.py`, run by hand, with the output committed alongside the
-  source; neither file is in this download. The app never reads the extension's files at run time and does not depend on any
-  path outside its own tree.
-- **Links leave.** Every navigation the page attempts is cancelled and handed to
-  `ShellExecuteW`, so a click opens your normal browser. Only the three URLs in
-  `src\sponsor.h` are ever opened; anything else is refused and logged.
-- **On network access:** the app makes no requests, and the page is loaded from a string in
-  the binary with every navigation cancelled — so nothing in this repository fetches anything.
-  WebView2 is nevertheless a full browser engine and this project has not audited what the
-  Microsoft runtime may do on its own. If that matters to you, do not install WebView2: the
-  app then uses the GDI strip and this component never loads.
-
-`WebView2Loader.dll` is Microsoft's redistributable loader; see `NOTICE.md`. In a downloaded
-release it sits beside `GameOptimizer.exe`, which is the **first** place the app looks — keep it
-there. (It then tries the installed Edge WebView2 runtime, then the default search path.) (In the source repository it is vendored under `third_party\webview2\x64\` and
-the build copies it next to the binary.) It is loaded with `LoadLibraryW` at run time and is
-deliberately **not** in the exe's import table, so its absence can never stop the app starting.
 
 ## Status
 
