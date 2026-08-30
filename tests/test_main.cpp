@@ -2897,6 +2897,24 @@ void Test_M2_VCacheOriginalStartThreeRoundTrips() {
     CHECK_EQ(roundTripped.vcacheOriginalStart, 3);
 }
 
+void Test_M7_VCacheRestoreHintPinsMissingManualAndBootStartValues() {
+    Case("M7 V-Cache restore hint is absent only when no original Start value is recorded");
+    const std::wstring missing = cd::FormatVCacheRestoreHint(-1);
+    CHECK(missing.empty());
+
+    CHECK_EQ(cd::FormatVCacheRestoreHint(3),
+             L"Game Optimizer recorded this driver's original Start value as 3. Turn this "
+             L"setting off before deleting the app's settings folder, or that value is lost "
+             L"and the driver stays disabled.");
+
+    const std::wstring bootStart = cd::FormatVCacheRestoreHint(0);
+    CHECK(!bootStart.empty());
+    CHECK_EQ(bootStart,
+             L"Game Optimizer recorded this driver's original Start value as 0. Turn this "
+             L"setting off before deleting the app's settings folder, or that value is lost "
+             L"and the driver stays disabled.");
+}
+
 void Test_M3_DisabledWhileRunningRequiresRestart() {
     Case("M3 configured Disabled plus Running says restart required");
     CHECK_EQ(cd::FormatAmdVCacheComponentEnvironmentLine(
@@ -3047,6 +3065,7 @@ int main() {
     Test_M4_ManualWhileRunningNeedsNoNotice();
     Test_M5_DisabledWhileStoppedNeedsNoNotice();
     Test_M6_ManualWhileStoppedRequiresRestart();
+    Test_M7_VCacheRestoreHintPinsMissingManualAndBootStartValues();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

@@ -1007,7 +1007,8 @@ struct SettingsState {
     HWND hGenHdr = nullptr, hStartup = nullptr, hNotify = nullptr;
     HWND hVCacheManage = nullptr, hVCacheManageDesc = nullptr;
     HWND hPollLbl = nullptr, hPoll = nullptr;
-    HWND hGameModeStatus = nullptr, hVCacheStatus = nullptr, hVCacheEffect = nullptr;
+    HWND hGameModeStatus = nullptr, hVCacheStatus = nullptr, hVCacheRestoreHint = nullptr;
+    HWND hVCacheEffect = nullptr;
     HWND hBlocked = nullptr, hInspect = nullptr;
     // The sponsor strip. It belongs to the WINDOW, not to a page - it sits directly above the
     // footer on every page - so it is deliberately absent from PageControls.
@@ -2464,9 +2465,8 @@ bool RefreshBlockedLine(SettingsState* st) {
 }
 
 // Updates the General page's environment card from the already-probed running state and the
-// current configured Start values. Returns true
-// only when the running-service explanation appeared or disappeared, because that is the
-// only change that alters the card's height and therefore requires a layout pass.
+// current configured Start values. Returns true when either optional explanation appears or
+// disappears, because those are the changes that alter the card's height and require layout.
 bool UpdateEnvironmentSection(SettingsState* st) {
     if (!st) return false;
 
@@ -2483,10 +2483,15 @@ bool UpdateEnvironmentSection(SettingsState* st) {
         st->env.amdVCacheServiceState == AmdVCacheServiceState::Running
             ? AmdVCacheRunningEffectText()
             : std::wstring();
+    const std::wstring restoreHint =
+        FormatVCacheRestoreHint(st->work.vcacheOriginalStart);
 
     const bool hadEffect = st->hVCacheEffect &&
                            GetWindowTextLengthW(st->hVCacheEffect) > 0;
     const bool hasEffect = !effect.empty();
+    const bool hadRestoreHint = st->hVCacheRestoreHint &&
+                                GetWindowTextLengthW(st->hVCacheRestoreHint) > 0;
+    const bool hasRestoreHint = !restoreHint.empty();
 
     if (st->hGameModeStatus && GetText(st->hGameModeStatus) != game)
         SetWindowTextW(st->hGameModeStatus, game.c_str());
@@ -2494,11 +2499,17 @@ bool UpdateEnvironmentSection(SettingsState* st) {
         SetWindowTextW(st->hVCacheStatus, components.c_str());
     if (st->hVCacheEffect && GetText(st->hVCacheEffect) != effect)
         SetWindowTextW(st->hVCacheEffect, effect.c_str());
+    if (st->hVCacheRestoreHint && GetText(st->hVCacheRestoreHint) != restoreHint)
+        SetWindowTextW(st->hVCacheRestoreHint, restoreHint.c_str());
     if (st->hVCacheEffect) {
         ShowWindow(st->hVCacheEffect,
                    hasEffect && st->page == PAGE_GENERAL ? SW_SHOW : SW_HIDE);
     }
-    return hadEffect != hasEffect;
+    if (st->hVCacheRestoreHint) {
+        ShowWindow(st->hVCacheRestoreHint,
+                   hasRestoreHint && st->page == PAGE_GENERAL ? SW_SHOW : SW_HIDE);
+    }
+    return hadEffect != hasEffect || hadRestoreHint != hasRestoreHint;
 }
 
 // ---------------------------------------------------------------------------
@@ -3195,11 +3206,18 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         // Live scheduling influences. The AMD block is three lines because its user-mode
         // service and kernel driver are independent. The explanation exists only while the
         // AMD service is RUNNING, and its pure wording is shared with the parked-mask warning.
+        // The restore hint exists only while config carries an original driver Start value.
         const bool showEffect = st->hVCacheEffect &&
                                 GetWindowTextLengthW(st->hVCacheEffect) > 0;
+        const bool showRestoreHint = st->hVCacheRestoreHint &&
+                                     GetWindowTextLengthW(st->hVCacheRestoreHint) > 0;
         const int vCacheH = 3 * LH;
         const int effectH = theme::Dp(34, dpi);
+        const int restoreHintH = showRestoreHint
+            ? MeasureWrappedStaticHeight(st->hVCacheRestoreHint, measureDc, iw, dpi)
+            : 0;
         int envH = 2 * PAD + HH + GT + ROW + GT + vCacheH;
+        if (showRestoreHint) envH += GT + restoreHintH;
         if (showEffect) envH += GT + effectH;
         RECT envCard = AddCard(y, envH, x0, W);
         ix = envCard.left + PAD; iy = envCard.top + PAD; iw = W - 2 * PAD;
@@ -3209,8 +3227,12 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hGameModeStatus, ix, iy + (ROW - LH) / 2, iw, LH);
         iy += ROW + GT;
         Put(st->hVCacheStatus, ix, iy, iw, vCacheH);
-        if (showEffect) {
+        if (showRestoreHint) {
             iy += vCacheH + GT;
+            Put(st->hVCacheRestoreHint, ix, iy, iw, restoreHintH);
+        }
+        if (showEffect) {
+            iy += (showRestoreHint ? restoreHintH : vCacheH) + GT;
             Put(st->hVCacheEffect, ix, iy, iw, effectH);
         }
         y = envCard.bottom + GAP;
@@ -3593,7 +3615,8 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
                         st->hMapReset, st->hMap, st->hMapFail };
     HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify,
                         st->hVCacheManage, st->hVCacheManageDesc, st->hPollLbl, st->hPoll,
-                        st->hGameModeStatus, st->hVCacheStatus, st->hVCacheEffect,
+                        st->hGameModeStatus, st->hVCacheStatus, st->hVCacheRestoreHint,
+                        st->hVCacheEffect,
                         st->hBlocked, st->hInspect };
 
     const HWND* src = nullptr;
@@ -3619,7 +3642,8 @@ void ApplyPageVisibility(SettingsState* st) {
             // The two parked warnings and the auto-pin status line take part in the page's
             // visibility, but only when they actually have something to say.
             if (h == st->hGameMaskWarn || h == st->hHeavyMaskWarn ||
-                h == st->hAutoStatus || h == st->hVCacheEffect)
+                h == st->hAutoStatus || h == st->hVCacheEffect ||
+                h == st->hVCacheRestoreHint)
                 show = on && GetWindowTextLengthW(h) > 0;
             ShowWindow(h, show ? SW_SHOW : SW_HIDE);
         }
@@ -3649,7 +3673,8 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
     HWND smalls[] = { st->hGameLbl, st->hGameMaskLbl, st->hHeavyLbl, st->hHeavyMaskLbl,
                       st->hGameMaskWarn, st->hHeavyMaskWarn, st->hAutoDesc, st->hPctLbl,
                       st->hAutoStatus, st->hTopoText, st->hMapMaskLbl,
-                      st->hVCacheManageDesc, st->hPollLbl, st->hVCacheEffect,
+                      st->hVCacheManageDesc, st->hPollLbl, st->hVCacheRestoreHint,
+                      st->hVCacheEffect,
                       st->hBlocked, st->hMapFail };
     for (HWND h : smalls)
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(small), TRUE);
@@ -4073,7 +4098,9 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                            IDC_POLL);
             st->hGameModeStatus = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
             st->hVCacheStatus = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
+            st->hVCacheRestoreHint = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
             st->hVCacheEffect = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
+            if (st->hVCacheRestoreHint) ShowWindow(st->hVCacheRestoreHint, SW_HIDE);
             if (st->hVCacheEffect) ShowWindow(st->hVCacheEffect, SW_HIDE);
             st->hBlocked = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
             st->hInspect = Mk(hwnd, L"BUTTON", L"Inspect processes...",
@@ -4458,7 +4485,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // card going quiet.
                     fg = (st->autoState == AutoPinState::Off) ? pal.textDim
                                                               : pal.textSecondary;
-                } else if (ctl == st->hVCacheEffect) {
+                } else if (ctl == st->hVCacheRestoreHint || ctl == st->hVCacheEffect) {
                     fg = pal.textDim;
                 } else if (IsAutoPinLabel(st, ctl) && AutoPinLabelsAreDim(st)) {
                     // These three stay enabled on purpose - see SyncAutoPinEnable - so the

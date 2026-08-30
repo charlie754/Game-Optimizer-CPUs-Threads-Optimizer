@@ -16,8 +16,11 @@ else, and clears every mask the moment the game exits.
 - **CPU Sets only.** `SetProcessDefaultCpuSets`, never `SetProcessAffinityMask`.
 - **Child processes included.** A worker spawned twenty minutes into a session is picked up
   within one poll period. This is not optional — CPU sets are *not* inherited by children.
-- **Nothing global.** No CCD parking, no system policy, no driver, no reboot.
-- **No elevation, no injection, no overlay.** One native exe, no .NET runtime.
+- **Nothing global by default.** No CCD parking, no system policy, no driver, no reboot. The one
+  exception is opt-in: the AMD 3D V-Cache setting described below, which changes a driver's start
+  type and needs a restart.
+- **No injection, no overlay.** One native exe, no .NET runtime. Nothing needs elevation except
+  the optional AMD 3D V-Cache setting, which asks for it once.
 - **Local config only.** No account, no telemetry, and the app itself makes no network
   requests. See the WebView2 note below for the one component that is a browser engine.
 - **One optional runtime dependency: WebView2.** It is used for the sponsor strip in the
@@ -91,8 +94,9 @@ Use it on anti-cheat-protected titles at your own risk.
 
 ## What is in this download
 
-Eight files. There is no installer, no service and no driver, and nothing is written outside your
-user profile.
+Eight files. There is no installer, and the app installs no service and no driver. Nothing is
+written outside your user profile unless you turn on the AMD 3D V-Cache setting, which writes one
+registry value for AMD's own driver and service.
 
 | File | What it is |
 |---|---|
@@ -106,16 +110,21 @@ user profile.
 | `third_party\webview2\README.md` | Which SDK package version that loader came from. |
 
 The `third_party\webview2\` folder is **documentation only** — nothing in it is loaded at run
-time. To remove Game Optimizer: Exit from the tray icon, delete the folder you unzipped, and delete
+time. To remove Game Optimizer: **if you turned on the AMD 3D V-Cache setting, turn it off first and
+restart** — that setting disables a driver, and the record of its original value lives in
+`config.ini`, so deleting that file first leaves the driver disabled with nothing left to restore
+it. Then Exit from the tray icon, delete the folder you unzipped, and delete
 `%LOCALAPPDATA%\GameOptimizer\` if you want its settings gone too.
 
 **If Windows says the file is blocked**, that is the mark-of-the-web that lands on anything
 downloaded. Right-click the **zip** before extracting, Properties, tick **Unblock**, OK, then
 extract.
 
-**It never asks for administrator rights.** The manifest requests `asInvoker`, so double-clicking
-it raises no UAC prompt. (You can still force one yourself with Run as administrator; nothing
-in the app needs it.)
+**Double-clicking it never asks for administrator rights.** The manifest requests `asInvoker`, so
+launching it raises no UAC prompt. One optional feature does: turning the AMD 3D V-Cache setting on
+or off launches a short-lived elevated copy of this same exe to write a single registry value, and
+Windows will ask you to approve it. Because the exe is unsigned, that prompt says "Unknown
+publisher" for the same reason SmartScreen does.
 
 ## Build from source
 

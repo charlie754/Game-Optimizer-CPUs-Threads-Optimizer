@@ -45,6 +45,16 @@ inline std::wstring FormatAmdVCacheComponentsEnvironmentStatus(
            L"\r\n  driver (amd3dvcache): " + AmdVCacheComponentStateText(driverState);
 }
 
+// Returned text is empty when there is nothing recorded (originalStart < 0), so the caller
+// can skip the row entirely rather than showing a placeholder.
+inline std::wstring FormatVCacheRestoreHint(int originalStart) {
+    if (originalStart < 0) return {};
+    return L"Game Optimizer recorded this driver's original Start value as " +
+           std::to_wstring(originalStart) +
+           L". Turn this setting off before deleting the app's settings folder, or that value is "
+           L"lost and the driver stays disabled.";
+}
+
 inline const wchar_t* ServiceStartTypeText(int startValue) {
     switch (startValue) {
         case 0: return L"Boot";
