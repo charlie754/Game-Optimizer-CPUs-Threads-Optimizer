@@ -7,6 +7,10 @@
 Per-game CPU Set isolation for split-topology CPUs — the isolation of BIOS "Turbo Game Mode",
 applied only to the game you chose, and only while it is running.
 
+Please turn off
+- Turbo Game Mode, optimize CCD Parking servies in BIOS.
+- Game Mode and AMD's 3D V-Cache optimizer in OS.
+
 On a dual-CCD AMD part (7950X3D, 7900X3D, 9950X3D) one CCD carries 3D V-Cache and the other
 clocks higher. Some games run better pinned to the cache CCD with nothing else on it. The
 existing ways to arrange that — a BIOS game mode, or letting Windows and AMD's driver decide —
