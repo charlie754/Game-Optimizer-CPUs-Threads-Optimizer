@@ -36,13 +36,18 @@ inline std::wstring FormatAmdVCacheEnvironmentStatus(AmdVCacheServiceState state
            AmdVCacheComponentStateText(state);
 }
 
-// The service and kernel driver move independently. The operator measured the service
-// stopped while the driver remained running, so one shared product-level state is misleading.
+// ONLY THE SERVICE IS REPORTED, AND THE OMISSION OF THE DRIVER IS DELIBERATE - do not
+// "restore" it. amd3dvcache.sys is PnP-loaded onto the ACPI device node, so it runs whether
+// or not amd3dvcacheSvc does; measured live, Running with the service Disabled AND Stopped.
+// It relays one value to firmware and carries no policy of its own, so it is inert without
+// the per-session agent the service launches. Its state therefore tells the user nothing they
+// can act on, and printing it beside the service invited exactly the wrong conclusion - that
+// a still-Running driver meant stopping the service had failed. Stopping the SERVICE is the
+// whole lever, and it takes effect immediately.
 inline std::wstring FormatAmdVCacheComponentsEnvironmentStatus(
-    AmdVCacheServiceState serviceState, AmdVCacheServiceState driverState) {
+    AmdVCacheServiceState serviceState) {
     return std::wstring(L"AMD 3D V-Cache Performance Optimizer\r\n") +
-           L"  service (amd3dvcacheSvc): " + AmdVCacheComponentStateText(serviceState) +
-           L"\r\n  driver (amd3dvcache): " + AmdVCacheComponentStateText(driverState);
+           L"  service (amd3dvcacheSvc): " + AmdVCacheComponentStateText(serviceState);
 }
 
 // Returned text is empty when there is nothing recorded (originalStart < 0), so the caller

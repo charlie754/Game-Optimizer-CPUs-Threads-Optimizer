@@ -62,6 +62,59 @@ if not exist "%ROOT%\build\GameOptimizer.exe" (
 )
 
 echo.
+echo === GATE A.4 release manifest - all source paths must exist ===
+REM WebView2Loader.dll is loaded dynamically, not linked. The ONLY record that it must ship
+REM is the explicit manifest. This check verifies every source path exists, catching deletions
+REM or moves of third_party\webview2 that would silently break the release.
+REM
+REM POSITIVE CONTROL: If the manifest is empty, the check fails with a distinct message.
+REM A checker that reads nothing and reports success is the exact failure this gate prevents.
+if not exist "%ROOT%\tools\release-manifest.txt" (
+  echo GATE_A4=FAIL manifest not found at tools\release-manifest.txt
+  set FAIL=1
+) else (
+  REM NO setlocal HERE, AND THAT IS THE POINT. A `setlocal` opens a new variable scope, so every
+  REM `set FAIL=1` below it is discarded at the matching `endlocal` and the gate reports FAIL=0
+  REM while this check has failed. That is exactly what happened on this check's first run:
+  REM it printed GATE_A4=FAIL and the gate still exited 0. Delayed expansion is already enabled
+  REM file-wide at the top of this script, so the inner setlocal bought nothing and cost the
+  REM only thing that matters.
+  set "ENTRY_COUNT=0"
+  set "FAILED_PATHS="
+
+  REM Parse manifest and verify each source path
+  for /f "usebackq delims=" %%L in ("%ROOT%\tools\release-manifest.txt") do (
+    set "LINE=%%L"
+    REM Skip comments and blank lines
+    if not "!LINE:~0,1!"=="#" if not "!LINE!"=="" (
+      REM Extract source path (before the ->)
+      for /f "tokens=1,* delims=-> " %%A in ("!LINE!") do (
+        set "SOURCE_PATH=%%A"
+        if not "!SOURCE_PATH!"=="" (
+          set /a ENTRY_COUNT+=1
+          set "FULL_PATH=!SOURCE_PATH!"
+          REM Check if path exists
+          if not exist "%ROOT%\!FULL_PATH!" (
+            set "FAILED_PATHS=!FAILED_PATHS! !SOURCE_PATH!"
+          )
+        )
+      )
+    )
+  )
+
+  REM Check positive control: manifest must have entries
+  if "!ENTRY_COUNT!"=="0" (
+    echo GATE_A4=FAIL positive control: manifest has zero entries
+    set FAIL=1
+  ) else if not "!FAILED_PATHS!"=="" (
+    echo GATE_A4=FAIL missing source files:!FAILED_PATHS!
+    set FAIL=1
+  ) else (
+    echo GATE_A4=PASS !ENTRY_COUNT! manifest entries verified
+  )
+)
+
+echo.
 echo === GATE A.3 unit tests ===
 call "%ROOT%\tools\build-tests.bat"
 if errorlevel 1 (

@@ -60,6 +60,24 @@ void CoreMapRefreshParked(HWND hMap);              // re-reads Parked flags and 
 // Engine::SetConfig on OK/Apply.
 void ShowSettings(HWND owner, Config& cfg, const Topology& topo, Engine& engine);
 
+// The live Settings window, or nullptr when it is not open. Used to parent a modal over it.
+HWND SettingsWindow();
+
+// The one elevated action this app offers: relaunches this exe as `--vcache-set 1|0` under
+// the `runas` verb and waits for it to exit. Defined in settings.cpp, beside the Settings
+// checkbox that was its first caller; the startup warning window offers the same disable.
+//
+// THE ELEVATED CHILD - NOT THE CALLER - WRITES THE UNDO RECORD. Before it disables anything
+// it reads the driver's current Start value and saves it to config.ini as
+// vcache_original_start, so a caller must never compose that value itself. It must, though,
+// re-read config.ini afterwards: the child wrote to DISK, and every in-memory Config this
+// process holds is stale from that moment.
+//
+// Returns false and sets outError. ERROR_CANCELLED means the user declined the UAC prompt,
+// which changed nothing at all and is not a failure to report.
+bool LaunchVCacheSetElevated(bool disable, DWORD& outError);
+bool LaunchVCacheRunElevated(bool run, DWORD& outError);
+
 // Three pages: topology confirmation, the Game Mode advisory, first profile.
 // Returns false only if the user closed it outright; `cfg.firstRunDone` is set either way
 // so it does not reappear every launch.

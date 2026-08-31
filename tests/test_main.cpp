@@ -30,14 +30,19 @@
 #include <string>
 #include <vector>
 
+#include "agent_transition.h"
 #include "applier.h"
 #include "config.h"
 #include "engine.h"
+#include "mask_merge.h"
 #include "procwatch.h"
 #include "settings_environment.h"
 #include "settings_heavy_order.h"
 #include "settings_merge.h"
 #include "settings_warning.h"
+#include "envwarning_text.h"
+#include "firstrun_text.h"
+#include "startup_warning.h"
 #include "topology.h"
 #include "util.h"
 
@@ -2528,52 +2533,57 @@ void Test_G1_FullyParkedWarningNamesRunningVCacheCause() {
     Case("G1 fully parked warning names the running AMD V-Cache cause");
     const std::wstring expected =
         L"Warning: all 16 processors in \"Freq\" are currently parked. The running AMD 3D "
-        L"V-Cache Performance Optimizer service is the likely cause. It normally parks the "
+        L"V-Cache optimizer (amd3dvcacheUser.exe) is the likely cause. It normally parks the "
         L"non-cache CCD while a game is running. While that CCD is parked, a background mask "
-        L"pointing at it is effectively inert. Windows can accept assignments to that CCD "
-        L"and then ignore them.";
+        L"pointing at it is effectively inert. Stopping the AMD service also stops this agent, "
+        L"and takes effect immediately. Windows can accept assignments to that CCD and then ignore them.";
     CHECK_EQ(
-        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, false, true), expected);
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, true, false, true), expected);
     CHECK_EQ(
-        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, false, false), expected);
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, true, false, false), expected);
     CHECK_EQ(
-        cd::FormatFullyParkedMaskWarning(L"Cache", 8, true, true, true),
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, true, true, true, true),
         L"Warning: all 8 processors in \"Cache\" are currently parked. The running AMD 3D "
-        L"V-Cache Performance Optimizer service is the likely cause. It normally parks the "
+        L"V-Cache optimizer (amd3dvcacheUser.exe) is the likely cause. It normally parks the "
         L"non-cache CCD while a game is running. While that CCD is parked, a background mask "
-        L"pointing at it is effectively inert. Windows can accept assignments to that CCD "
-        L"and then ignore them.");
+        L"pointing at it is effectively inert. Stopping the AMD service also stops this agent, "
+        L"and takes effect immediately. Windows can accept assignments to that CCD and then ignore them.");
 }
 
-void Test_G2_FullyParkedWarningNamesRunningVCacheDriverCause() {
-    Case("G2 fully parked warning names the running AMD V-Cache driver cause");
+void Test_G2_FullyParkedWarningExoneratesOptimizerWhenAgentIsNotRunning() {
+    Case("G2 fully parked warning exonerates optimizer when agent is not running");
     const std::wstring warning =
-        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, true, true);
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, false, true, true);
     CHECK_EQ(
         warning,
-        L"Warning: all 16 processors in \"Freq\" are currently parked. The AMD 3D V-Cache "
-        L"Performance Optimizer service is stopped, but its kernel driver is still running, "
-        L"so this may still be coming from Windows rather than from firmware. That driver has "
-        L"no stop routine and only goes away after a restart. Windows can accept assignments "
-        L"to a parked CCD and then ignore them.");
-    CHECK(warning.find(L"BIOS") == std::wstring::npos);
+        L"Warning: all 16 processors in \"Freq\" are currently parked. AMD's 3D V-Cache "
+        L"optimizer service or driver is running, but the part that actively steers "
+        L"(amd3dvcacheUser.exe) is not, so this is probably not coming from the optimizer. "
+        L"A BIOS option can park a CCD below the operating system. Look for a game-aware or "
+        L"adaptive CCD parking setting - not the CCD or SMT controls that disable a CCD at "
+        L"boot, which are a different feature. Windows can accept assignments to a parked "
+        L"CCD and then ignore them.");
+    CHECK(warning.find(L"BIOS") != std::wstring::npos);
+    CHECK(warning.find(L"amd3dvcacheUser.exe") != std::wstring::npos);
 
     const std::wstring otherWarning =
-        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, true, true);
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, true, false, true);
     CHECK_EQ(
         otherWarning,
-        L"Warning: all 8 processors in \"Cache\" are currently parked. The AMD 3D V-Cache "
-        L"Performance Optimizer service is stopped, but its kernel driver is still running, "
-        L"so this may still be coming from Windows rather than from firmware. That driver has "
-        L"no stop routine and only goes away after a restart. Windows can accept assignments "
-        L"to a parked CCD and then ignore them.");
-    CHECK(otherWarning.find(L"BIOS") == std::wstring::npos);
+        L"Warning: all 8 processors in \"Cache\" are currently parked. AMD's 3D V-Cache "
+        L"optimizer service or driver is running, but the part that actively steers "
+        L"(amd3dvcacheUser.exe) is not, so this is probably not coming from the optimizer. "
+        L"A BIOS option can park a CCD below the operating system. Look for a game-aware or "
+        L"adaptive CCD parking setting - not the CCD or SMT controls that disable a CCD at "
+        L"boot, which are a different feature. Windows can accept assignments to a parked "
+        L"CCD and then ignore them.");
+    CHECK(otherWarning.find(L"BIOS") != std::wstring::npos);
 }
 
 void Test_G3_FullyParkedWarningPointsToFirmwareWhenVCacheIsPresent() {
     Case("G3 fully parked warning points to firmware when AMD V-Cache is present but stopped");
     CHECK_EQ(
-        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, false, true),
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, false, false, true),
         L"Warning: all 16 processors in \"Freq\" are currently parked. AMD's 3D V-Cache "
         L"optimizer is installed, and neither its service nor its driver is running, so "
         L"nothing on the Windows side explains this. A BIOS option can park a CCD below the "
@@ -2581,7 +2591,7 @@ void Test_G3_FullyParkedWarningPointsToFirmwareWhenVCacheIsPresent() {
         L"CCD or SMT controls that disable a CCD at boot, which are a different feature. "
         L"Windows can accept assignments to a parked CCD and then ignore them.");
     CHECK_EQ(
-        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, false, true),
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, false, false, true),
         L"Warning: all 8 processors in \"Cache\" are currently parked. AMD's 3D V-Cache "
         L"optimizer is installed, and neither its service nor its driver is running, so "
         L"nothing on the Windows side explains this. A BIOS option can park a CCD below the "
@@ -2593,7 +2603,7 @@ void Test_G3_FullyParkedWarningPointsToFirmwareWhenVCacheIsPresent() {
 void Test_G4_FullyParkedWarningStaysGenericWithoutVCache() {
     Case("G4 fully parked warning stays generic without AMD V-Cache");
     const std::wstring warning =
-        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, false, false);
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, false, false, false);
     CHECK_EQ(
         warning,
         L"Warning: all 16 processors in \"Freq\" are currently parked. Windows can accept "
@@ -2603,7 +2613,7 @@ void Test_G4_FullyParkedWarningStaysGenericWithoutVCache() {
     CHECK(warning.find(L"V-Cache") == std::wstring::npos);
 
     const std::wstring otherWarning =
-        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, false, false);
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, false, false, false);
     CHECK_EQ(
         otherWarning,
         L"Warning: all 8 processors in \"Cache\" are currently parked. Windows can accept "
@@ -2612,6 +2622,111 @@ void Test_G4_FullyParkedWarningStaysGenericWithoutVCache() {
     CHECK(otherWarning.find(L"BIOS") == std::wstring::npos);
     CHECK(otherWarning.find(L"V-Cache") == std::wstring::npos);
 }
+
+void Test_T1_AgentRunningNamesTheActiveOptimizer() {
+    Case("T1 agent running names the active optimizer, not the service");
+    const std::wstring warning =
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, false, false, true);
+    CHECK(warning.find(L"amd3dvcacheUser.exe") != std::wstring::npos);
+    CHECK(warning.find(L"The running AMD 3D V-Cache optimizer (amd3dvcacheUser.exe) is the likely cause.") !=
+          std::wstring::npos);
+    CHECK(warning.find(L"Stopping the AMD service also stops this agent") != std::wstring::npos);
+}
+
+void Test_T2_ServiceRunningWithoutAgentDoesNotBlameService() {
+    Case("T2 service running with agent not running does not blame service, mentions BIOS");
+    const std::wstring warning =
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, false, true, false, true);
+    CHECK(warning.find(L"BIOS") != std::wstring::npos);
+    CHECK(warning.find(L"this is probably not coming from the optimizer") != std::wstring::npos);
+    CHECK(warning.find(L"amd3dvcacheUser.exe") != std::wstring::npos);
+    CHECK(warning.find(L"The running AMD 3D V-Cache") == std::wstring::npos);
+}
+
+void Test_T3_PresentButNotRunningPointsToFirmware() {
+    Case("T3 present but not running points to firmware unchanged");
+    const std::wstring warning =
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, false, false, true);
+    CHECK_EQ(
+        warning,
+        L"Warning: all 8 processors in \"Cache\" are currently parked. AMD's 3D V-Cache "
+        L"optimizer is installed, and neither its service nor its driver is running, so "
+        L"nothing on the Windows side explains this. A BIOS option can park a CCD below the "
+        L"operating system. Look for a game-aware or adaptive CCD parking setting - not the "
+        L"CCD or SMT controls that disable a CCD at boot, which are a different feature. "
+        L"Windows can accept assignments to a parked CCD and then ignore them.");
+}
+
+void Test_T4_NothingPresentStaysGeneric() {
+    Case("T4 nothing present stays generic unchanged");
+    const std::wstring warning =
+        cd::FormatFullyParkedMaskWarning(L"Cache", 8, false, false, false, false);
+    CHECK_EQ(
+        warning,
+        L"Warning: all 8 processors in \"Cache\" are currently parked. Windows can accept "
+        L"an assignment to a fully parked mask and then ignore it - the process keeps "
+        L"running elsewhere.");
+}
+
+// ===========================================================================
+// U. The Stop toggle, and the anti-stranding restore control.
+// ===========================================================================
+
+void Test_U1_StopBoxIsCheckedWhenTheOptimizerIsNotActive() {
+    Case("U1 the Stop box is checked exactly when the optimizer is NOT active");
+    // "Checked" means stopped. Getting this backwards would show every user a ticked box on a
+    // machine where AMD's optimizer is running normally.
+    CHECK(cd::VCacheStopBoxChecked(false));
+    CHECK(!cd::VCacheStopBoxChecked(true));
+}
+
+void Test_U2_StopBoxDependsOnNothingButTheLiveFlag() {
+    Case("U2 the Stop box depends on the live flag alone, never on config");
+    // This control has NO persisted value. It is a live mirror of the machine, so its helper
+    // takes exactly one argument and there is nowhere for a config value to enter. A stored
+    // value would survive the user stopping or starting the service outside our UI, and the
+    // box would then assert a state the machine is not in.
+    CHECK(cd::VCacheStopBoxChecked(false) == true);
+    CHECK(cd::VCacheStopBoxChecked(true) == false);
+}
+
+void Test_U3_RestoreControlAppearsOnlyForUsersTheOldFeatureStranded() {
+    Case("U3 the restore control appears only when a driver Start value was recorded");
+    // -1 means "we never disabled the driver", so there is nothing to restore and the control
+    // must not exist. Any recorded value means the user has the driver at Start=4 with no other
+    // route back, and removing their only way out is the stranding defect this project has
+    // already had to fix once.
+    CHECK(!cd::ShowVCacheRestoreControl(-1));
+    CHECK(cd::ShowVCacheRestoreControl(0));
+    CHECK(cd::ShowVCacheRestoreControl(3));
+    CHECK(cd::ShowVCacheRestoreControl(4));
+}
+
+void Test_U4_ParkedWarningNoLongerClaimsStoppingTheServiceIsUseless() {
+    Case("U4 the parked-mask warning no longer says stopping the service will not help");
+    // The old sentence was measured FALSE and shipped: stopping amd3dvcacheSvc DOES stop the
+    // agent. This test exists so it cannot come back.
+    const std::wstring warning =
+        cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, true, true, true);
+    CHECK(warning.find(L"will not stop this") == std::wstring::npos);
+    CHECK(warning.find(L"also stops this agent") != std::wstring::npos);
+}
+
+void Test_U5_StoppingDisablesAndClearingRestoresAmdsOwnDefault() {
+    Case("U5 stopping sets Disabled(4); clearing restores AMD's shipped Automatic(2)");
+    // 4 is SERVICE_DISABLED, 2 is SERVICE_AUTO_START. main.cpp static_asserts both against the
+    // Windows headers, so this test and the SDK cannot drift apart silently.
+    CHECK_EQ(cd::VCacheServiceStartTypeFor(true), 4);
+    // 🔴 2, not 3. AMD's own INF installs this service as StartType = 2 (SERVICE_AUTO_START), so
+    // "put it back" means Automatic. Restoring it to Manual would look like a restore and would in
+    // fact leave the service permanently dead - it would never start at sign-in again, which is
+    // exactly the trap the operator caught in the shipped helper text.
+    CHECK_EQ(cd::VCacheServiceStartTypeFor(false), 2);
+}
+
+// ===========================================================================
+// H. Live environment wording.
+// ===========================================================================
 
 void Test_H1_GameModeEnvironmentWordingCoversEveryState() {
     Case("H1 Game Mode environment wording covers on, off, and indeterminate");
@@ -2643,7 +2758,7 @@ void Test_H3_RunningVCacheEffectMatchesTheParkedMaskWarning() {
     CHECK_EQ(effect,
              L"It normally parks the non-cache CCD while a game is running. While that CCD "
              L"is parked, a background mask pointing at it is effectively inert.");
-    CHECK(cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, false, true).find(effect) !=
+    CHECK(cd::FormatFullyParkedMaskWarning(L"Freq", 16, true, true, false, true).find(effect) !=
           std::wstring::npos);
 }
 
@@ -2866,14 +2981,14 @@ void Test_K7_KeyComparisonIsExactAndDoesNotFoldCase() {
           expected);
 }
 
-void Test_L1_VCacheEnvironmentNamesServiceAndDriverSeparately() {
-    Case("L1 V-Cache environment wording names service and driver separately");
+// Pins the ABSENCE of the driver line. The kernel driver is PnP-loaded and runs whether or
+// not the service does, so its state is noise; showing it read as "the stop failed".
+void Test_L1_VCacheEnvironmentNamesOnlyTheService() {
+    Case("L1 V-Cache environment wording names only the service");
     CHECK_EQ(cd::FormatAmdVCacheComponentsEnvironmentStatus(
-                 cd::AmdVCacheServiceState::InstalledButStopped,
-                 cd::AmdVCacheServiceState::Running),
+                 cd::AmdVCacheServiceState::InstalledButStopped),
              L"AMD 3D V-Cache Performance Optimizer\r\n"
-             L"  service (amd3dvcacheSvc): Installed but stopped\r\n"
-             L"  driver (amd3dvcache): Running");
+             L"  service (amd3dvcacheSvc): Installed but stopped");
 }
 
 void Test_M1_MissingVCacheOriginalStartDefaultsMinusOne() {
@@ -2945,6 +3060,500 @@ void Test_M6_ManualWhileStoppedRequiresRestart() {
              L"driver (amd3dvcache): Installed but stopped, start type Manual - restart required");
 }
 
+void Test_N1_NoDetectedConditionDoesNotShow() {
+    Case("N1 Game Mode Off and no V-Cache does not show");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::Off;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain());
+    CHECK(!decision.Any());
+}
+
+void Test_N2_MultiDomainAmdGameModeIsActionable() {
+    Case("N2 Game Mode On on multi-domain AMD is actionable");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::On;
+    env.isAmd = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSymmetricDualCcd());
+    CHECK(decision.showGameMode);
+    CHECK(decision.gameModeTone == cd::WarningTone::Actionable);
+}
+
+void Test_N3_SingleDomainGameModeIsInformational() {
+    Case("N3 Game Mode On on one domain is informational");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::On;
+    env.isAmd = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain());
+    CHECK(decision.showGameMode);
+    CHECK(decision.gameModeTone == cd::WarningTone::Informational);
+}
+
+void Test_N4_NonAmdGameModeIsInformational() {
+    Case("N4 Game Mode On on non-AMD multi-domain CPU is informational");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::On;
+    env.isAmd = false;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSymmetricDualCcd());
+    CHECK(decision.showGameMode);
+    CHECK(decision.gameModeTone == cd::WarningTone::Informational);
+}
+
+void Test_N5_NotDeterminableDoesNotShowGameMode() {
+    Case("N5 Game Mode NotDeterminable does not show Game Mode");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::NotDeterminable;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSymmetricDualCcd());
+    CHECK(!decision.showGameMode);
+}
+
+void Test_N6_VCacheOnlyShows() {
+    Case("N6 V-Cache agent running with Game Mode Off shows V-Cache only");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::Off;
+    env.amdVCacheServicePresent = true;
+    env.amdVCacheServiceRunning = true;
+    env.amdVCacheAgentRunning = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain());
+    CHECK(!decision.showGameMode);
+    CHECK(decision.showVCache);
+    CHECK(decision.Any());
+}
+
+void Test_N7_BothDetectedConditionsShow() {
+    Case("N7 Game Mode On and V-Cache agent running show both");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::On;
+    env.amdVCacheDriverPresent = true;
+    env.amdVCacheDriverRunning = true;
+    env.amdVCacheAgentRunning = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain());
+    CHECK(decision.showGameMode);
+    CHECK(decision.showVCache);
+    CHECK(decision.Any());
+}
+
+void Test_N8_WizardVCacheLeadInIsUnchanged() {
+    Case("N8 wizard V-Cache text keeps the existing lead-in");
+    const cd::EnvironmentInfo env;
+    const std::wstring text = cd::Page2VCacheText(env, true);
+    const std::wstring expected =
+        L"Separately, and regardless of the Game Mode setting above:";
+    CHECK(text.compare(0, expected.size(), expected) == 0);
+}
+
+void Test_N9_StandaloneVCacheTextOmitsLeadIn() {
+    Case("N9 standalone V-Cache text omits the wizard-only lead-in");
+    const cd::EnvironmentInfo env;
+    const std::wstring text = cd::Page2VCacheText(env, false);
+    CHECK(text.find(L"above:") == std::wstring::npos);
+    CHECK(text.compare(0, 10, L"Separately") != 0);
+}
+
+// == S. Page2VCacheText now keys on agent running state, not service state ==
+
+void Test_S1_AgentRunningShowsActive() {
+    Case("S1 agent running -> Page2VCacheText contains 'is ACTIVE' and 'amd3dvcacheUser.exe'");
+    cd::EnvironmentInfo env;
+    env.amdVCacheServiceState = cd::AmdVCacheServiceState::NotInstalled;
+    env.amdVCacheAgentRunning = true;
+    const std::wstring text = cd::Page2VCacheText(env, false);
+    CHECK(text.find(L"is ACTIVE") != std::wstring::npos);
+    CHECK(text.find(L"amd3dvcacheUser.exe") != std::wstring::npos);
+}
+
+void Test_S2_AgentNotRunningServiceStoppedShowsNotActive() {
+    Case("S2 agent NOT running, service InstalledButStopped -> text contains 'NOT ACTIVE' and "
+         "does NOT contain old sentence, contains new one");
+    cd::EnvironmentInfo env;
+    env.amdVCacheServiceState = cd::AmdVCacheServiceState::InstalledButStopped;
+    env.amdVCacheAgentRunning = false;
+    const std::wstring text = cd::Page2VCacheText(env, false);
+    CHECK(text.find(L"NOT ACTIVE") != std::wstring::npos);
+    CHECK(text.find(L"not expressing a preference") == std::wstring::npos);  // old text gone
+    CHECK(text.find(L"is not running, so nothing here is expressing a CCD preference") != std::wstring::npos);
+}
+
+void Test_S3_ServiceRunningButAgentNotRunningShowsNotActive() {
+    Case("S3 REGRESSION: service Running but agent NOT running -> text must say NOT ACTIVE");
+    cd::EnvironmentInfo env;
+    env.amdVCacheServiceState = cd::AmdVCacheServiceState::Running;
+    env.amdVCacheAgentRunning = false;
+    const std::wstring text = cd::Page2VCacheText(env, false);
+    CHECK(text.find(L"NOT ACTIVE") != std::wstring::npos);
+    // Under the old code, this would have said "INSTALLED and RUNNING" - prove it does not now
+    CHECK(text.find(L"INSTALLED and RUNNING") == std::wstring::npos);
+}
+
+void Test_S4_ServiceStoppedButAgentRunningShowsActive() {
+    Case("S4 REGRESSION: service InstalledButStopped but agent RUNNING -> text must say ACTIVE");
+    cd::EnvironmentInfo env;
+    env.amdVCacheServiceState = cd::AmdVCacheServiceState::InstalledButStopped;
+    env.amdVCacheAgentRunning = true;
+    const std::wstring text = cd::Page2VCacheText(env, false);
+    CHECK(text.find(L"is ACTIVE") != std::wstring::npos);
+    // Prove it does not wrongly say NOT RUNNING
+    CHECK(text.find(L"is not running") == std::wstring::npos);
+}
+
+void Test_S5_NotInstalledAlwaysShowsNotInstalled() {
+    Case("S5 NotInstalled -> contains 'NOT installed', lead-in rule still holds");
+    cd::EnvironmentInfo env;
+    env.amdVCacheServiceState = cd::AmdVCacheServiceState::NotInstalled;
+    env.amdVCacheAgentRunning = false;
+    const std::wstring text = cd::Page2VCacheText(env, false);
+    CHECK(text.find(L"NOT installed") != std::wstring::npos);
+    CHECK(text.find(L"Separately, and regardless") == std::wstring::npos);  // lead-in omitted when false
+}
+
+void Test_N10_VCacheInstalledButNotRunningDoesNotShow() {
+    Case("N10 V-Cache installed but not running does not show");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::Off;
+    env.amdVCacheServicePresent = true;
+    env.amdVCacheDriverPresent = true;
+    // Nothing is running, and in particular the agent is not: the policy engine
+    // is installed but idle, so no warning.
+    env.amdVCacheAgentRunning = false;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain());
+    CHECK(!decision.showVCache);
+    CHECK(!decision.Any());
+}
+
+void Test_N11_DriverAndServiceRunningWithoutAgentDoesNotShow() {
+    Case("N11 driver and service running without the agent does not show");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::Off;
+    env.amdVCacheServicePresent = true;
+    env.amdVCacheServiceRunning = true;
+    env.amdVCacheDriverPresent = true;
+    env.amdVCacheDriverRunning = true;
+    env.amdVCacheAgentRunning = false;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain());
+    CHECK(!decision.showVCache);
+}
+
+void Test_N12_AgentRunningShowsVCache() {
+    Case("N12 agent running shows V-Cache");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::Off;
+    env.amdVCacheServicePresent = true;
+    env.amdVCacheServiceRunning = true;
+    env.amdVCacheDriverPresent = true;
+    env.amdVCacheDriverRunning = true;
+    env.amdVCacheAgentRunning = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain());
+    CHECK(decision.showVCache);
+    CHECK(decision.Any());
+}
+
+cd::Mask MakeMask(const std::wstring& name, const std::vector<ULONG>& ids, bool derived) {
+    cd::Mask mask;
+    mask.name = name;
+    mask.ids = ids;
+    mask.derived = derived;
+    return mask;
+}
+
+void CheckMasksExactly(const std::vector<cd::Mask>& actual,
+                       const std::vector<cd::Mask>& expected) {
+    CHECK_EQ(actual.size(), expected.size());
+    const size_t count = (std::min)(actual.size(), expected.size());
+    for (size_t i = 0; i < count; ++i) {
+        CHECK_EQ(actual[i].name, expected[i].name);
+        CHECK_EQ(actual[i].ids, expected[i].ids);
+        CHECK_EQ(actual[i].derived, expected[i].derived);
+    }
+}
+
+void Test_O1_NoCustomMasksReturnsDerivedExactly() {
+    Case("O1 no custom masks returns derived exactly in derived order");
+    const std::vector<cd::Mask> derived = {
+        MakeMask(L"Cache", {256u, 257u}, true),
+        MakeMask(L"All", {256u, 257u, 258u}, true),
+    };
+    const std::vector<cd::Mask> existing = {
+        MakeMask(L"Old Cache", {300u}, true),
+        MakeMask(L"Old All", {300u, 301u}, true),
+    };
+
+    CheckMasksExactly(cd::MergeMasksPreservingCustom(derived, existing), derived);
+}
+
+void Test_O2_OneCustomIsAppendedAfterDerived() {
+    Case("O2 one non-colliding custom follows every derived mask");
+    const std::vector<cd::Mask> derived = {
+        MakeMask(L"Cache", {256u}, true),
+        MakeMask(L"All", {256u, 257u}, true),
+    };
+    const cd::Mask custom = MakeMask(L"Streaming", {257u}, false);
+    const std::vector<cd::Mask> existing = {custom};
+    const std::vector<cd::Mask> expected = {derived[0], derived[1], custom};
+
+    CheckMasksExactly(cd::MergeMasksPreservingCustom(derived, existing), expected);
+}
+
+void Test_O3_ExactNameCollisionKeepsDerivedAndDropsCustom() {
+    Case("O3 exact name collision keeps DERIVED and drops custom");
+    const cd::Mask live = MakeMask(L"Cache", {256u, 257u}, true);
+    const std::vector<cd::Mask> derived = {live};
+    const std::vector<cd::Mask> existing = {
+        MakeMask(L"Cache", {999u}, false),
+    };
+
+    CheckMasksExactly(cd::MergeMasksPreservingCustom(derived, existing), {live});
+}
+
+void Test_O4_CaseInsensitiveCollisionKeepsDerivedAndDropsCustom() {
+    Case("O4 case-insensitive collision keeps DERIVED and drops custom");
+    const cd::Mask live = MakeMask(L"Cache", {256u, 257u}, true);
+    const std::vector<cd::Mask> derived = {live};
+    const std::vector<cd::Mask> existing = {
+        MakeMask(L"cache", {999u}, false),
+    };
+
+    CheckMasksExactly(cd::MergeMasksPreservingCustom(derived, existing), {live});
+}
+
+void Test_O5_SeveralCustomsKeepTheirRelativeOrder() {
+    Case("O5 several customs retain existing relative order after derived masks");
+    const cd::Mask live = MakeMask(L"All", {256u, 257u, 258u}, true);
+    const cd::Mask first = MakeMask(L"Game", {256u}, false);
+    const cd::Mask second = MakeMask(L"Capture", {257u}, false);
+    const cd::Mask third = MakeMask(L"Compile", {258u}, false);
+    const std::vector<cd::Mask> derived = {live};
+    const std::vector<cd::Mask> existing = {first, second, third};
+    const std::vector<cd::Mask> expected = {live, first, second, third};
+
+    CheckMasksExactly(cd::MergeMasksPreservingCustom(derived, existing), expected);
+}
+
+void Test_O6_StaleDerivedMaskIsDropped() {
+    Case("O6 stale derived mask absent from live hardware is dropped");
+    const cd::Mask live = MakeMask(L"All", {256u, 257u}, true);
+    const std::vector<cd::Mask> derived = {live};
+    const std::vector<cd::Mask> existing = {
+        MakeMask(L"Old CCD", {900u, 901u}, true),
+    };
+
+    CheckMasksExactly(cd::MergeMasksPreservingCustom(derived, existing), {live});
+}
+
+void Test_O7_EmptyExistingReturnsDerivedExactly() {
+    Case("O7 empty existing list returns derived exactly");
+    const std::vector<cd::Mask> derived = {
+        MakeMask(L"Cache", {256u}, true),
+        MakeMask(L"All", {256u, 257u}, true),
+    };
+
+    CheckMasksExactly(cd::MergeMasksPreservingCustom(derived, {}), derived);
+}
+
+void Test_O8_EmptyDerivedStillPreservesCustoms() {
+    Case("O8 empty derived list still preserves custom masks");
+    const cd::Mask first = MakeMask(L"Game", {256u}, false);
+    const cd::Mask second = MakeMask(L"Capture", {257u}, false);
+    const std::vector<cd::Mask> existing = {
+        first,
+        MakeMask(L"Stale derived", {900u}, true),
+        second,
+    };
+
+    CheckMasksExactly(cd::MergeMasksPreservingCustom({}, existing), {first, second});
+}
+
+void Test_O9_PreservedCustomIndicatorMatchesTheMerge() {
+    Case("O9 preserved-custom indicator is true for O2 and false for O1");
+    const std::vector<cd::Mask> derived = {
+        MakeMask(L"Cache", {256u}, true),
+        MakeMask(L"All", {256u, 257u}, true),
+    };
+    const std::vector<cd::Mask> o2Existing = {
+        MakeMask(L"Streaming", {257u}, false),
+    };
+    const std::vector<cd::Mask> o1Existing = {
+        MakeMask(L"Old Cache", {300u}, true),
+    };
+
+    CHECK(cd::MergePreservedCustomMasks(derived, o2Existing));
+    CHECK(!cd::MergePreservedCustomMasks(derived, o1Existing));
+}
+
+// ===========================================================================
+// P. Startup warning popup wording.
+//
+// The popup and the first-run wizard have DELIBERATELY DIVERGED. The wizard keeps its
+// page-2 body; the popup gets its own short text, because the wizard is something the user
+// chose to open and the popup opens itself at every login. P1-P4 pin what the popup says,
+// P5 pins that the wizard was not edited into it.
+// ===========================================================================
+void Test_P1_PopupActionableTextIsExact() {
+    Case("P1 popup actionable Game Mode text matches character for character");
+    const std::wstring expected =
+        L"Windows Game Mode is on. On a multi-CCD AMD part it applies a machine-wide CCD preference "
+        L"to whatever it decides is the game. That is not per-game, and it competes with the masks "
+        L"Game Optimizer applies. If your game ends up on the wrong CCD, check this first.";
+    CHECK_EQ(cd::PopupGameModeText(true), expected);
+}
+
+void Test_P2_PopupInformationalTextIsExact() {
+    Case("P2 popup informational Game Mode text matches character for character");
+    const std::wstring expected =
+        L"Windows Game Mode is on. This CPU has a single cache domain, so Game Mode has no CCD "
+        L"preference to apply here and is not competing with Game Optimizer.";
+    CHECK_EQ(cd::PopupGameModeText(false), expected);
+}
+
+void Test_P3_PopupSaysNeitherPageNorAttention() {
+    Case("P3 popup text names no page and asks for no attention");
+    // THE REGRESSION GUARD FOR THIS WHOLE CHANGE. The wizard body this window used to print
+    // ends "Nothing on this page needs your attention" - a sentence with two defects here:
+    // there is no page, and a window that opened by itself to say nothing needs attention
+    // argues against its own existence. If anyone pastes it back in, this fails.
+    const std::wstring info = cd::PopupGameModeText(false);
+    CHECK(info.find(L"page") == std::wstring::npos);
+    CHECK(info.find(L"attention") == std::wstring::npos);
+    CHECK(info.find(L"Nothing on this page needs your attention") == std::wstring::npos);
+    // The actionable branch is held to the same bar; it is the louder of the two.
+    const std::wstring act = cd::PopupGameModeText(true);
+    CHECK(act.find(L"page") == std::wstring::npos);
+    CHECK(act.find(L"attention") == std::wstring::npos);
+}
+
+void Test_P4_PopupShowsNoRegistryPath() {
+    Case("P4 neither popup branch prints a registry value name");
+    // The popup is not the wizard. A user who wants the registry detail can open the wizard
+    // or the Settings environment panel, both of which still carry it.
+    CHECK(cd::PopupGameModeText(true).find(L"AutoGameModeEnabled") == std::wstring::npos);
+    CHECK(cd::PopupGameModeText(false).find(L"AutoGameModeEnabled") == std::wstring::npos);
+}
+
+void Test_P5_WizardGameModeTextIsUnchanged() {
+    Case("P5 wizard page-2 Game Mode text still says its own sentence");
+    // ASSERTS THE TWO SURFACES GENUINELY DIVERGED rather than one having been edited into
+    // the other. Game Mode ON with a single cache domain is the wizard informational branch:
+    // the same machine shape P2 covers for the popup, and the two must not agree.
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::On;
+    env.isAmd = true;
+    bool warn = true;
+    const std::wstring wizard = cd::Page2GameModeText(env, MakeSingleDomain(), warn);
+    CHECK(!warn);
+    CHECK(wizard.find(L"Nothing on this page needs your attention") != std::wstring::npos);
+    CHECK_NE(wizard, cd::PopupGameModeText(false));
+}
+
+// ===========================================================================
+// Q. The fields Settings never edits.
+//
+// ApplyChanges ends by writing the Settings window's snapshot over the live config. Three
+// fields have no control in that window at all and are written from OUTSIDE it while it sits
+// open: the tray's Pause item, a newer build's unparsed sections, and vcache_original_start,
+// which the ELEVATED `--vcache-set` child writes to config.ini on disk.
+//
+// The last of those is the one that costs the user something, and the startup warning window
+// can now trigger it: the warning disables the driver, the child records the original Start
+// value 3, the user then closes the warning and clicks OK in the Settings window that was
+// open behind it. If the snapshot won, the only record able to restore that driver would be
+// overwritten with -1 and the driver would be stranded disabled.
+//
+// THE RULE IS "THE SNAPSHOT NEVER WINS", NOT "THE LARGER VALUE WINS" - hence Q2, which runs
+// the same reconciliation in the opposite direction.
+// ===========================================================================
+void Test_Q1_LiveVCacheOriginalStartSurvivesTheSettingsSnapshot() {
+    Case("Q1 a vcache_original_start recorded behind the window survives ApplyChanges");
+    cd::Config live;
+    live.vcacheOriginalStart = 3;                    // the child recorded Manual, on disk
+    live.paused = true;                              // the tray paused, while Settings was open
+    live.unknown[L"future"].push_back(L"key=value"); // a newer build's section
+
+    cd::Config work;                                 // the snapshot, taken before all of that
+    work.vcacheOriginalStart = -1;
+    work.paused = false;
+
+    cd::PreserveFieldsSettingsNeverEdits(live, work);
+    CHECK_EQ(work.vcacheOriginalStart, 3);
+    // The two fields this reconciliation already protected must still be protected - the
+    // helper was extracted from ApplyChanges, and dropping one of them would be silent.
+    CHECK(work.paused);
+    CHECK(work.unknown.find(L"future") != work.unknown.end());
+}
+
+void Test_Q2_ClearedVCacheOriginalStartAlsoBeatsTheSnapshot() {
+    Case("Q2 a cleared live vcache_original_start also beats a stale recorded value");
+    cd::Config live;
+    live.vcacheOriginalStart = -1;   // the driver was restored and the record cleared
+    live.paused = false;             // and the tray un-paused, likewise behind the window
+
+    cd::Config work;
+    work.vcacheOriginalStart = 3;    // Settings still holds what it read when it opened
+    work.paused = true;
+
+    cd::PreserveFieldsSettingsNeverEdits(live, work);
+    CHECK_EQ(work.vcacheOriginalStart, -1);
+    CHECK(!work.paused);
+}
+
+// ===========================================================================
+// R. Re-checking AMD's V-Cache agent at pin time
+//
+// The engine probes for amd3dvcacheUser.exe on the tick, because the agent can be launched
+// after this app was and a startup-only probe would never see it. A tick runs four times a
+// second, so the probe RESULT must not reach the log - only a change in it may. That decision
+// is the pure function these cases drive; the probe itself is a process snapshot and is not
+// testable here.
+// ===========================================================================
+void Test_R1_UnchangedAgentStateDoesNotLog() {
+    Case("R1 an unchanged agent state produces no log line");
+    CHECK(!cd::ShouldLogAgentChange(cd::AgentSeen::Absent, false));
+    CHECK(!cd::ShouldLogAgentChange(cd::AgentSeen::Present, true));
+    // The same question in the two-state form, which is what a caller that has already probed
+    // once is really asking.
+    CHECK(!cd::ShouldLogAgentChange(false, false));
+    CHECK(!cd::ShouldLogAgentChange(true, true));
+}
+
+void Test_R2_AgentAppearingLogs() {
+    Case("R2 the agent appearing mid-session logs once");
+    CHECK(cd::ShouldLogAgentChange(cd::AgentSeen::Absent, true));
+    CHECK(cd::ShouldLogAgentChange(false, true));
+}
+
+void Test_R3_AgentDisappearingLogs() {
+    Case("R3 the agent going away mid-session logs once");
+    CHECK(cd::ShouldLogAgentChange(cd::AgentSeen::Present, false));
+    CHECK(cd::ShouldLogAgentChange(true, false));
+}
+
+void Test_R4_FirstProbeOfARunAlwaysLogs() {
+    Case("R4 the first probe of a run logs whichever way it lands");
+    // Never is not Absent. A machine where the agent has been running since boot never
+    // CHANGES, so a bool seeded false would call the first probe a change it was not, and a
+    // bool seeded true would report nothing at all on a machine that has the agent.
+    CHECK(cd::ShouldLogAgentChange(cd::AgentSeen::Never, true));
+    CHECK(cd::ShouldLogAgentChange(cd::AgentSeen::Never, false));
+}
+
+void Test_R5_TheSecondProbeOfAnUnchangedRunIsSilent() {
+    Case("R5 after the first probe an unchanged answer is silent");
+    // The engine's own sequence: probe, log, remember, probe again. AgentSeenFrom is the
+    // "remember" step, and getting it wrong would log the same line four times a second.
+    const bool measured = true;
+    CHECK(cd::ShouldLogAgentChange(cd::AgentSeen::Never, measured));
+    CHECK(!cd::ShouldLogAgentChange(cd::AgentSeenFrom(measured), measured));
+    CHECK(cd::AgentSeenFrom(true) == cd::AgentSeen::Present);
+    CHECK(cd::AgentSeenFrom(false) == cd::AgentSeen::Absent);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -3011,9 +3620,22 @@ int main() {
 
     std::printf("\n== G. Parked-mask warning ==\n");
     Test_G1_FullyParkedWarningNamesRunningVCacheCause();
-    Test_G2_FullyParkedWarningNamesRunningVCacheDriverCause();
+    Test_G2_FullyParkedWarningExoneratesOptimizerWhenAgentIsNotRunning();
     Test_G3_FullyParkedWarningPointsToFirmwareWhenVCacheIsPresent();
     Test_G4_FullyParkedWarningStaysGenericWithoutVCache();
+
+    std::printf("\n== T. Agent-aware diagnostic refactor ==\n");
+    Test_T1_AgentRunningNamesTheActiveOptimizer();
+    Test_T2_ServiceRunningWithoutAgentDoesNotBlameService();
+    Test_T3_PresentButNotRunningPointsToFirmware();
+    Test_T4_NothingPresentStaysGeneric();
+
+    std::printf("\n== U. The Stop toggle and the restore safety net ==\n");
+    Test_U1_StopBoxIsCheckedWhenTheOptimizerIsNotActive();
+    Test_U2_StopBoxDependsOnNothingButTheLiveFlag();
+    Test_U3_RestoreControlAppearsOnlyForUsersTheOldFeatureStranded();
+    Test_U4_ParkedWarningNoLongerClaimsStoppingTheServiceIsUseless();
+    Test_U5_StoppingDisablesAndClearingRestoresAmdsOwnDefault();
 
     std::printf("\n== H. Live environment wording ==\n");
     Test_H1_GameModeEnvironmentWordingCoversEveryState();
@@ -3056,7 +3678,7 @@ int main() {
     Test_K7_KeyComparisonIsExactAndDoesNotFoldCase();
 
     std::printf("\n== L. AMD V-Cache driver detection ==\n");
-    Test_L1_VCacheEnvironmentNamesServiceAndDriverSeparately();
+    Test_L1_VCacheEnvironmentNamesOnlyTheService();
 
     std::printf("\n== M. AMD V-Cache persistent switch ==\n");
     Test_M1_MissingVCacheOriginalStartDefaultsMinusOne();
@@ -3066,6 +3688,56 @@ int main() {
     Test_M5_DisabledWhileStoppedNeedsNoNotice();
     Test_M6_ManualWhileStoppedRequiresRestart();
     Test_M7_VCacheRestoreHintPinsMissingManualAndBootStartValues();
+
+    std::printf("\n== N. Startup environment warning ==\n");
+    Test_N1_NoDetectedConditionDoesNotShow();
+    Test_N2_MultiDomainAmdGameModeIsActionable();
+    Test_N3_SingleDomainGameModeIsInformational();
+    Test_N4_NonAmdGameModeIsInformational();
+    Test_N5_NotDeterminableDoesNotShowGameMode();
+    Test_N6_VCacheOnlyShows();
+    Test_N7_BothDetectedConditionsShow();
+    Test_N8_WizardVCacheLeadInIsUnchanged();
+    Test_N9_StandaloneVCacheTextOmitsLeadIn();
+    Test_N10_VCacheInstalledButNotRunningDoesNotShow();
+    Test_N11_DriverAndServiceRunningWithoutAgentDoesNotShow();
+    Test_N12_AgentRunningShowsVCache();
+
+    std::printf("\n== O. Preserve custom masks across topology changes ==\n");
+    Test_O1_NoCustomMasksReturnsDerivedExactly();
+    Test_O2_OneCustomIsAppendedAfterDerived();
+    Test_O3_ExactNameCollisionKeepsDerivedAndDropsCustom();
+    Test_O4_CaseInsensitiveCollisionKeepsDerivedAndDropsCustom();
+    Test_O5_SeveralCustomsKeepTheirRelativeOrder();
+    Test_O6_StaleDerivedMaskIsDropped();
+    Test_O7_EmptyExistingReturnsDerivedExactly();
+    Test_O8_EmptyDerivedStillPreservesCustoms();
+    Test_O9_PreservedCustomIndicatorMatchesTheMerge();
+
+    std::printf("\n== P. Startup warning popup wording ==\n");
+    Test_P1_PopupActionableTextIsExact();
+    Test_P2_PopupInformationalTextIsExact();
+    Test_P3_PopupSaysNeitherPageNorAttention();
+    Test_P4_PopupShowsNoRegistryPath();
+    Test_P5_WizardGameModeTextIsUnchanged();
+
+    std::printf("\n== Q. Fields Settings never edits ==\n");
+    Test_Q1_LiveVCacheOriginalStartSurvivesTheSettingsSnapshot();
+    Test_Q2_ClearedVCacheOriginalStartAlsoBeatsTheSnapshot();
+
+    std::printf("\n== R. AMD V-Cache agent re-checked at pin time ==\n");
+    Test_R1_UnchangedAgentStateDoesNotLog();
+    Test_R2_AgentAppearingLogs();
+    Test_R3_AgentDisappearingLogs();
+    Test_R4_FirstProbeOfARunAlwaysLogs();
+    Test_R5_TheSecondProbeOfAnUnchangedRunIsSilent();
+
+    std::printf("\n== S. AMD V-Cache body text names the agent ==\n");
+    Test_S1_AgentRunningShowsActive();
+    Test_S2_AgentNotRunningServiceStoppedShowsNotActive();
+    Test_S3_ServiceRunningButAgentNotRunningShowsNotActive();
+    Test_S4_ServiceStoppedButAgentRunningShowsActive();
+    Test_S5_NotInstalledAlwaysShowsNotInstalled();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

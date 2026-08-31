@@ -36,6 +36,8 @@
 #include "applier.h"
 #include "util.h"
 #include "theme.h"
+#include "envwarning.h"
+#include "settings_warning.h"
 
 namespace cd {
 // Implemented in tray.cpp. It is not in ui.h - the header is frozen - but the Explorer
@@ -395,6 +397,8 @@ struct CmdOptions {
     bool tray  = false;
     bool vcacheSet = false;
     int vcacheSetValue = -1;
+    bool vcacheRun = false;
+    int vcacheRunValue = -1;
 };
 
 CmdOptions ParseCommandLine() {
@@ -414,6 +418,16 @@ CmdOptions ParseCommandLine() {
                 const std::wstring value = argv[++i] ? argv[i] : L"";
                 if (value == L"0") opt.vcacheSetValue = 0;
                 if (value == L"1") opt.vcacheSetValue = 1;
+            }
+        }
+        else if (a == L"--vcache-run") {
+            // Presence selects this mode even when the argument is malformed. Falling through to
+            // normal startup would turn a bad elevated helper invocation into an elevated tray.
+            opt.vcacheRun = true;
+            if (i + 1 < argc) {
+                const std::wstring value = argv[++i] ? argv[i] : L"";
+                if (value == L"0") opt.vcacheRunValue = 0;
+                if (value == L"1") opt.vcacheRunValue = 1;
             }
         }
         // Anything else is ignored on purpose: an unknown switch must not stop the app
@@ -454,8 +468,10 @@ int RunVCacheSet(int requestedValue) {
     }
 
     // The measured SCM stop request failed with ERROR_INVALID_SERVICE_CONTROL (1052), and the
-    // device is CR_NOT_DISABLEABLE. Changing these two fixed Start values followed by a reboot
-    // is the measured working route; no service-control operation belongs in this mode.
+    // device is CR_NOT_DISABLEABLE. These were measured ON THE KERNEL DRIVER (amd3dvcache),
+    // which is PnP-owned and genuinely cannot be stopped. The usermode service (amd3dvcacheSvc)
+    // is separately stoppable via the --vcache-run mode. For this mode's persistent registry
+    // changes, reboot is required; no service-control operation belongs in this mode.
     const int driverStart = ReadServiceStartValue(L"amd3dvcache");
     const int serviceStart = ReadServiceStartValue(L"amd3dvcacheSvc");
     if (driverStart < 0 || serviceStart < 0) {
@@ -536,6 +552,87 @@ int RunVCacheSet(int requestedValue) {
             L"vcache_original_start=%d; restart required",
             static_cast<unsigned long>(targetStart), cfg.vcacheOriginalStart);
     return 0;
+}
+
+int RunVCacheRun(int requestedValue) {
+    if (requestedValue != 0 && requestedValue != 1) {
+        LogLine(L"[vcache-run] invalid or missing value; exiting without changes");
+        return 2;
+    }
+
+    SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (!scm) {
+        LogLine(L"[vcache-run] OpenSCManagerW failed, err=%lu", ::GetLastError());
+        return 3;
+    }
+
+    SC_HANDLE service = ::OpenServiceW(scm, L"amd3dvcacheSvc",
+                                       SERVICE_START | SERVICE_STOP | SERVICE_QUERY_STATUS |
+                                       SERVICE_CHANGE_CONFIG);
+    if (!service) {
+        DWORD err = ::GetLastError();
+        ::CloseServiceHandle(scm);
+        LogLine(L"[vcache-run] OpenServiceW(amd3dvcacheSvc) failed, err=%lu", err);
+        return 4;
+    }
+
+    DWORD result = 0;
+    // Through the pure helper rather than inline, so the mapping is covered by a test. Its 4 and 2
+    // are SERVICE_DISABLED and SERVICE_AUTO_START; the static_asserts below keep the header honest
+    // without making it include <windows.h>.
+    static_assert(SERVICE_DISABLED == 4, "VCacheServiceStartTypeFor assumes SERVICE_DISABLED == 4");
+    static_assert(SERVICE_AUTO_START == 2, "VCacheServiceStartTypeFor assumes SERVICE_AUTO_START == 2");
+    const DWORD newStartType =
+        static_cast<DWORD>(VCacheServiceStartTypeFor(requestedValue == 0));
+
+    if (!::ChangeServiceConfigW(service, SERVICE_NO_CHANGE, newStartType, SERVICE_NO_CHANGE,
+                                nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr)) {
+        DWORD err = ::GetLastError();
+        LogLine(L"[vcache-run] ChangeServiceConfigW(start type=%lu) failed, err=%lu",
+                newStartType, err);
+        ::CloseServiceHandle(service);
+        ::CloseServiceHandle(scm);
+        return 5;
+    }
+
+    LogLine(L"[vcache-run] set amd3dvcacheSvc start type to %lu", newStartType);
+
+    if (requestedValue == 1) {
+        // START the service
+        if (!::StartServiceW(service, 0, nullptr)) {
+            DWORD err = ::GetLastError();
+            if (err != ERROR_SERVICE_ALREADY_RUNNING) {
+                LogLine(L"[vcache-run] StartServiceW failed, err=%lu", err);
+                result = 6;
+            } else {
+                LogLine(L"[vcache-run] service already running (expected success)");
+                result = 0;
+            }
+        } else {
+            LogLine(L"[vcache-run] started amd3dvcacheSvc");
+            result = 0;
+        }
+    } else {
+        // STOP the service
+        SERVICE_STATUS status;
+        if (!::ControlService(service, SERVICE_CONTROL_STOP, &status)) {
+            DWORD err = ::GetLastError();
+            if (err != ERROR_SERVICE_NOT_ACTIVE) {
+                LogLine(L"[vcache-run] ControlService(STOP) failed, err=%lu", err);
+                result = 7;
+            } else {
+                LogLine(L"[vcache-run] service already stopped (expected success)");
+                result = 0;
+            }
+        } else {
+            LogLine(L"[vcache-run] stopped amd3dvcacheSvc");
+            result = 0;
+        }
+    }
+
+    ::CloseServiceHandle(service);
+    ::CloseServiceHandle(scm);
+    return result;
 }
 
 int RunBench() {
@@ -839,6 +936,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
     // single-instance mutex, COM, window classes, config, tray, CPU Sets or engine exist.
     const CmdOptions opt = ParseCommandLine();
     if (opt.vcacheSet) return RunVCacheSet(opt.vcacheSetValue);
+    if (opt.vcacheRun) return RunVCacheRun(opt.vcacheRunValue);
 
     g_hInst           = hInst;
     g_msgShowSettings = RegisterWindowMessageW(L"GameOptimizer.ShowSettings");
@@ -996,16 +1094,46 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
                     kAppTitle, MB_OK | MB_ICONERROR);
     }
 
+    // ---- The environment warning: a GATE, not a notification ----------------
+    // Once at startup, on every launch, and on --tray too. No suppression, no gating by CPU
+    // and no "don't show again" - all three are operator decisions, not omissions. It builds
+    // nothing at all unless Windows Game Mode is ON or the AMD V-Cache optimizer is present,
+    // and on that ordinary machine this line costs nothing and returns at once.
+    //
+    // MODAL OVER SETTINGS, AND THAT IS WHY SETTINGS IS OPENED FIRST. The operator tested a
+    // modeless build and reported the warning "hiding behind the main window", then tested a
+    // modal build opened before Settings and reported the two appearing one after the other.
+    // What is wanted is them stacked. ShowEnvironmentWarning runs its own message loop and
+    // does not return until the window is dismissed, so it is still a GATE: nothing below it
+    // runs early. Closing it still does not exit the app.
+    //
+    // AFTER THE ENGINE START, NOT BEFORE IT. The engine should be governing while the user
+    // reads this; gating it on a window someone may leave open would stop the product doing
+    // its job for as long as the window is up. g_topo is populated by LoadEverything -
+    // DetectTopology is synchronous, not on g_detectThread, which is GAME detection - and the
+    // tray icon already exists, so the window has a real owner and a real topology to reason
+    // about. The --vcache-set helper and the second-instance path both returned long ago.
+
     // ---- Launch visibility --------------------------------------------------
-    // The wizard above still finishes before a manual launch reaches Settings. --bench never
-    // reaches here because it returned above, and --tray is reserved for the Run entry so a
-    // login start stays quiet even for entries migrated from older builds.
+    // The wizard finishes before a manual launch reaches Settings. --bench never reaches here
+    // because it returned above, and --tray is reserved for the Run entry so a login start
+    // stays quiet even for entries migrated from older builds.
     if (!opt.tray) {
         LogLine(wizardWasShown
                     ? L"[main] first run - opening Settings on the Profiles page"
                     : L"[main] ordinary launch - opening Settings on the Profiles page");
         OpenSettings(g_hwnd);
     }
+
+    // The warning is modal over whatever the user can actually see. On a normal launch that
+    // is the Settings window just opened, so Settings greys out behind the warning and comes
+    // back the moment it closes - ownership alone puts the warning above it, and
+    // EnableWindow(owner, FALSE) inside ShowEnvironmentWarning is what greys it. On --tray
+    // there is no Settings and g_hwnd - which is never shown - is the only owner available;
+    // the warning is then simply a window of its own, exactly as it ships today.
+    HWND warnOwner = SettingsWindow();
+    if (!warnOwner) warnOwner = g_hwnd;
+    ShowEnvironmentWarning(warnOwner, g_cfg, ProbeEnvironment(), g_topo);
 
     // ---- Message loop -------------------------------------------------------
     MSG m;

@@ -1,8 +1,8 @@
 101 ICON "GameOptimizer.ico"
 
 1 VERSIONINFO
- FILEVERSION 0,1,0,0
- PRODUCTVERSION 0,1,0,0
+ FILEVERSION 0,2,0,0
+ PRODUCTVERSION 0,2,0,0
  FILEFLAGSMASK 0x3fL
  FILEFLAGS 0x0L
  FILEOS 0x40004L
@@ -15,12 +15,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName", "IRP_HongKong"
             VALUE "FileDescription", "Game Optimizer - CPU threads optimizer"
-            VALUE "FileVersion", "0.1.0.0"
+            VALUE "FileVersion", "0.2.0.0"
             VALUE "InternalName", "GameOptimizer"
             VALUE "LegalCopyright", "Copyright (c) 2026 IRP_HongKong"
             VALUE "OriginalFilename", "GameOptimizer.exe"
             VALUE "ProductName", "Game Optimizer"
-            VALUE "ProductVersion", "0.1.0.0-prerelease"
+            VALUE "ProductVersion", "0.2.0.0"
         END
     END
     BLOCK "VarFileInfo"

@@ -1,0 +1,19 @@
+# Game Optimizer Release Package Manifest
+#
+# This file is the ONLY record that WebView2Loader.dll must ship with a release package.
+# The DLL is loaded dynamically with LoadLibraryW (see src\webview_host.cpp:218) and is
+# deliberately absent from the exe's static import table. No automated tool can detect this
+# dependency by inspecting the binary. The explicit list below is the only guard against
+# silent omission during packaging.
+#
+# Format: <source path relative to repo root> -> <destination path inside the package>
+# Lines starting with # are comments; blank lines are ignored.
+
+build\GameOptimizer.exe                        -> GameOptimizer.exe
+README.md                                      -> README.md
+LICENSE                                        -> LICENSE
+NOTICE.md                                      -> NOTICE.md
+third_party\webview2\x64\WebView2Loader.dll    -> WebView2Loader.dll
+third_party\webview2\LICENSE.txt               -> third_party\webview2\LICENSE.txt
+third_party\webview2\NOTICE.txt                -> third_party\webview2\NOTICE.txt
+third_party\webview2\README.md                 -> third_party\webview2\README.md

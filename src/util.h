@@ -65,6 +65,10 @@ void MigrateLegacyConfigDir();
 //   turned autostart off is never switched back on.
 void MigrateLegacyAutostart();
 
+// ---- AMD V-Cache policy agent image name ----------------------------------
+// Exported so the engine can match the same name without duplication.
+extern const wchar_t* const kVCacheAgentImage;
+
 // ---- Environment probes, for the first-run wizard and the risk warnings -----
 enum class GameModeState { NotDeterminable, Off, On };
 enum class AmdVCacheServiceState {
@@ -89,11 +93,23 @@ struct EnvironmentInfo {
     bool  amdVCacheDriverRunning = false;
     AmdVCacheServiceState amdVCacheDriverState =
         AmdVCacheServiceState::NotDeterminable;
+    // AMD's actual policy engine: it watches the foreground window and issues the IOCTL.
+    // The service only launches it and the kernel driver is a relay, so neither of those
+    // means anything is steering - THIS is the flag that means something really is.
+    bool  amdVCacheAgentRunning = false;    // "amd3dvcacheUser.exe" in this logon session
     bool  isElevated = false;
 };
 EnvironmentInfo ProbeEnvironment();
-// Refreshes only the live scheduling influences: one HKCU value read and two named status
-// queries. It never enumerates services and never writes any source.
+// True when `pid` belongs to the caller's own logon session. False if either session
+// cannot be read - an unreadable session is not evidence of a match.
+bool IsProcessInOurSession(DWORD pid);
+
+// True when AMD's V-Cache policy agent is running in the CALLER'S logon session.
+// Cheap enough to call on the engine's tick path - it is one process snapshot and no
+// registry or service-control access, unlike ProbeEnvironment().
+bool IsAmdVCacheAgentRunning();
+// Refreshes only the live scheduling influences: one HKCU value read, two named status
+// queries and one process snapshot. It never enumerates services and never writes any source.
 void RefreshEnvironmentStatus(EnvironmentInfo& info);
 
 void OpenGameModeSettings();                    // ms-settings:gaming-gamemode

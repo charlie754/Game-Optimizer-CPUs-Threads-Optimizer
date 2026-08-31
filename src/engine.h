@@ -62,6 +62,9 @@ struct EngineStatus {
                                      // ids no longer match this machine and the topology
                                      // needs re-detecting. Raised by the watcher, never
                                      // acted on by it - re-detection is a user action.
+    // AMD's V-Cache policy agent was running the last time a game was pinned. Re-checked on the
+    // tick rather than only at startup, because the agent can appear after this app launched.
+    bool amdVCacheAgentActive = false;
     int lastTickMs = 0;              // measured cost of the last tick, for --bench
     std::vector<GovernedProcess> governed;
     std::wstring tooltip;            // pre-rendered, <= 127 chars (NOTIFYICONDATA szTip)

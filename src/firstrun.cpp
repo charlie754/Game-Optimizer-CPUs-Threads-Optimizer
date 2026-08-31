@@ -36,6 +36,7 @@
 #include "ui.h"
 #include "util.h"
 #include "config.h"
+#include "firstrun_text.h"
 #include "topology.h"
 #include "theme.h"
 
@@ -245,70 +246,6 @@ std::wstring Page1Masks(const Topology& t) {
         s += L"\r\nRecommended for background apps: ";
         s += t.defaultHeavyMask;
         s += L"\r\n";
-    }
-    return s;
-}
-
-std::wstring Page2GameModeText(const EnvironmentInfo& env, const Topology& t, bool& warnOut) {
-    const bool multiDomain = t.domains.size() > 1;
-    warnOut = env.gameModeState == GameModeState::On && multiDomain && env.isAmd;
-
-    std::wstring s = L"CPU: ";
-    s += env.cpuBrand.empty() ? std::wstring(L"(not reported by the registry)") : env.cpuBrand;
-    s += L"\r\n\r\n";
-
-    if (env.gameModeState == GameModeState::NotDeterminable) {
-        s += L"Windows Game Mode is not determinable because the AutoGameModeEnabled "
-             L"registry value could not be read for this account.";
-    } else if (warnOut) {
-        s += L"Windows Game Mode is ON "
-             L"(HKCU\\Software\\Microsoft\\GameBar\\AutoGameModeEnabled = 1).\r\n\r\n"
-             L"On a multi-CCD AMD part Game Mode applies its own GLOBAL CCD preference to "
-             L"whatever it decides is the game. That is machine-wide, it is not per-game, "
-             L"you do not choose which processes it covers, and it fights the per-game CPU "
-             L"Sets this tool applies. If your game ends up on the wrong CCD anyway, this "
-             L"is the first thing to check.\r\n\r\n"
-             L"Game Optimizer will not change this setting for you. The button below just "
-             L"opens the Windows page so you can decide.";
-    } else if (env.gameModeState == GameModeState::Off) {
-        s += L"Windows Game Mode is OFF "
-             L"(HKCU\\Software\\Microsoft\\GameBar\\AutoGameModeEnabled = 0). It is not "
-             L"applying a global CCD preference, so it is not competing with the per-game "
-             L"CPU Sets this tool applies.";
-    } else {
-        s += L"Windows Game Mode is ON "
-             L"(HKCU\\Software\\Microsoft\\GameBar\\AutoGameModeEnabled = 1), but this "
-             L"machine is not a multi-CCD AMD part, so there is no CCD preference for it "
-             L"to express. Nothing on this page needs your attention.";
-    }
-    return s;
-}
-
-std::wstring Page2VCacheText(const EnvironmentInfo& env) {
-    std::wstring s = L"Separately, and regardless of the Game Mode setting above:\r\n\r\n";
-    if (env.amdVCacheServiceState == AmdVCacheServiceState::NotDeterminable) {
-        s += L"The AMD 3D V-Cache Performance Optimizer service state is not determinable.";
-        return s;
-    }
-    if (env.amdVCacheServiceState == AmdVCacheServiceState::NotInstalled) {
-        s += L"The AMD 3D V-Cache Performance Optimizer service (amd3dvcacheSvc) is NOT "
-             L"installed on this machine, so it is not influencing scheduling here.";
-        return s;
-    }
-    if (env.amdVCacheServiceState == AmdVCacheServiceState::Running) {
-        s += L"The AMD 3D V-Cache Performance Optimizer service (amd3dvcacheSvc) is "
-             L"INSTALLED and RUNNING.\r\n\r\n"
-             L"This is a second, independent global influence on where threads are "
-             L"scheduled - it is not the same thing as Windows Game Mode and it is not "
-             L"turned off by turning Game Mode off. Both facts on this page can be true at "
-             L"once, which is why they are two lines and not one. On a machine like this "
-             L"one a whole cache domain has been observed flagged Parked; if the core map "
-             L"shows a parked CCD, this service is the likeliest reason.\r\n\r\n"
-             L"Game Optimizer does not stop, start or configure this service.";
-    } else {
-        s += L"The AMD 3D V-Cache Performance Optimizer service (amd3dvcacheSvc) is "
-             L"INSTALLED but NOT RUNNING. It is a separate global scheduling influence from "
-             L"Windows Game Mode; while it is stopped it is not expressing a preference.";
     }
     return s;
 }
@@ -922,7 +859,7 @@ LRESULT CALLBACK WizardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                            kRoText | WS_TABSTOP, -1);
             st->hP2Open = Mk(hwnd, L"BUTTON", L"Open Game Mode settings",
                              BS_OWNERDRAW | WS_TABSTOP, IDC_FR_OPENGM);
-            st->hP2VCache = Mk(hwnd, L"EDIT", Page2VCacheText(st->env).c_str(),
+            st->hP2VCache = Mk(hwnd, L"EDIT", Page2VCacheText(st->env, true).c_str(),
                                kRoText | WS_TABSTOP, -1);
 
             // ---- page 3 ----

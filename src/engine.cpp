@@ -20,6 +20,7 @@
 #include <set>
 #include <thread>
 
+#include "agent_transition.h"
 #include "applier.h"
 #include "games.h"
 #include "procwatch.h"
@@ -78,6 +79,10 @@ bool StatusEquivalent(const EngineStatus& a, const EngineStatus& b) {
         && a.heavyCount == b.heavyCount
         && a.blockedCount == b.blockedCount
         && a.staleTopology == b.staleTopology
+        // Included so the tray is told when AMD's agent appears or disappears mid-session.
+        // It does not jitter - it changes only when a process starts or exits - so it cannot
+        // cause the per-tick message storm lastTickMs would.
+        && a.amdVCacheAgentActive == b.amdVCacheAgentActive
         && a.profileName == b.profileName
         && a.gameMaskName == b.gameMaskName
         && a.heavyMaskName == b.heavyMaskName
@@ -434,6 +439,10 @@ struct Engine::Impl {
     std::map<DWORD, AppliedRec> applied;
     std::wstring lastProfileName;
 
+    // What the last completed probe said about AMD's V-Cache agent, so the tick logs the
+    // transition and not the state. Starts Never: the first probe of a run is itself news.
+    AgentSeen lastAgentSeen = AgentSeen::Never;
+
     // Known game executables, lowercased basenames, for the All Games profile. Refreshed
     // lazily and only while an enabled All Games profile actually exists, because
     // DiscoverGames() walks the filesystem and the registry and costs tens to hundreds of
@@ -758,6 +767,40 @@ int Engine::Impl::Tick() {
         DWORD pid = 0;
         if (LowestLiveGamePid(fresh, *matched, pid)) st.gamePid = pid;
     }
+
+    // AMD's V-Cache policy agent, RE-CHECKED HERE and not only at startup. amd3dvcacheSvc
+    // launches amd3dvcacheUser.exe into the interactive session, so the agent can appear after
+    // this app did and a startup-only probe would never notice. Probed ONLY while a profile's
+    // game is actually governed: that is the moment two schedulers would be steering the same
+    // threads, and it keeps the process snapshot off the idle path. Reuses this tick's snapshot
+    // instead of taking a second one.
+    //
+    // THIS RAISES NOTHING. The watcher thread owns the applier and publishes an immutable
+    // status; it does not own the UI and must never open a window, least of all during a game.
+    // The entire visible effect is this field and one log line per transition.
+    if (st.active) {
+        const std::vector<DWORD> agentPids = fresh.FindBySpec(kVCacheAgentImage);
+        bool agentNow = false;
+        for (size_t i = 0; i < agentPids.size(); ++i) {
+            if (IsProcessInOurSession(agentPids[i])) { agentNow = true; break; }
+        }
+        st.amdVCacheAgentActive = agentNow;
+        if (ShouldLogAgentChange(lastAgentSeen, agentNow)) {
+            const wchar_t* who =
+                st.profileName.empty() ? L"(unnamed profile)" : st.profileName.c_str();
+            if (agentNow) {
+                LogLine(L"engine: AMD V-Cache agent now running while '%s' is governed", who);
+            } else if (lastAgentSeen == AgentSeen::Present) {
+                LogLine(L"engine: AMD V-Cache agent no longer running");
+            } else {
+                LogLine(L"engine: AMD V-Cache agent not running while '%s' is governed", who);
+            }
+        }
+        lastAgentSeen = AgentSeenFrom(agentNow);
+    }
+    // No probe while idle, so lastAgentSeen is deliberately left alone: it records what was
+    // last MEASURED, and going idle measures nothing. The published flag stays false because
+    // nothing is pinned for the agent to be fighting over.
 
     std::set<DWORD> gameFamily;
     if (st.gamePid != 0) {

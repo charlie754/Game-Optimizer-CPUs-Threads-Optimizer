@@ -16,6 +16,7 @@
 #include <tlhelp32.h>
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <string>
 #include <vector>
@@ -827,7 +828,7 @@ enum : int {
 };
 
 // Added separately so the stable control ids above keep their numeric values.
-enum : int { IDC_VCACHE_MANAGE = 1600 };
+enum : int { IDC_VCACHE_MANAGE = 1600, IDC_VCACHE_RESTORE = 1601 };
 
 enum : int { PAGE_PROFILES = 0, PAGE_COREMAP, PAGE_GENERAL, PAGE_COUNT };
 
@@ -1005,7 +1006,9 @@ struct SettingsState {
     // one of hMap / hMapFail is ever non-null, and they occupy the same rectangle.
     HWND hMapFail = nullptr;
     HWND hGenHdr = nullptr, hStartup = nullptr, hNotify = nullptr;
-    HWND hVCacheManage = nullptr, hVCacheManageDesc = nullptr;
+    // The checkbox carries no description paragraph - the operator removed it. Its caption
+    // says what it does; the removed text repeated that and added driver detail that misled.
+    HWND hVCacheManage = nullptr, hVCacheRestore = nullptr;
     HWND hPollLbl = nullptr, hPoll = nullptr;
     HWND hGameModeStatus = nullptr, hVCacheStatus = nullptr, hVCacheRestoreHint = nullptr;
     HWND hVCacheEffect = nullptr;
@@ -2250,6 +2253,13 @@ void StoreGeneralToWork(SettingsState* st) {
     if (ParseIntW(Trim(GetText(st->hPoll)), v)) st->work.pollMs = v;
 }
 
+}  // namespace
+
+// SHARED WITH THE STARTUP WARNING WINDOW, so it has external linkage and a declaration in
+// ui.h. The anonymous namespace is closed around this one function rather than the function
+// being moved to the bottom of the file: it belongs next to its only in-file caller,
+// OnVCacheManageToggle, and moving it would have made the diff look like a rewrite of a
+// working elevation path. Everything either side of it is still file-local.
 bool LaunchVCacheSetElevated(bool disable, DWORD& outError) {
     outError = ERROR_SUCCESS;
     const std::wstring exe = GetExePath();
@@ -2290,53 +2300,111 @@ bool LaunchVCacheSetElevated(bool disable, DWORD& outError) {
     return true;
 }
 
+bool LaunchVCacheRunElevated(bool run, DWORD& outError) {
+    outError = ERROR_SUCCESS;
+    const std::wstring exe = GetExePath();
+    if (exe.empty()) {
+        outError = ERROR_FILE_NOT_FOUND;
+        return false;
+    }
+
+    const std::wstring parameters = run ? L"--vcache-run 1" : L"--vcache-run 0";
+    SHELLEXECUTEINFOW sei;
+    ::ZeroMemory(&sei, sizeof(sei));
+    sei.cbSize = sizeof(sei);
+    sei.fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI;
+    sei.lpVerb = L"runas";
+    sei.lpFile = exe.c_str();
+    sei.lpParameters = parameters.c_str();
+    sei.nShow = SW_HIDE;
+    if (!::ShellExecuteExW(&sei)) {
+        outError = ::GetLastError();
+        if (outError == ERROR_CANCELLED) {
+            LogLine(L"[vcache-run] user declined UAC prompt");
+            outError = ERROR_CANCELLED;
+            return false;
+        }
+        return false;
+    }
+    if (sei.hProcess == nullptr) {
+        outError = ERROR_INVALID_HANDLE;
+        return false;
+    }
+
+    const DWORD waitResult = ::WaitForSingleObject(sei.hProcess, INFINITE);
+    DWORD exitCode = 1;
+    const bool gotExitCode = waitResult == WAIT_OBJECT_0 &&
+                             ::GetExitCodeProcess(sei.hProcess, &exitCode) != FALSE;
+    if (!gotExitCode) outError = ::GetLastError();
+    ::CloseHandle(sei.hProcess);
+    if (!gotExitCode) return false;
+    if (exitCode != 0) {
+        outError = exitCode;
+        return false;
+    }
+    return true;
+}
+
+namespace {
+
 void OnVCacheManageToggle(SettingsState* st, HWND hwnd) {
-    const bool disable = IsChecked(st->hVCacheManage);
-    const bool previous = !disable;
-    const int previousDriverStart = ReadServiceStartValue(L"amd3dvcache");
+    // Checked means stopped; unchecked means running
+    const bool checked = IsChecked(st->hVCacheManage);
+    const bool run = !checked;  // true = start the service, false = stop it
+
     DWORD error = ERROR_SUCCESS;
-    if (!LaunchVCacheSetElevated(disable, error)) {
-        // BS_AUTOCHECKBOX flips before WM_COMMAND. A declined UAC prompt changed neither
-        // registry nor config, so restore exactly the previous visual state.
+    if (!LaunchVCacheRunElevated(run, error)) {
+        // Even on failure, set the box from the real state, not from memory.
+        // BS_AUTOCHECKBOX already flipped on the click, so this re-reads reality and corrects it.
         if (error == ERROR_CANCELLED) {
-            SetChecked(st->hVCacheManage, previous);
-            LogLine(L"[settings] AMD V-Cache Start change approval declined; unchanged");
+            LogLine(L"[settings] AMD V-Cache start/stop approval declined");
         } else {
-            // A child failure normally rolls back. Read the driver again so even a failed
-            // rollback cannot leave the checkbox making a stale claim.
-            SetChecked(st->hVCacheManage, ReadServiceStartValue(L"amd3dvcache") == 4);
-            RefreshEnvironmentStatus(st->env);
-            if (UpdateEnvironmentSection(st)) SettingsLayout(st, hwnd);
-            RedrawSettings(hwnd);
-            LogLine(L"[settings] AMD V-Cache Start change failed, child/error=%lu", error);
+            LogLine(L"[settings] AMD V-Cache start/stop failed, error=%lu", error);
             MessageBoxW(hwnd,
                         L"The AMD 3D V-Cache optimizer change did not complete. The current "
-                        L"configured state is shown here; see the log for details.",
+                        L"state is shown here; see the log for details.",
                         L"Game Optimizer", MB_OK | MB_ICONWARNING);
         }
+        // Set the box from reality on both ERROR_CANCELLED and other failures
+        SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
+        RefreshEnvironmentStatus(st->env);
+        if (UpdateEnvironmentSection(st)) SettingsLayout(st, hwnd);
+        RedrawSettings(hwnd);
         return;
     }
 
-    int recordedStart = disable ? previousDriverStart : -1;
-    Config diskConfig;
-    std::wstring configError;
-    if (LoadConfig(GetConfigPath(), diskConfig, &configError)) {
-        recordedStart = diskConfig.vcacheOriginalStart;
+    // The SCM accepts the request immediately, but the service takes time to stop/start.
+    // Poll up to ~3 seconds to let it settle before re-reading.
+    const auto startTime = std::chrono::high_resolution_clock::now();
+    const auto timeout = std::chrono::milliseconds(3000);
+    bool settledToRequestedState = false;
+    while (true) {
+        const auto elapsed = std::chrono::high_resolution_clock::now() - startTime;
+        if (elapsed >= timeout) {
+            break;
+        }
+        const bool isRunning = cd::IsAmdVCacheAgentRunning();
+        if (isRunning == run) {
+            // State has settled to the requested value
+            settledToRequestedState = true;
+            break;
+        }
+        // Sleep ~100 ms and re-check
+        ::Sleep(100);
     }
-    st->work.vcacheOriginalStart = recordedStart;
-    st->baseline.vcacheOriginalStart = recordedStart;
-    st->out->vcacheOriginalStart = recordedStart;
 
+    // Always set the box from the final real state, success or not
+    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
     RefreshEnvironmentStatus(st->env);
     if (UpdateEnvironmentSection(st)) SettingsLayout(st, hwnd);
     RedrawSettings(hwnd);
-    MessageBoxW(hwnd,
-                disable
-                    ? L"AMD's 3D V-Cache optimizer is configured to be disabled. "
-                      L"Restart Windows for the change to take effect."
-                    : L"AMD's 3D V-Cache optimizer is configured to be enabled. "
-                      L"Restart Windows for the change to take effect.",
-                L"Restart required", MB_OK | MB_ICONINFORMATION);
+
+    if (settledToRequestedState) {
+        LogLine(L"[settings] AMD V-Cache optimizer %s successfully",
+                run ? L"started" : L"stopped");
+    } else {
+        LogLine(L"[settings] AMD V-Cache optimizer did not settle to requested state within timeout");
+    }
 }
 
 void SelectMapMask(SettingsState* st) {
@@ -2393,6 +2461,7 @@ std::wstring MaskParkedWarning(const SettingsState* st, const std::wstring& mask
     const std::wstring p = std::to_wstring(parked);
     if (parked == total) {
         return FormatFullyParkedMaskWarning(maskName, total,
+                                            st->env.amdVCacheAgentRunning,
                                             st->env.amdVCacheServiceRunning,
                                             st->env.amdVCacheDriverRunning,
                                             st->env.amdVCacheServicePresent ||
@@ -2472,19 +2541,27 @@ bool UpdateEnvironmentSection(SettingsState* st) {
 
     const std::wstring game = FormatGameModeEnvironmentStatus(st->env.gameModeState);
     const int serviceStart = ReadServiceStartValue(L"amd3dvcacheSvc");
-    const int driverStart = ReadServiceStartValue(L"amd3dvcache");
+    // THE DRIVER LINE IS GONE ON PURPOSE - see FormatAmdVCacheComponentsEnvironmentStatus in
+    // settings_environment.h. amd3dvcache.sys is PnP-loaded and runs whether or not the
+    // service does, relays one value to firmware, and has no policy of its own, so its state
+    // is noise the user cannot act on - and a Running driver beside a stopped service read as
+    // "stopping it failed". st->env.amdVCacheDriverState is still probed; it is just not shown.
     const std::wstring components =
         std::wstring(L"AMD 3D V-Cache Performance Optimizer\r\n  ") +
         FormatAmdVCacheComponentEnvironmentLine(
-            L"service", L"amd3dvcacheSvc", st->env.amdVCacheServiceState, serviceStart) +
-        L"\r\n  " + FormatAmdVCacheComponentEnvironmentLine(
-            L"driver", L"amd3dvcache", st->env.amdVCacheDriverState, driverStart);
+            L"service", L"amd3dvcacheSvc", st->env.amdVCacheServiceState, serviceStart);
     const std::wstring effect =
         st->env.amdVCacheServiceState == AmdVCacheServiceState::Running
             ? AmdVCacheRunningEffectText()
             : std::wstring();
+    // FROM THE LIVE CONFIG, NOT THE SNAPSHOT. The value is written by the elevated
+    // `--vcache-set` child - the startup warning can now run it over this window - so the
+    // copy taken when Settings opened goes stale the moment that happens, and a card that
+    // reports a stale -1 hides the one sentence telling the user how to undo the change they
+    // just made. ApplyChanges reconciles the same field on the way out; see settings_merge.h.
     const std::wstring restoreHint =
-        FormatVCacheRestoreHint(st->work.vcacheOriginalStart);
+        FormatVCacheRestoreHint(st->out ? st->out->vcacheOriginalStart
+                                        : st->work.vcacheOriginalStart);
 
     const bool hadEffect = st->hVCacheEffect &&
                            GetWindowTextLengthW(st->hVCacheEffect) > 0;
@@ -2509,6 +2586,22 @@ bool UpdateEnvironmentSection(SettingsState* st) {
         ShowWindow(st->hVCacheRestoreHint,
                    hasRestoreHint && st->page == PAGE_GENERAL ? SW_SHOW : SW_HIDE);
     }
+
+    // THE CHECKBOX IS A VIEW OF THE DRIVER, NOT A REMEMBERED CLICK - and until this line it
+    // was only re-read at WM_CREATE, at the end of ApplyChanges, and after a failed toggle.
+    // Nothing refreshed it while the window sat open, which was harmless while this window
+    // owned the only route to that Start value. The startup warning now offers the same
+    // disable, modally, over an open Settings window.
+    //
+    // A STALE UNCHECKED BOX IS NOT COSMETIC HERE. Clicking it asks the elevated child to
+    // disable a driver that is ALREADY disabled, and the child records the driver's current
+    // Start value as the original - so the real original (3, Manual) is overwritten with 4,
+    // Disabled. A later restore then writes Disabled back and the driver never returns. Same
+    // class as the stale-snapshot defect above, one doorway along. This costs nothing: both
+    // Start values were already read at the top of this function, which the timer calls once
+    // a second, so the control simply stops being able to lie.
+    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
+
     return hadEffect != hasEffect || hadRestoreHint != hasRestoreHint;
 }
 
@@ -3184,9 +3277,7 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         y = c.bottom + GAP;
     } else {
         int iw = W - 2 * PAD;
-        const int vCacheDescH = MeasureWrappedStaticHeight(
-            st->hVCacheManageDesc, measureDc, iw, dpi);
-        const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW + vCacheDescH + GT + ROW;
+        const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW + GT + ROW;
         RECT c = AddCard(y, cardH, x0, W);
         int ix = c.left + PAD, iy = c.top + PAD;
         Put(st->hGenHdr, ix, iy, iw, HH);
@@ -3195,9 +3286,7 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hNotify, ix + theme::Dp(212, dpi), iy, theme::Dp(240, dpi), ROW);
         iy += ROW + GT;
         Put(st->hVCacheManage, ix, iy, iw, ROW);
-        iy += ROW;
-        Put(st->hVCacheManageDesc, ix, iy, iw, vCacheDescH);
-        iy += vCacheDescH + GT;
+        iy += ROW + GT;
         Put(st->hPollLbl, ix, iy + (ROW - LH) / 2, theme::Dp(150, dpi), LH);
         Put(st->hPoll, ix + theme::Dp(150, dpi), iy + (ROW - RH) / 2,
             theme::Dp(80, dpi), RH);
@@ -3614,7 +3703,7 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
     HWND coremap[]  = { st->hMapHdr, st->hTopoText, st->hMapMaskLbl, st->hMapMask,
                         st->hMapReset, st->hMap, st->hMapFail };
     HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify,
-                        st->hVCacheManage, st->hVCacheManageDesc, st->hPollLbl, st->hPoll,
+                        st->hVCacheManage, st->hPollLbl, st->hPoll,
                         st->hGameModeStatus, st->hVCacheStatus, st->hVCacheRestoreHint,
                         st->hVCacheEffect,
                         st->hBlocked, st->hInspect };
@@ -3673,7 +3762,7 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
     HWND smalls[] = { st->hGameLbl, st->hGameMaskLbl, st->hHeavyLbl, st->hHeavyMaskLbl,
                       st->hGameMaskWarn, st->hHeavyMaskWarn, st->hAutoDesc, st->hPctLbl,
                       st->hAutoStatus, st->hTopoText, st->hMapMaskLbl,
-                      st->hVCacheManageDesc, st->hPollLbl, st->hVCacheRestoreHint,
+                      st->hPollLbl, st->hVCacheRestoreHint,
                       st->hVCacheEffect,
                       st->hBlocked, st->hMapFail };
     for (HWND h : smalls)
@@ -3711,8 +3800,15 @@ void ApplyChanges(SettingsState* st, HWND hwnd) {
 
     // Settings never edits these fields. Preserve their live values so a tray Pause or prompt
     // decline saved while this modeless window is open cannot be erased by its stale snapshot.
-    st->work.paused = st->out->paused;
-    st->work.unknown = st->out->unknown;
+    //
+    // vcacheOriginalStart JOINED THEM, and it is the one that costs the user something. It is
+    // written by an elevated child process and now by the startup warning window too - both
+    // outside this window's knowledge - so the snapshot taken when Settings opened must never
+    // win over it. It is the only record of the driver's Start value before the app disabled
+    // it; a stale -1 written over it leaves the driver disabled with nothing able to restore
+    // it. Extracted into a pure helper so the rule is reachable by a test that can FAIL:
+    // settings.cpp does not link into the unit-test harness. See settings_merge.h, group Q.
+    PreserveFieldsSettingsNeverEdits(*st->out, st->work);
 
     // Compare caller-folded names against both the open baseline and the edited work copy. The
     // baseline is what keeps a profile deliberately deleted here from being resurrected.
@@ -3775,7 +3871,7 @@ void ApplyChanges(SettingsState* st, HWND hwnd) {
     SetWindowTextW(st->hPoll, std::to_wstring(st->work.pollMs).c_str());
     SetChecked(st->hNotify, st->work.notifications);
     SetChecked(st->hStartup, st->work.startWithWindows);
-    SetChecked(st->hVCacheManage, ReadServiceStartValue(L"amd3dvcache") == 4);
+    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
     RepaintChrome(hwnd);   // masks may have been repaired, so the stat row may have moved
 }
 
@@ -4083,16 +4179,18 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                              BS_AUTOCHECKBOX | WS_TABSTOP, IDC_NOTIFY);
             st->hVCacheManage = Mk(
                 hwnd, L"BUTTON",
-                L"Disable AMD's 3D V-Cache optimizer (requires a restart)",
+                L"Stop AMD's 3D V-Cache optimizer",
                 BS_AUTOCHECKBOX | WS_TABSTOP, IDC_VCACHE_MANAGE);
-            st->hVCacheManageDesc = Mk(
-                hwnd, L"STATIC",
-                L"Changing this needs administrator approval once and takes effect only after "
-                L"you restart Windows. It stays off until you turn it back on here. AMD's "
-                L"optimizer parks the non-cache CCD while a game runs; disabling it stops the "
-                L"Windows side only. If your BIOS also has a 3D V-Cache or CCD parking option, "
-                L"changing this setting does not change your BIOS setting.",
-                SS_LEFT, -1);
+            // No description STATIC under the checkbox - the operator removed the paragraph,
+            // and the control went with it so the layout closes up instead of leaving a gap.
+            // The restore control is a safety net for users who used the old disable feature.
+            // It exists only when vcache_original_start is recorded (>= 0).
+            if (cd::ShowVCacheRestoreControl(st->work.vcacheOriginalStart)) {
+                st->hVCacheRestore = Mk(
+                    hwnd, L"BUTTON",
+                    L"Restore AMD's driver startup setting (requires a restart)",
+                    BS_PUSHBUTTON | WS_TABSTOP, IDC_VCACHE_RESTORE);
+            }
             st->hPollLbl = Mk(hwnd, L"STATIC", L"Poll interval (ms):", SS_LEFT, -1);
             st->hPoll = Mk(hwnd, L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
                            IDC_POLL);
@@ -4198,7 +4296,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             SetChecked(st->hStartup, st->work.startWithWindows);
             SetChecked(st->hNotify, st->work.notifications);
-            SetChecked(st->hVCacheManage, ReadServiceStartValue(L"amd3dvcache") == 4);
+            SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
             SetWindowTextW(st->hPoll, std::to_wstring(st->work.pollMs).c_str());
 
             FillMaskCombo(st->hMapMask, st->work,
@@ -4721,6 +4819,24 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDC_VCACHE_MANAGE:
                     if (code == BN_CLICKED) OnVCacheManageToggle(st, hwnd);
                     return 0;
+                case IDC_VCACHE_RESTORE:
+                    if (code == BN_CLICKED) {
+                        DWORD error = ERROR_SUCCESS;
+                        if (!LaunchVCacheSetElevated(false, error)) {
+                            if (error != ERROR_CANCELLED) {
+                                MessageBoxW(hwnd,
+                                            L"The AMD 3D V-Cache driver restore did not complete. "
+                                            L"See the log for details.",
+                                            L"Game Optimizer", MB_OK | MB_ICONWARNING);
+                            }
+                        } else {
+                            MessageBoxW(hwnd,
+                                        L"AMD's 3D V-Cache driver startup setting has been restored. "
+                                        L"Restart Windows for the change to take effect.",
+                                        L"Restart required", MB_OK | MB_ICONINFORMATION);
+                        }
+                    }
+                    return 0;
                 case IDC_STARTUP: {
                     bool on = IsChecked(st->hStartup);
                     st->work.startWithWindows = on;
@@ -5237,6 +5353,13 @@ std::wstring BrowseForExe(HWND owner) {
     ofn.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR | OFN_EXPLORER;
     if (!GetOpenFileNameW(&ofn)) return std::wstring();
     return std::wstring(buf);
+}
+
+// The live Settings window, or nullptr when it is not open. IsWindow is not decoration:
+// g_hSettings is cleared on WM_DESTROY, but handing a stale handle to a caller that then
+// disables it would leave a dead window disabled forever.
+HWND SettingsWindow() {
+    return (g_hSettings && IsWindow(g_hSettings)) ? g_hSettings : nullptr;
 }
 
 void ShowSettings(HWND owner, Config& cfg, const Topology& topo, Engine& engine) {

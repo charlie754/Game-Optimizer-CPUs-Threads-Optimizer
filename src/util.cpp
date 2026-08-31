@@ -10,6 +10,7 @@
 #include <shellapi.h>   // ShellExecuteW
 #include <objbase.h>    // CoTaskMemFree
 #include <winsvc.h>     // OpenSCManagerW, QueryServiceStatusEx
+#include <tlhelp32.h>   // CreateToolhelp32Snapshot, Process32FirstW
 
 #include <cstdarg>
 #include <cstdlib>
@@ -162,6 +163,16 @@ bool FileExists(const std::wstring& path) {
 }
 
 }  // namespace
+
+// The per-session user-mode agent that actually decides anything. It ships beside the service
+// and the driver in the DriverStore, but it is a plain process, not a service, so it cannot be
+// queried through the service control manager.
+//
+// DEFINED HERE, IN cd, AND DELIBERATELY NOT IN THE ANONYMOUS NAMESPACE ABOVE. util.h declares it
+// extern in cd so the engine can match the same string; a second definition in the anonymous
+// namespace would ALSO be visible as cd::kVCacheAgentImage, and every use inside this file then
+// fails to compile with C2872 'ambiguous symbol'. That is exactly what happened.
+const wchar_t* const kVCacheAgentImage = L"amd3dvcacheUser.exe";
 
 // ---- Paths -----------------------------------------------------------------
 
@@ -639,6 +650,52 @@ void MigrateLegacyAutostart() {
 
 // ---- Environment probes ----------------------------------------------------
 
+bool IsProcessInOurSession(DWORD pid) {
+    // Session identity is the whole point. A process in another user's session is running
+    // under a different security context and must not count. Read our own session first: if
+    // that fails there is nothing to compare against and the honest answer is false.
+    DWORD ourSession = 0;
+    if (!::ProcessIdToSessionId(::GetCurrentProcessId(), &ourSession)) return false;
+
+    DWORD theirSession = 0;
+    if (!::ProcessIdToSessionId(pid, &theirSession)) return false;
+
+    return ourSession == theirSession;
+}
+
+bool IsAmdVCacheAgentRunning() {
+    // Session identity is the whole point of this probe. The agent is per-session, so an
+    // instance in another user's session is steering THAT session's foreground window, not
+    // ours, and must not count. Used at startup when there is no snapshot to reuse; the
+    // engine's tick path reuses the existing ProcessSnapshot instead of taking a second one.
+
+    HANDLE snapshot = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W entry;
+    ::ZeroMemory(&entry, sizeof(entry));
+    entry.dwSize = sizeof(entry);
+
+    bool found = false;
+    if (::Process32FirstW(snapshot, &entry)) {
+        do {
+            if (::CompareStringOrdinal(entry.szExeFile, -1, kVCacheAgentImage, -1,
+                                       TRUE) != CSTR_EQUAL) {
+                continue;
+            }
+            // A candidate whose session cannot be read is treated as NOT ours. Assuming it
+            // were ours would turn a failed query into a claim we never measured.
+            if (IsProcessInOurSession(entry.th32ProcessID)) {
+                found = true;
+                break;
+            }
+        } while (::Process32NextW(snapshot, &entry));
+    }
+
+    ::CloseHandle(snapshot);
+    return found;
+}
+
 void RefreshEnvironmentStatus(EnvironmentInfo& info) {
     // Reset first so a failed refresh can never leave a stale, confident answer on screen.
     info.gameModeKeyPresent = false;
@@ -669,6 +726,11 @@ void RefreshEnvironmentStatus(EnvironmentInfo& info) {
     info.amdVCacheDriverPresent = false;
     info.amdVCacheDriverRunning = false;
     info.amdVCacheDriverState = AmdVCacheServiceState::NotDeterminable;
+
+    // The agent is a plain process, so it is answered before - and independently of - the
+    // service control manager. Doing it here rather than after the queryComponent calls
+    // means the failed-to-open-SCM early return below cannot leave this flag stale.
+    info.amdVCacheAgentRunning = IsAmdVCacheAgentRunning();
 
     // Open exactly the two components we care about. No EnumServicesStatusEx call belongs
     // on a one-second UI timer. Every operation here is query-only.

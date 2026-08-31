@@ -8,7 +8,7 @@ Per-game CPU Set isolation for split-topology CPUs — the isolation of BIOS "Tu
 applied only to the game you chose, and only while it is running.
 
 Please turn off
-- Turbo Game Mode, optimize CCD Parking servies in BIOS.
+- Turbo Game Mode, optimize CCD Parking services in BIOS.
 - Game Mode and AMD's 3D V-Cache optimizer in OS.
 
 On a dual-CCD AMD part (7950X3D, 7900X3D, 9950X3D) one CCD carries 3D V-Cache and the other
@@ -270,10 +270,26 @@ The first-run wizard checks Game Mode and reports what it finds. **It never chan
 and never requires a particular value.**
 
 Worth understanding: Game Mode does not park CCDs itself. On X3D parts, AMD's *3D V-Cache
-Performance Optimizer* driver watches Xbox Game Bar's "this process is a game" signal and parks
-the non-cache CCD. That is a different mechanism making the same kind of decision as
-Game Optimizer, on Windows' idea of what counts as a game rather than yours. Running both means
-two systems placing your game by different rules.
+Performance Optimizer* makes the same kind of decision Game Optimizer does, by a different
+mechanism and on Windows' idea of what counts as a game rather than yours. Running both means two
+systems placing your game by different rules.
+
+That optimizer is **three** components, and only one of them does anything:
+
+| component | what it is | what it does |
+|---|---|---|
+| `amd3dvcacheSvc` | a Windows service, visible in `services.msc` | launches the agent below, and nothing else |
+| `amd3dvcacheUser.exe` | a per-session background process, **not** a service | watches which window has focus and decides which CCD to prefer |
+| `amd3dvcache` | a kernel driver, **not** shown in `services.msc` | passes that one preference down to firmware |
+
+So the service being stopped does not mean the optimizer is off, and the driver running does not
+mean it is on. The process that matters is `amd3dvcacheUser.exe`, and that is the one Game
+Optimizer's startup warning checks.
+
+The kernel driver is loaded by Windows PnP against a firmware-declared device, so its start type
+reading "Manual" does **not** mean it stays unloaded — it loads every boot. Only setting it to
+Disabled stops that, which is what the optional AMD 3D V-Cache setting does, and why it needs a
+restart.
 
 Separately, "AMD/ASUS Turbo Game Mode" and Gigabyte's "X3D Turbo Mode" are **BIOS** features
 unrelated to Windows Game Mode; they hard-disable SMT and the second CCD at boot.
@@ -311,8 +327,17 @@ Being specific here rather than implying more coverage than exists.
 - **That Game Optimizer is not the only program on this machine writing default CPU Sets.**
   50 processes were found carrying an assignment Game Optimizer had not made (no config on disk,
   empty journal, nothing in the log); cleared, they came back within 75 seconds with nothing of
-  ours running. Something else — plausibly the AMD 3D V-Cache stack, **not proven** — assigns
-  processes to the second CCD. Since this API is last-writer-wins with no ownership and no
+  ours running. Something else assigns processes to the second CCD.
+
+  An earlier version of this note named the AMD 3D V-Cache stack as the likely culprit, while
+  saying it was not proven. **That suspect has since been examined and cleared.** None of the three
+  V-Cache binaries — the service, the per-session agent, or the kernel driver — contains the name
+  of `SetProcessDefaultCpuSets`, `SetThreadSelectedCpuSets` or `SetProcessAffinityMask`, either as
+  an imported function or as a string that could be resolved at run time; a positive control
+  confirms the search does find other API names in the same files. The V-Cache agent's only
+  outbound call is a single device request that ends at firmware, not at the Windows scheduler.
+  **What writes those masks is once again unknown**, and naming a new suspect without evidence is
+  how the last one got there. Since this API is last-writer-wins with no ownership and no
   notification, that program and Game Optimizer can silently overwrite each other. Game Optimizer
   only ever clears masks it applied itself, and has no "clear everything" action, precisely
   because clearing is indiscriminate.
