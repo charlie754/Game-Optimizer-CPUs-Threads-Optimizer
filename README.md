@@ -4,8 +4,6 @@
 
 ![Game Optimizer in use](video/gameoptimizer.gif)
 
-Settings window, recorded on the author's machine.
-
 Per-game CPU Set isolation for split-topology CPUs — the isolation of BIOS "Turbo Game Mode",
 applied only to the game you chose, and only while it is running.
 
