@@ -115,6 +115,15 @@ void ClassifyTopology(Topology& t);
 // are always last. A "no SMT" variant is omitted when it would equal its parent.
 std::vector<Mask> DeriveMasks(const Topology& t);
 
+// Pure. True for any name DeriveMasks can emit on ANY machine: All, All no SMT, Cache, P-cores,
+// E-cores, CCD followed by one or more decimal digits (CCD0, CCD1, ...), and the " no SMT"
+// variant of each domain name (Cache no SMT, CCD0 no SMT, P-cores no SMT, E-cores no SMT) that
+// DeriveMasks emits whenever the domain has SMT. Case-insensitive (the same ordinal comparison
+// IEquals makes), because FindMask and the merge compare that way. The Core map refuses these
+// as custom names everywhere, not only where the live topology emits them, so a config that
+// moves to different hardware can never collide with a freshly derived mask.
+bool IsDerivableMaskName(const std::wstring& name);
+
 // Pure. Keeps the lowest LogicalProcessorIndex of each distinct CoreIndex present in `ids`.
 // Input and output are both CPU Set Ids.
 std::vector<ULONG> ReduceToNoSmt(const Topology& t, const std::vector<ULONG>& ids);

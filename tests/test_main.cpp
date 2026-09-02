@@ -35,6 +35,7 @@
 #include "config.h"
 #include "engine.h"
 #include "mask_merge.h"
+#include "mask_edit.h"
 #include "procwatch.h"
 #include "settings_environment.h"
 #include "settings_heavy_order.h"
@@ -166,6 +167,17 @@ std::string Show(cd::Confidence c) {
         case cd::Confidence::High: return "Confidence::High";
     }
     return "Confidence::<bad>";
+}
+
+std::string Show(cd::MaskNameProblem p) {
+    switch (p) {
+        case cd::MaskNameProblem::None: return "MaskNameProblem::None";
+        case cd::MaskNameProblem::Empty: return "MaskNameProblem::Empty";
+        case cd::MaskNameProblem::Duplicate: return "MaskNameProblem::Duplicate";
+        case cd::MaskNameProblem::ReservedDerivedName:
+            return "MaskNameProblem::ReservedDerivedName";
+    }
+    return "MaskNameProblem::<bad>";
 }
 
 void Fail(const char* file, int line, const char* expr, const std::string& got,
@@ -3554,6 +3566,207 @@ void Test_R5_TheSecondProbeOfAnUnchangedRunIsSilent() {
     CHECK(cd::AgentSeenFrom(false) == cd::AgentSeen::Absent);
 }
 
+// ===========================================================================
+// V. Naming a custom mask (mask_edit.h). Written from the header comments and from
+// docs\superpowers\specs\2026-08-31-custom-masks-design.md section 5.
+// ===========================================================================
+
+void Test_V1_EmptyAndWhitespaceOnlyNamesAreEmpty() {
+    Case("V1 empty and whitespace-only names are rejected as Empty");
+    const std::vector<cd::Mask> none;
+    CHECK_EQ(cd::ValidateNewMaskName(L"", none, none), cd::MaskNameProblem::Empty);
+    CHECK_EQ(cd::ValidateNewMaskName(L" ", none, none), cd::MaskNameProblem::Empty);
+    CHECK_EQ(cd::ValidateNewMaskName(L"   ", none, none), cd::MaskNameProblem::Empty);
+    CHECK_EQ(cd::ValidateNewMaskName(L"\t \r\n", none, none), cd::MaskNameProblem::Empty);
+    // Empty is checked FIRST: a blank name is Empty even when the lists could match it.
+    const std::vector<cd::Mask> blank = {MakeMask(L"", {256u}, true)};
+    CHECK_EQ(cd::ValidateNewMaskName(L"", blank, blank), cd::MaskNameProblem::Empty);
+}
+
+void Test_V2_CaseInsensitiveDuplicateOfExistingMask() {
+    Case("V2 \"cache\" duplicates an existing \"Cache\" (case-insensitive)");
+    const std::vector<cd::Mask> existing = {
+        MakeMask(L"Cache", {256u, 257u}, true),
+        MakeMask(L"All", {256u, 257u, 258u}, true),
+    };
+    // Deliberately empty, so only the Duplicate rule can produce a rejection here.
+    const std::vector<cd::Mask> derived;
+    CHECK_EQ(cd::ValidateNewMaskName(L"cache", existing, derived),
+             cd::MaskNameProblem::Duplicate);
+    CHECK_EQ(cd::ValidateNewMaskName(L"CACHE", existing, derived),
+             cd::MaskNameProblem::Duplicate);
+    CHECK_EQ(cd::ValidateNewMaskName(L"Cache", existing, derived),
+             cd::MaskNameProblem::Duplicate);
+    // Trimming happens before the comparison.
+    CHECK_EQ(cd::ValidateNewMaskName(L"  cache  ", existing, derived),
+             cd::MaskNameProblem::Duplicate);
+    // A hand-made existing mask is protected exactly like a derived one.
+    const std::vector<cd::Mask> custom = {MakeMask(L"Streaming", {257u}, false)};
+    CHECK_EQ(cd::ValidateNewMaskName(L"streaming", custom, derived),
+             cd::MaskNameProblem::Duplicate);
+}
+
+void Test_V3_NameDeriveMasksEmitsIsReserved() {
+    Case("V3 a name DeriveMasks emits for this machine is reserved even when absent today");
+    const std::vector<cd::Mask> derived = cd::DeriveMasks(MakeSymmetricDualCcd());
+    CHECK(MaskNamed(derived, L"CCD0") != nullptr);  // guard: the helper really emits it
+    const std::vector<cd::Mask> existing;            // no mask of that name exists yet
+    CHECK_EQ(cd::ValidateNewMaskName(L"CCD0", existing, derived),
+             cd::MaskNameProblem::ReservedDerivedName);
+    CHECK_EQ(cd::ValidateNewMaskName(L"ccd0", existing, derived),
+             cd::MaskNameProblem::ReservedDerivedName);
+    CHECK_EQ(cd::ValidateNewMaskName(L"CCD0 no SMT", existing, derived),
+             cd::MaskNameProblem::ReservedDerivedName);
+    // Duplicate is checked BEFORE Reserved when both would fire.
+    const std::vector<cd::Mask> already = {MakeMask(L"CCD0", {256u}, true)};
+    CHECK_EQ(cd::ValidateNewMaskName(L"ccd0", already, derived),
+             cd::MaskNameProblem::Duplicate);
+}
+
+void Test_V4_FreshNameIsAcceptedAndTrimmed() {
+    Case("V4 a fresh name passes, and TrimMaskName strips both ends");
+    const std::vector<cd::Mask> derived = cd::DeriveMasks(MakeSymmetricDualCcd());
+    const std::vector<cd::Mask> existing = {MakeMask(L"Streaming", {257u}, false)};
+    CHECK_EQ(cd::ValidateNewMaskName(L"Recording", existing, derived),
+             cd::MaskNameProblem::None);
+    CHECK_EQ(cd::ValidateNewMaskName(L"  Recording  ", existing, derived),
+             cd::MaskNameProblem::None);
+    CHECK_EQ(cd::TrimMaskName(L"  Recording \t"), std::wstring(L"Recording"));
+    CHECK_EQ(cd::TrimMaskName(L"\r\nRecording"), std::wstring(L"Recording"));
+    CHECK_EQ(cd::TrimMaskName(L"Recording"), std::wstring(L"Recording"));
+    CHECK_EQ(cd::TrimMaskName(L"Two words "), std::wstring(L"Two words"));  // inner kept
+    CHECK_EQ(cd::TrimMaskName(L"   "), std::wstring());
+    CHECK_EQ(cd::TrimMaskName(L""), std::wstring());
+}
+
+void Test_V5_ProfilesReferencingMaskListsEachOnceInConfigOrder() {
+    Case("V5 ProfilesReferencingMask: every referencing profile once, in config order");
+    cd::Config c;
+    auto add = [&](const wchar_t* name, const wchar_t* game, const wchar_t* heavy) {
+        cd::Profile p;
+        p.name = name;
+        p.gameMask = game;
+        p.heavyMask = heavy;
+        c.profiles.push_back(p);
+    };
+    add(L"Overwatch", L"Streaming", L"All");   // game only
+    add(L"Untouched", L"CCD0", L"All");        // neither
+    add(L"Compile", L"CCD0", L"streaming");    // heavy only, different case
+    add(L"Both", L"Streaming", L"Streaming");  // both roles - listed once
+
+    const std::vector<std::wstring> want = {L"Overwatch", L"Compile", L"Both"};
+    CHECK_EQ(cd::ProfilesReferencingMask(c, L"Streaming"), want);
+    CHECK_EQ(cd::ProfilesReferencingMask(c, L"STREAMING"), want);
+    CHECK_EQ(cd::ProfilesReferencingMask(c, L"Nobody"), std::vector<std::wstring>());
+    const std::vector<std::wstring> allUsers = {L"Overwatch", L"Untouched"};
+    CHECK_EQ(cd::ProfilesReferencingMask(c, L"All"), allUsers);
+}
+
+void Test_V8_CanRemoveMaskOnlyForCustomMasks() {
+    Case("V8 CanRemoveMask: null -> false, derived -> false, custom -> true, derived NAME -> false");
+    // What DeriveMasks would emit for this machine; the predicate must refuse these names
+    // whatever flag the selected mask carries.
+    const std::vector<cd::Mask> derivedList = {
+        MakeMask(L"CCD0", {256u}, true),
+        MakeMask(L"Cache", {256u, 257u}, true),
+    };
+    CHECK(!cd::CanRemoveMask(nullptr, derivedList));
+    const cd::Mask derived = MakeMask(L"CCD0", {256u}, true);
+    CHECK(!cd::CanRemoveMask(&derived, derivedList));
+    const cd::Mask custom = MakeMask(L"Streaming", {257u}, false);
+    CHECK(cd::CanRemoveMask(&custom, derivedList));
+    // A hand-edited derived mask reports derived == false (the Core map write-back clears the
+    // flag on any edit) but keeps its name. The merge that would re-derive it runs only on a
+    // topology-signature change, so on the same hardware a removed "CCD0" is gone for good and
+    // Add then refuses the name as reserved. The predicate therefore keys on the NAME as well
+    // as the flag - case-insensitively, because FindMask and the merge compare with IEquals.
+    // (This case used to assert true, when the rule keyed on the flag alone.)
+    const cd::Mask editedDerivedName = MakeMask(L"ccd0", {258u}, false);
+    CHECK(!cd::CanRemoveMask(&editedDerivedName, derivedList));
+}
+
+void Test_V9_DerivableNamesAreReservedEverywhere() {
+    Case("V9 derivable names are reserved on EVERY machine, even when this one emits none");
+    // Empty existing list and empty derived list: the only thing that can refuse a name is the
+    // machine-independent vocabulary check, so each ReservedDerivedName below proves that check
+    // alone. Founder ruling 2026-09-01 ("Reserve all"): a custom "Cache" made on a single-domain
+    // CPU used to be accepted, and won the merge as the hardware domain the day the config moved
+    // to an X3D part.
+    const std::vector<cd::Mask> none;
+    const auto v = [&none](const wchar_t* raw) { return cd::ValidateNewMaskName(raw, none, none); };
+    const cd::MaskNameProblem reserved = cd::MaskNameProblem::ReservedDerivedName;
+    const cd::MaskNameProblem ok = cd::MaskNameProblem::None;
+    CHECK(v(L"Cache") == reserved);
+    CHECK(v(L"cache") == reserved);
+    CHECK(v(L"CCD0") == reserved);
+    CHECK(v(L"ccd12") == reserved);
+    CHECK(v(L"P-cores") == reserved);
+    CHECK(v(L"e-cores") == reserved);
+    CHECK(v(L"All") == reserved);
+    CHECK(v(L"all no smt") == reserved);
+    CHECK(v(L"  CCD3  ") == reserved);  // trimmed before the check, like every other name
+    // DeriveMasks also emits "<label> no SMT" beside every domain label (topology.cpp,
+    // `groups[i].label + L" no SMT"`), so those are reserved too.
+    CHECK(v(L"Cache no SMT") == reserved);
+    CHECK(v(L"ccd1 no smt") == reserved);
+    CHECK(v(L"P-cores no SMT") == reserved);
+    CHECK(v(L"E-cores no SMT") == reserved);
+    // The Freq family, on an AmdAsymmetricCache part: every domain that is not the largest L3
+    // is "Freq", "Freq 2", "Freq 3", ... (topology.cpp:203-204), each with a " no SMT" twin.
+    // THIS WHOLE FAMILY WAS MISSED ON THE FIRST PASS BECAUSE THE LABEL IS BUILT WITH A TERNARY
+    // (`g.label = (freqSeq == 1) ? std::wstring(L"Freq") : (L"Freq " + std::to_wstring(...))`)
+    // RATHER THAN A PLAIN STRING LITERAL, so the grep for `label = L"` that enumerated the
+    // vocabulary could not see it - and README.md documents `Freq` / `Freq no SMT` as derived
+    // masks on a 9950X3D the whole time. A vocabulary check is only as complete as the sweep
+    // that built it.
+    CHECK(v(L"Freq") == reserved);
+    CHECK(v(L"freq") == reserved);
+    CHECK(v(L"Freq 2") == reserved);
+    CHECK(v(L"Freq 10") == reserved);
+    CHECK(v(L"Freq no SMT") == reserved);
+    CHECK(v(L"Freq 2 no SMT") == reserved);
+    CHECK(v(L"FREQ NO SMT") == reserved);
+    // Not derivable: CCD needs at least one digit and nothing after them, and the suffix alone
+    // reserves nothing.
+    CHECK(v(L"CCD") == ok);
+    CHECK(v(L"CCDx") == ok);
+    CHECK(v(L"CCD 0") == ok);
+    CHECK(v(L"Streaming") == ok);
+    CHECK(v(L"Cache2") == ok);
+    CHECK(v(L"Streaming no SMT") == ok);
+    // Freq needs the single space to_wstring is appended after, then digits and nothing else.
+    // None of these four is a name BaseGroups can emit, so none may be taken from the user.
+    CHECK(v(L"Freq2") == ok);
+    CHECK(v(L"Freqx") == ok);
+    CHECK(v(L"Freq x") == ok);
+    CHECK(v(L"Frequency") == ok);
+    CHECK(cd::IsDerivableMaskName(L"CCD7"));
+    CHECK(!cd::IsDerivableMaskName(L"ccd"));
+    CHECK(!cd::IsDerivableMaskName(L"CCD-1"));
+    CHECK(cd::IsDerivableMaskName(L"Freq 3"));
+    CHECK(!cd::IsDerivableMaskName(L"Freq "));  // prefix alone, no index: never emitted
+}
+
+void Test_V6_TopologyChangedPreservedSentence() {
+    Case("V6 topology-changed sentence: silent at zero, names the count otherwise");
+    CHECK_EQ(cd::TopologyChangedPreservedSentence(0), std::wstring());
+
+    const std::wstring one = cd::TopologyChangedPreservedSentence(1);
+    const std::wstring three = cd::TopologyChangedPreservedSentence(3);
+    CHECK(!one.empty());
+    CHECK(!three.empty());
+    CHECK(one.find(L"1 custom mask") != std::wstring::npos);
+    CHECK(three.find(L"3 custom masks") != std::wstring::npos);
+
+    // Pinned wording. The sentence is appended to a MessageBox nobody can assert on.
+    CHECK_EQ(one, std::wstring(L"1 custom mask you created was kept, but the processor "
+                               L"numbers inside it may now refer to different cores - open "
+                               L"the Core map and check it."));
+    CHECK_EQ(three, std::wstring(L"3 custom masks you created were kept, but the processor "
+                                 L"numbers inside them may now refer to different cores - "
+                                 L"open the Core map and check each one."));
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -3636,6 +3849,16 @@ int main() {
     Test_U3_RestoreControlAppearsOnlyForUsersTheOldFeatureStranded();
     Test_U4_ParkedWarningNoLongerClaimsStoppingTheServiceIsUseless();
     Test_U5_StoppingDisablesAndClearingRestoresAmdsOwnDefault();
+
+    std::printf("\n== V. Naming a custom mask ==\n");
+    Test_V1_EmptyAndWhitespaceOnlyNamesAreEmpty();
+    Test_V2_CaseInsensitiveDuplicateOfExistingMask();
+    Test_V3_NameDeriveMasksEmitsIsReserved();
+    Test_V4_FreshNameIsAcceptedAndTrimmed();
+    Test_V5_ProfilesReferencingMaskListsEachOnceInConfigOrder();
+    Test_V6_TopologyChangedPreservedSentence();
+    Test_V8_CanRemoveMaskOnlyForCustomMasks();
+    Test_V9_DerivableNamesAreReservedEverywhere();
 
     std::printf("\n== H. Live environment wording ==\n");
     Test_H1_GameModeEnvironmentWordingCoversEveryState();

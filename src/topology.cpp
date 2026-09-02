@@ -689,6 +689,70 @@ std::vector<Mask> DeriveMasks(const Topology& t) {
 }
 
 // ---------------------------------------------------------------------------
+// IsDerivableMaskName - pure
+// ---------------------------------------------------------------------------
+
+// Case-insensitive ordinal equality, the comparison util.cpp's IEquals makes. Spelled out here
+// because this TU does not depend on util.h, and a new include for one call is how header
+// cycles start.
+static bool NameEqualsNoCase(const std::wstring& a, const wchar_t* b) {
+    return ::CompareStringOrdinal(a.c_str(), static_cast<int>(a.size()), b, -1, TRUE) ==
+           CSTR_EQUAL;
+}
+
+// `prefix` (compared case-insensitively) followed by one or more ASCII decimal digits and
+// nothing else. Shared by the "CCD" + index and "Freq " + index branches below. The trailing
+// space is part of the Freq prefix and is NOT part of the CCD one, because BaseGroups builds
+// the two names differently: L"CCD" + to_wstring(i) at :225 versus L"Freq " + to_wstring(seq)
+// at :204. Passing the prefix in verbatim keeps that difference in one place.
+static bool PrefixThenDigitsNoCase(const std::wstring& s, const wchar_t* prefix,
+                                   size_t prefixLen) {
+    if (s.size() <= prefixLen) return false;  // prefix alone is not a name DeriveMasks emits
+    if (!NameEqualsNoCase(s.substr(0, prefixLen), prefix)) return false;
+    for (size_t i = prefixLen; i < s.size(); ++i) {
+        if (s[i] < L'0' || s[i] > L'9') return false;
+    }
+    return true;
+}
+
+bool IsDerivableMaskName(const std::wstring& name) {
+    // DeriveMasks emits "<label> no SMT" beside every domain label, so strip that suffix first
+    // and test the base. THE BASE VOCABULARY IS THE COMPLETE SET OF LITERALS BaseGroups AND
+    // DeriveMasks CAN PRODUCE - every one of them, or the founder's "reserve all" ruling is
+    // only half implemented:
+    //
+    //   "All"                topology.cpp:678  (DeriveMasks, every machine)
+    //   "P-cores"            topology.cpp:155  (IntelHybrid)
+    //   "E-cores"            topology.cpp:157  (IntelHybrid)
+    //   "Cache"              topology.cpp:200  (AmdAsymmetricCache, the largest-L3 domain)
+    //   "Freq", "Freq 2", ... topology.cpp:203-204  (AmdAsymmetricCache, every OTHER domain;
+    //                        built with a ternary, so a grep for `label = L"` cannot see it -
+    //                        which is exactly how this family was missed the first time)
+    //   "CCD0", "CCD1", ...  topology.cpp:225  (MultiCcdSymmetric)
+    //
+    // plus the " no SMT" suffix appended to any of the above at topology.cpp:663 (domain
+    // labels) and :681 ("All no SMT").
+    static const wchar_t kNoSmt[] = L" no SMT";
+    const size_t noSmtLen = 7;  // wcslen(kNoSmt)
+    std::wstring base = name;
+    if (base.size() > noSmtLen &&
+        NameEqualsNoCase(base.substr(base.size() - noSmtLen), kNoSmt)) {
+        base.erase(base.size() - noSmtLen);
+    }
+    if (NameEqualsNoCase(base, L"All") || NameEqualsNoCase(base, L"Cache") ||
+        NameEqualsNoCase(base, L"P-cores") || NameEqualsNoCase(base, L"E-cores") ||
+        NameEqualsNoCase(base, L"Freq")) {
+        return true;
+    }
+    // "CCD" followed by at least one ASCII decimal digit and nothing else. "CCD" alone, "CCDx"
+    // and "CCD 0" are not names DeriveMasks can produce.
+    if (PrefixThenDigitsNoCase(base, L"CCD", 3)) return true;
+    // "Freq " - with the single space to_wstring is appended after - followed by at least one
+    // digit and nothing else. "Freq2", "Freq x", "Freqx" and "Freq " alone are not emitted.
+    return PrefixThenDigitsNoCase(base, L"Freq ", 5);
+}
+
+// ---------------------------------------------------------------------------
 // ReduceToNoSmt - pure
 // ---------------------------------------------------------------------------
 

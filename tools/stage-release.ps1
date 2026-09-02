@@ -244,8 +244,22 @@ Write-Host "Package contents total: $([math]::Round($TotalSize / 1KB, 2)) KB"
 Write-Host "Zip file: $ZipPath"
 Write-Host "Zip size: $ZipSizeMB MB ($ZipSizeKB KB)"
 
-# Calculate SHA256
-$SHA256 = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
-Write-Host "SHA256:   $SHA256"
+# Calculate SHA256 of BOTH published artifacts.
+#
+# The exe is hashed as well as the zip because the one real field report was a Defender toast
+# on a bare GameOptimizer.exe that the user had already unpacked and kept on its own. They have
+# no zip left to hash, so a zip-only hash is unverifiable for exactly the person who needs it.
+# README.md's "If Windows Defender flags it" section tells users that BOTH hashes are in the
+# release notes - so both must be printed here, and both must be pasted there.
+#
+# Hash the STAGED exe ($StagedExePath, verified above to exist beside WebView2Loader.dll) and
+# never build\GameOptimizer.exe: only the staged copy is provably the bits that went into the
+# zip that shipped.
+$ZipSHA256 = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
+$ExeSHA256 = (Get-FileHash $StagedExePath -Algorithm SHA256).Hash
+Write-Host ""
+Write-Host "Paste BOTH of these into the GitHub release notes:"
+Write-Host "  SHA256 (zip)  GameOptimizer-v$Version-x64.zip : $ZipSHA256"
+Write-Host "  SHA256 (exe)  GameOptimizer.exe               : $ExeSHA256"
 Write-Host ""
 Write-Host "Staging complete: GameOptimizer-v$Version-x64.zip"

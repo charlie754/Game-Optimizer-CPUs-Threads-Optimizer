@@ -32,6 +32,8 @@
 #include "config.h"
 #include "games.h"
 #include "topology.h"
+#include "mask_merge.h"
+#include "mask_edit.h"
 #include "procwatch.h"
 #include "applier.h"
 #include "util.h"
@@ -850,8 +852,9 @@ bool RegisterAndCreateWindow() {
 
 // ---- Startup steps ---------------------------------------------------------
 // Everything that can fail on a strange machine. Returns with g_cfg usable in every case.
-void LoadEverything(bool& outTopologyChanged) {
-    outTopologyChanged = false;
+void LoadEverything(bool& outTopologyChanged, size_t& outPreservedCustomMasks) {
+    outTopologyChanged      = false;
+    outPreservedCustomMasks = 0;
 
     g_topoOk = DetectTopology(g_topo, &g_topoError);
     if (!g_topoOk) {
@@ -901,7 +904,19 @@ void LoadEverything(bool& outTopologyChanged) {
         LogLine(L"[main] topology signature changed: '%s' -> '%s', re-deriving masks",
                 g_cfg.topologySignature.c_str(), g_topo.signature.c_str());
 
-        g_cfg.masks = DeriveMasks(g_topo);
+        // Derived wins on a name collision: a stale custom mask must never shadow what the
+        // live hardware supports. Non-colliding custom masks are kept after the derived ones.
+        const std::vector<Mask> derived = DeriveMasks(g_topo);
+        size_t customBefore = 0;
+        for (size_t i = 0; i < g_cfg.masks.size(); ++i) {
+            if (!g_cfg.masks[i].derived) ++customBefore;
+        }
+        g_cfg.masks = MergeMasksPreservingCustom(derived, g_cfg.masks);
+        const size_t preserved = g_cfg.masks.size() - derived.size();
+        outPreservedCustomMasks = preserved;
+        LogLine(L"[main] re-derive kept %u custom mask(s), dropped %u by name collision",
+                static_cast<unsigned>(preserved),
+                static_cast<unsigned>(customBefore - preserved));
         for (size_t i = 0; i < g_cfg.profiles.size(); ++i) {
             Profile& p = g_cfg.profiles[i];
             if (!p.gameMask.empty() && g_cfg.FindMask(p.gameMask) == nullptr) {
@@ -991,9 +1006,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
 
     // ---- Load, in the fixed order ------------------------------------------
     bool topologyChanged = false;
+    size_t preservedCustomMasks = 0;
     std::wstring startupFailure;
     try {
-        LoadEverything(topologyChanged);
+        LoadEverything(topologyChanged, preservedCustomMasks);
     } catch (const std::exception& e) {
         g_topoOk       = false;
         startupFailure = Widen(e.what());
@@ -1050,13 +1066,15 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
         StartForegroundTracking();
 
         if (topologyChanged) {
-            MessageBoxW(g_hwnd,
-                        L"This machine's CPU layout has changed since Game Optimizer last "
-                        L"ran - a BIOS update, a CPU swap or a core-count change will do "
-                        L"it.\n\nThe CPU Set masks have been re-derived from the live "
-                        L"hardware. Your profiles were kept; check that each one still "
-                        L"names the mask you want.",
-                        kAppTitle, MB_OK | MB_ICONINFORMATION);
+            std::wstring msg =
+                L"This machine's CPU layout has changed since Game Optimizer last "
+                L"ran - a BIOS update, a CPU swap or a core-count change will do "
+                L"it.\n\nThe CPU Set masks have been re-derived from the live "
+                L"hardware. Your profiles were kept; check that each one still "
+                L"names the mask you want.";
+            const std::wstring kept = TopologyChangedPreservedSentence(preservedCustomMasks);
+            if (!kept.empty()) msg += L"\n\n" + kept;
+            MessageBoxW(g_hwnd, msg.c_str(), kAppTitle, MB_OK | MB_ICONINFORMATION);
         }
 
         wizardWasShown = !g_cfg.firstRunDone;

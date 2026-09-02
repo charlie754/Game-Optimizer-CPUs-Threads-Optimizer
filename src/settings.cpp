@@ -26,6 +26,7 @@
 #include "applier.h"
 #include "config.h"
 #include "engine.h"
+#include "mask_edit.h"
 #include "procwatch.h"
 #include "settings_environment.h"
 #include "settings_heavy_order.h"
@@ -830,6 +831,10 @@ enum : int {
 // Added separately so the stable control ids above keep their numeric values.
 enum : int { IDC_VCACHE_MANAGE = 1600, IDC_VCACHE_RESTORE = 1601 };
 
+// The Core map page's "Add mask..." / "Remove mask" buttons. Their own block, above every
+// id that WM_COMMAND already dispatches on, so nothing existing shifts.
+enum : int { IDC_MAPADD = 1700, IDC_MAPREMOVE = 1701 };
+
 enum : int { PAGE_PROFILES = 0, PAGE_COREMAP, PAGE_GENERAL, PAGE_COUNT };
 
 const wchar_t kSettingsClass[] = L"GameOptimizerSettings";
@@ -1002,6 +1007,9 @@ struct SettingsState {
     HWND hPctLbl = nullptr, hPct = nullptr;
     HWND hMapHdr = nullptr, hTopoText = nullptr;
     HWND hMapMaskLbl = nullptr, hMapMask = nullptr, hMapReset = nullptr, hMap = nullptr;
+    // "Add mask..." names a copy of the selected mask; "Remove mask" is live only for a
+    // mask the user made (CanRemoveMask). Neither places a thread anywhere.
+    HWND hMapAdd = nullptr, hMapRemove = nullptr;
     // Stand-in shown in the core map's slot when the control could not be created. Exactly
     // one of hMap / hMapFail is ever non-null, and they occupy the same rectangle.
     HWND hMapFail = nullptr;
@@ -2407,7 +2415,19 @@ void OnVCacheManageToggle(SettingsState* st, HWND hwnd) {
     }
 }
 
+// "Remove mask" follows the selection: live for a hand-made mask, dead for a derived one
+// (design 5.4). Dead also for a hand-EDITED derived mask, which reports derived == false but
+// still carries a name DeriveMasks emits for this machine: the merge that would bring it back
+// runs only on a topology-signature change, so on the same hardware a removed derived name is
+// gone for good and Add then refuses it as reserved. Same predicate as OnRemoveMask.
+void SyncMapRemoveEnable(SettingsState* st) {
+    if (!st->hMapRemove) return;
+    const Mask* m = st->work.FindMask(ComboText(st->hMapMask));
+    EnableWindow(st->hMapRemove, CanRemoveMask(m, DeriveMasks(*st->topo)) ? TRUE : FALSE);
+}
+
 void SelectMapMask(SettingsState* st) {
+    SyncMapRemoveEnable(st);
     if (!st->hMap) return;
     std::wstring name = ComboText(st->hMapMask);
     const Mask* m = st->work.FindMask(name);
@@ -3270,7 +3290,17 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         iy += LH + GT;
         Put(st->hMapMaskLbl, ix, iy + (ROW - LH) / 2, LBL, LH);
         Put(st->hMapMask, ix + LBL, iy + (ROW - RH) / 2, CBW, CBDROP);
-        Put(st->hMapReset, ix + LBL + CBW + GT, iy, theme::Dp(150, dpi), BH);
+        {
+            // Reset / Add / Remove share the rest of the row. Each is at most the width
+            // Reset had alone, and never narrower than a readable caption.
+            const int bx = ix + LBL + CBW + GT;
+            const int avail = ix + iw - bx;
+            int bw = (std::min)(theme::Dp(150, dpi), (avail - 2 * GT) / 3);
+            bw = (std::max)(bw, theme::Dp(96, dpi));
+            Put(st->hMapReset, bx, iy, bw, BH);
+            Put(st->hMapAdd, bx + bw + GT, iy, bw, BH);
+            Put(st->hMapRemove, bx + 2 * (bw + GT), iy, bw, BH);
+        }
         iy += ROW + GT;
         Put(st->hMap, ix, iy, iw, mapH);
         Put(st->hMapFail, ix, iy, iw, mapH);   // only ever one of the two exists
@@ -3701,7 +3731,7 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
                         st->hAutoPin, st->hAutoDesc, st->hPctLbl, st->hPct,
                         st->hAutoStatus };
     HWND coremap[]  = { st->hMapHdr, st->hTopoText, st->hMapMaskLbl, st->hMapMask,
-                        st->hMapReset, st->hMap, st->hMapFail };
+                        st->hMapReset, st->hMapAdd, st->hMapRemove, st->hMap, st->hMapFail };
     HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify,
                         st->hVCacheManage, st->hPollLbl, st->hPoll,
                         st->hGameModeStatus, st->hVCacheStatus, st->hVCacheRestoreHint,
@@ -3999,6 +4029,112 @@ void OnResetMask(SettingsState* st, HWND hwnd) {
     RepaintChrome(hwnd);             // and the "In this mask" gauge is drawn from its ids
 }
 
+// The mask list changed shape, so every combo that lists masks is rebuilt. The two profile
+// combos keep whatever they showed (a profile references a mask by NAME, and the name of
+// an existing mask never changes here); the map combo lands on `mapSelect`.
+void RefillMaskCombos(SettingsState* st, const std::wstring& mapSelect) {
+    FillMaskCombo(st->hGameMask, st->work, ComboText(st->hGameMask));
+    FillMaskCombo(st->hHeavyMask, st->work, ComboText(st->hHeavyMask));
+    FillMaskCombo(st->hMapMask, st->work, mapSelect);
+    if (SendMessageW(st->hMapMask, CB_GETCURSEL, 0, 0) == CB_ERR && !st->work.masks.empty())
+        SendMessageW(st->hMapMask, CB_SETCURSEL, 0, 0);
+}
+
+// "Add mask...": a NAME for a set of logical processors, nothing more. The new mask starts
+// as a copy of the mask being edited (design 5.1 - an empty mask is not a usable start,
+// and an empty assignment is how this app CLEARS a mask, see applier.cpp). It is
+// derived == false from birth: it was never derived from anything.
+void OnAddMask(SettingsState* st, HWND hwnd) {
+    const std::wstring current = ComboText(st->hMapMask);
+    const Mask* src = st->work.FindMask(current);
+    if (!src) {
+        MessageBoxW(hwnd,
+                    L"Choose the mask to copy first. A new mask starts as a copy of the mask "
+                    L"being edited.",
+                    L"Game Optimizer", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    std::wstring raw;
+    if (!PromptName(hwnd, L"Name for the new mask:", raw)) return;
+
+    const wchar_t* problem = nullptr;
+    switch (ValidateNewMaskName(raw, st->work.masks, DeriveMasks(*st->topo))) {
+        case MaskNameProblem::None:
+            break;
+        case MaskNameProblem::Empty:
+            problem = L"The mask name is empty.";
+            break;
+        case MaskNameProblem::Duplicate:
+            problem = L"A mask with that name already exists. Mask names are compared "
+                      L"without regard to case.";
+            break;
+        case MaskNameProblem::ReservedDerivedName:
+            // Do NOT recite the refused set item by item. The previous wording listed fewer
+            // categories than IsDerivableMaskName actually refuses: it omitted Freq entirely
+            // and showed "no SMT" on All alone, when every base has a "no SMT" form. Name the
+            // bases, then say the suffix applies to all of them - a short true statement beats
+            // a long list that drifts out of date the next time BaseGroups gains a label.
+            problem = L"That name is reserved for the masks Game Optimizer detects on its own "
+                      L"(All, Cache, Freq, CCD0 and so on, P-cores, E-cores - each of those "
+                      L"also has a \"no SMT\" form). Choose a different name.";
+            break;
+    }
+    if (problem) {
+        MessageBoxW(hwnd, problem, L"Game Optimizer", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    // Copy the ids BEFORE push_back: `src` points into the vector being grown.
+    Mask added{ TrimMaskName(raw), src->ids, false };
+    st->work.masks.push_back(added);
+    RefillMaskCombos(st, added.name);
+    SelectMapMask(st);
+    RelayoutIfWarningsChanged(st);
+    RepaintChrome(hwnd);   // the stat row names and measures the selected mask
+}
+
+// "Remove mask": only a hand-made mask, and never one a profile still names (design 5.4 -
+// those profiles would drop onto a default mask, the exact harm a custom mask avoids).
+void OnRemoveMask(SettingsState* st, HWND hwnd) {
+    // A mask just picked in the Profiles page's Game/Heavy-mask combo is not in st->work until
+    // StoreUiToProfile runs (neither SwitchPage nor CBN_SELCHANGE stores it), so without this
+    // the reference check below could say "No profile uses it" for a mask the user can SEE
+    // selected. No-op with no profile selected; st->work is the copy Cancel discards anyway.
+    StoreUiToProfile(st);
+
+    const std::wstring name = ComboText(st->hMapMask);
+    const Mask* m = st->work.FindMask(name);
+    if (!CanRemoveMask(m, DeriveMasks(*st->topo))) return;
+
+    const std::vector<std::wstring> refs = ProfilesReferencingMask(st->work, name);
+    if (!refs.empty()) {
+        std::wstring msg = L"The mask \"" + name + L"\" is still used by ";
+        msg += refs.size() == 1 ? L"this profile:\r\n\r\n" : L"these profiles:\r\n\r\n";
+        for (const std::wstring& p : refs) msg += L"    " + p + L"\r\n";
+        msg += L"\r\nPoint those profiles at another mask first, then remove this one.";
+        MessageBoxW(hwnd, msg.c_str(), L"Game Optimizer", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    const std::wstring ask = L"Remove the mask \"" + name + L"\"?\r\n\r\nNo profile uses it. "
+                             L"This cannot be undone once the settings are applied.";
+    if (MessageBoxW(hwnd, ask.c_str(), L"Game Optimizer",
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+        return;
+    }
+
+    for (size_t i = 0; i < st->work.masks.size(); ++i) {
+        if (IEquals(st->work.masks[i].name, name)) {
+            st->work.masks.erase(st->work.masks.begin() + static_cast<ptrdiff_t>(i));
+            break;
+        }
+    }
+    RefillMaskCombos(st, st->work.masks.empty() ? std::wstring() : st->work.masks[0].name);
+    SelectMapMask(st);
+    RelayoutIfWarningsChanged(st);   // a profile combo may now show no selection
+    RepaintChrome(hwnd);
+}
+
 LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     SettingsState* st =
         reinterpret_cast<SettingsState*>(GetWindowLongPtrW(hwnd, GWLP_USERDATA));
@@ -4149,6 +4285,13 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             st->hMapReset = Mk(hwnd, L"BUTTON", L"Reset to detected",
                                BS_OWNERDRAW | WS_TABSTOP, IDC_MAPRESET);
             SetButtonKind(st->hMapReset, theme::ButtonKind::Secondary);
+            st->hMapAdd = Mk(hwnd, L"BUTTON", L"Add mask...",
+                             BS_OWNERDRAW | WS_TABSTOP, IDC_MAPADD);
+            SetButtonKind(st->hMapAdd, theme::ButtonKind::Secondary);
+            st->hMapRemove = Mk(hwnd, L"BUTTON", L"Remove mask",
+                                BS_OWNERDRAW | WS_TABSTOP, IDC_MAPREMOVE);
+            SetButtonKind(st->hMapRemove, theme::ButtonKind::Danger);
+            EnableWindow(st->hMapRemove, FALSE);   // SelectMapMask enables it per mask
             st->hMap = CreateWindowExW(0, kCoreMapClass, L"",
                                        WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                                        0, 0, 10, 10, hwnd,
@@ -4646,8 +4789,24 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     std::wstring name = ComboText(st->hMapMask);
                     Mask* m = st->work.FindMask(name);
                     if (m) {
-                        m->ids = CoreMapGetSelection(st->hMap);
+                        std::vector<ULONG> picked = CoreMapGetSelection(st->hMap);
+                        if (picked.empty()) {
+                            // Design 5.5: an EMPTY id list is how this app CLEARS an
+                            // assignment (applier.cpp, SetProcessDefaultCpuSets with no
+                            // ids), so an empty mask would not apply nothing - it would
+                            // read as a clear. Refuse it here, at edit time, and put the
+                            // mask's current ids back on the map.
+                            SelectMapMask(st);
+                            MessageBoxW(hwnd,
+                                        L"A mask must keep at least one processor. An empty "
+                                        L"selection is how a mask is cleared, not how one is "
+                                        L"applied, so the last processor was put back.",
+                                        L"Game Optimizer", MB_OK | MB_ICONWARNING);
+                            return 0;
+                        }
+                        m->ids = picked;
                         m->derived = false;
+                        SyncMapRemoveEnable(st);   // flag flipped; a derived NAME stays unremovable
                         // The mask the user just hand-edited may be the game or heavy mask,
                         // so its parked count may have just changed.
                         RelayoutIfWarningsChanged(st);
@@ -4815,6 +4974,12 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     return 0;
                 case IDC_MAPRESET:
                     OnResetMask(st, hwnd);
+                    return 0;
+                case IDC_MAPADD:
+                    OnAddMask(st, hwnd);
+                    return 0;
+                case IDC_MAPREMOVE:
+                    OnRemoveMask(st, hwnd);
                     return 0;
                 case IDC_VCACHE_MANAGE:
                     if (code == BN_CLICKED) OnVCacheManageToggle(st, hwnd);

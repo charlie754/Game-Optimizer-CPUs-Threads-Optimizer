@@ -216,6 +216,42 @@ what it does and produce the binary yourself. A copy you compiled locally does n
 the downloaded-file marker this check is keyed to, so the prompt is a thing downloaders meet
 rather than builders.
 
+## If Windows Defender flags it
+
+Some machines have shown a Defender toast for a Game Optimizer build - "Trojan:Win32 Cloxer" on an
+old development build, and "Trojan:Script Wacatac.H!ml" on a user's copy of a release. The "!ml"
+suffix marks a machine-learning verdict: no analyst looked at the file. The exe is not signed, it
+is new, few machines have seen it, and it does things a scanner scores as suspicious for a good
+reason - it enumerates processes, opens the game's process to set its CPU Sets, controls one
+AMD service on request, writes a Start-with-Windows entry when you ask for one, and relaunches a
+short-lived elevated copy of itself for the one action that needs administrator rights. None of
+that is hidden; all of it is in this repository.
+
+What to check before trusting any copy:
+
+1. The SHA256 of every release zip is printed in its GitHub release notes. Compare it with
+   `certutil -hashfile GameOptimizer-vX.Y.Z-x64.zip SHA256` on the file you downloaded. If you
+   already unpacked it and only have the loose exe, hash that instead with
+   `certutil -hashfile GameOptimizer.exe SHA256` - both hashes are published in the release
+   notes.
+2. If the hash matches and Defender still quarantines the exe, that is a false positive on this
+   build. You can report it to Microsoft at https://www.microsoft.com/en-us/wdsi/filesubmission
+   (choose "incorrectly detected", and set the submission priority to **Medium** - the form
+   says Medium gets an analyst review within a few days, while Low "may never be processed").
+   Expect a few days, and note that a review is not a promise: it may or may not clear the
+   detection, for you or for anyone else. Please also open an issue here with the detection
+   name and the date.
+3. Or build it yourself: `tools\build.bat` with the Visual Studio Build Tools gives you a
+   binary you compiled from these sources. It will **not** be byte-identical to the released
+   exe - the build is not reproducible bit for bit, so its SHA256 will differ and that is
+   expected. `tools\build.bat` currently expects the Build Tools at one hard-coded path and
+   stops if it is not there, so you may need to point it at your own `vcvars64.bat`.
+
+Defender's clean-up also deletes the Start-with-Windows entry it finds. After restoring or
+reinstalling, switch "Start with Windows" back on in Settings.
+
+Nothing here asks you to add an exclusion or turn Defender off.
+
 ## Use
 
 Double-click `GameOptimizer.exe`. The Settings window opens and the app gets a taskbar button,
