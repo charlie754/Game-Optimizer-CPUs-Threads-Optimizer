@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity type="win32" name="GameOptimizer" version="0.3.1.0" processorArchitecture="amd64"/>
+  <assemblyIdentity type="win32" name="GameOptimizer" version="0.3.2.0" processorArchitecture="amd64"/>
   <description>Game Optimizer - CPU threads optimizer. Per-game CPU Set isolation for split-topology CPUs.</description>
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>

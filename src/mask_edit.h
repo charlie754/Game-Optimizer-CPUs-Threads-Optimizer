@@ -26,6 +26,20 @@ inline std::wstring TrimMaskName(const std::wstring& raw) {
     return raw.substr(begin, end - begin);
 }
 
+// THE CAPTION OF THE "Add mask..." ROW THE PROFILES PAGE PUTS INSIDE ITS TWO MASK COMBOS,
+// so a mask can be created without leaving the page for the Core map.
+//
+// It lives HERE, beside the validator, rather than in settings.cpp because both sides need the
+// same string: the UI adds the row with it, and ValidateNewMaskName below refuses it as a mask
+// NAME. Two literals would drift apart the first time the wording changed, and the drift would
+// be invisible - the row would still draw and the name would silently become creatable again.
+//
+// The row itself is identified by its combo ITEM DATA, never by this text (settings.cpp,
+// kMaskItemAdd). Reserving the name is the second belt: a config written by hand, or by a build
+// older than this one, can still contain a mask called "Add mask...", and the item-data test is
+// what keeps THAT mask distinguishable from the action.
+inline const wchar_t* const kAddMaskEntryCaption = L"Add mask...";
+
 enum class MaskNameProblem {
     None,                 // acceptable
     Empty,                // nothing left after trimming
@@ -33,7 +47,8 @@ enum class MaskNameProblem {
     ReservedDerivedName,  // a name DeriveMasks emits on this or any other machine
 };
 
-// Checked in this order: Empty, Duplicate, ReservedDerivedName.
+// Checked in this order: Empty, Duplicate, ReservedDerivedName (which now covers the
+// "Add mask..." combo caption as well as the derived vocabulary - see kAddMaskEntryCaption).
 //
 // `existing`              - the current mask list (Config::masks).
 // `derivedForThisMachine` - DeriveMasks output for the live topology.
@@ -58,6 +73,12 @@ inline MaskNameProblem ValidateNewMaskName(const std::wstring& raw,
     for (const Mask& mask : existing) {
         if (IEquals(mask.name, name)) return MaskNameProblem::Duplicate;
     }
+    // The Profiles page's mask combos carry kAddMaskEntryCaption as a ROW. A mask with that
+    // exact name would sit in the same list, drawn identically to the action, so the name is
+    // not the user's to take. ReservedDerivedName rather than a new problem code: the meaning
+    // the caller has to convey - "that name belongs to Game Optimizer, choose another" - is
+    // exactly what that code already means, and every existing switch already handles it.
+    if (IEquals(kAddMaskEntryCaption, name)) return MaskNameProblem::ReservedDerivedName;
     for (const Mask& mask : derivedForThisMachine) {
         if (IEquals(mask.name, name)) return MaskNameProblem::ReservedDerivedName;
     }

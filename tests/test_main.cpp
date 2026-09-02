@@ -3747,6 +3747,47 @@ void Test_V9_DerivableNamesAreReservedEverywhere() {
     CHECK(!cd::IsDerivableMaskName(L"Freq "));  // prefix alone, no index: never emitted
 }
 
+void Test_V10_AddMaskCaptionIsNotAValidMaskName() {
+    Case("V10 the \"Add mask...\" combo caption is reserved: exact, any case, and trimmed");
+    // The Profiles page now shows cd::kAddMaskEntryCaption as a ROW inside each of its two mask
+    // combos, so a mask carrying that same name would sit in the same list drawn identically to
+    // the action beside it. The ROW is told apart by its combo item data, not by its text
+    // (src\settings.cpp, kMaskItemAdd), so this reservation is the second belt rather than the
+    // first - but without it the ordinary Add flow, the one the user actually drives, would put
+    // such a mask into the config in the first place.
+    //
+    // Empty existing list and empty derived list, exactly as V9: the only thing that can refuse
+    // any name below is the machine-independent reservation, so each result proves that check
+    // alone rather than a Duplicate or a live derived name.
+    const std::vector<cd::Mask> none;
+    const auto v = [&none](const wchar_t* raw) { return cd::ValidateNewMaskName(raw, none, none); };
+    const cd::MaskNameProblem reserved = cd::MaskNameProblem::ReservedDerivedName;
+    const cd::MaskNameProblem ok = cd::MaskNameProblem::None;
+
+    // THE CONSTANT ITSELF, not a copy of its text. A literal-only test keeps passing after
+    // someone rewords the row, which is the exact drift the shared constant exists to prevent -
+    // so the caption is asserted both ways, and the pair fails the day they stop agreeing.
+    CHECK(v(cd::kAddMaskEntryCaption) == reserved);
+    CHECK(v(L"Add mask...") == reserved);
+    // Case-insensitively: FindMask, the merge and every other name comparison in this program
+    // use IEquals, so "add mask..." and "Add mask..." are one name to all of them.
+    CHECK(v(L"add mask...") == reserved);
+    CHECK(v(L"ADD MASK...") == reserved);
+    CHECK(v(L"AdD mAsK...") == reserved);
+    // Trimmed first, like every other name. This is not cosmetic: TrimMaskName is what the
+    // caller STORES, so "  Add mask...  " would not merely resemble the caption, it would
+    // become it.
+    CHECK(v(L"  Add mask...") == reserved);
+    CHECK(v(L"Add mask...   ") == reserved);
+    CHECK(v(L"\t Add mask... \r\n") == reserved);
+    // NEGATIVE CONTROLS. Without these the eight above are satisfied by a validator that
+    // refuses everything, which would be a far worse bug than the one they guard.
+    CHECK(v(L"Streaming") == ok);
+    CHECK(v(L"Add mask") == ok);      // no ellipsis
+    CHECK(v(L"Add mask..") == ok);    // two dots, not three
+    CHECK(v(L"Add masks...") == ok);
+}
+
 void Test_V6_TopologyChangedPreservedSentence() {
     Case("V6 topology-changed sentence: silent at zero, names the count otherwise");
     CHECK_EQ(cd::TopologyChangedPreservedSentence(0), std::wstring());
@@ -3859,6 +3900,7 @@ int main() {
     Test_V6_TopologyChangedPreservedSentence();
     Test_V8_CanRemoveMaskOnlyForCustomMasks();
     Test_V9_DerivableNamesAreReservedEverywhere();
+    Test_V10_AddMaskCaptionIsNotAValidMaskName();
 
     std::printf("\n== H. Live environment wording ==\n");
     Test_H1_GameModeEnvironmentWordingCoversEveryState();

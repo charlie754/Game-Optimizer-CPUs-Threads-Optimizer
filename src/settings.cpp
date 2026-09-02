@@ -999,6 +999,18 @@ struct SettingsState {
     HWND hHeavyLbl = nullptr, hHeavy = nullptr, hHeavyPick = nullptr;
     HWND hHeavyAdd = nullptr, hHeavyRem = nullptr;
     HWND hHeavyMaskLbl = nullptr, hHeavyMask = nullptr, hHeavyMaskWarn = nullptr;
+    // WHICH MASK THE PROFILES PAGE'S MASK COMBO WAS SHOWING BEFORE THE USER STARTED CHANGING IT.
+    //
+    // Both of those combos carry an "Add mask..." row, and choosing it needs two things the
+    // notification itself cannot supply: the mask the new one is COPIED from, and the selection
+    // to put BACK when the user cancels or the name is refused. Both are "whatever was showing a
+    // moment ago" - and by the time CBN_SELCHANGE arrives the selection has already moved onto
+    // the action, so it cannot be read from the control any more. Captured on CBN_DROPDOWN (the
+    // mouse route, fired just before the list opens), on CBN_SETFOCUS (the keyboard route - the
+    // arrow keys change a CBS_DROPDOWNLIST selection with no CBN_DROPDOWN at all), and refreshed
+    // after every settled selection on a real mask. One field, because only one of the two
+    // combos can have the focus that any of those three routes requires.
+    std::wstring maskComboBeforeChange;
     HWND hAutoPin = nullptr, hAutoDesc = nullptr;
     // The live "why is nothing happening" line under the percent field. See AutoPinState.
     HWND hAutoStatus = nullptr;
@@ -1413,14 +1425,51 @@ std::wstring TopologyBlock(const Topology& t) {
     return s;
 }
 
-void FillMaskCombo(HWND combo, const Config& c, const std::wstring& select) {
+// ---------------------------------------------------------------------------
+// The mask combos
+//
+// WHAT A ROW IS, AND WHY THE ANSWER IS ITEM DATA RATHER THAN TEXT.
+//
+// The two Profiles-page combos carry one row that is NOT a mask: the "Add mask..." action, so a
+// user can create a mask without walking over to the Core map page (which keeps its own button
+// beside its own combo and therefore does NOT get the row). Every consumer of these combos -
+// StoreUiToProfile above all - has to be able to tell that row from a mask.
+//
+// It is told apart by CB_SETITEMDATA / CB_GETITEMDATA, never by comparing the caption. A config
+// can contain a mask literally named "Add mask...": ValidateNewMaskName refuses that name now,
+// but a hand-edited file or one written by an older build can still hold one, and two rows
+// carrying the same string are indistinguishable by text. The stamp is written by exactly one
+// function - FillMaskCombo below - so it cannot be forged from the config.
+//
+// CB_GETITEMDATA on a row nobody stamped returns 0, so kMaskItemMask MUST be 0: an unstamped row
+// then reads as a mask, which is the harmless direction (FindMask simply fails to find it). The
+// dangerous direction - the action read back as configuration - needs the positive value.
+enum : LPARAM {
+    kMaskItemMask = 0,   // a mask from Config::masks
+    kMaskItemAdd  = 1    // the "Add mask..." action; never a mask, never stored in a profile
+};
+
+// `withAddEntry` appends the "Add mask..." row LAST, after every real mask. `select` is matched
+// against mask names only, so it can never land the selection on that row.
+void FillMaskCombo(HWND combo, const Config& c, const std::wstring& select,
+                   bool withAddEntry = false) {
     if (!combo) return;
     SendMessageW(combo, CB_RESETCONTENT, 0, 0);
     int sel = -1;
     for (size_t i = 0; i < c.masks.size(); ++i) {
-        SendMessageW(combo, CB_ADDSTRING, 0,
-                     reinterpret_cast<LPARAM>(c.masks[i].name.c_str()));
-        if (!select.empty() && IEquals(c.masks[i].name, select)) sel = static_cast<int>(i);
+        // The INDEX CB_ADDSTRING returns, not the loop counter: it is what CB_SETITEMDATA and
+        // CB_SETCURSEL address, and it stays correct if an add is ever refused.
+        const LRESULT item = SendMessageW(combo, CB_ADDSTRING, 0,
+                                          reinterpret_cast<LPARAM>(c.masks[i].name.c_str()));
+        if (item < 0) continue;   // CB_ERR / CB_ERRSPACE
+        SendMessageW(combo, CB_SETITEMDATA, static_cast<WPARAM>(item), kMaskItemMask);
+        if (!select.empty() && IEquals(c.masks[i].name, select)) sel = static_cast<int>(item);
+    }
+    if (withAddEntry) {
+        const LRESULT item = SendMessageW(combo, CB_ADDSTRING, 0,
+                                          reinterpret_cast<LPARAM>(kAddMaskEntryCaption));
+        if (item >= 0)
+            SendMessageW(combo, CB_SETITEMDATA, static_cast<WPARAM>(item), kMaskItemAdd);
     }
     SendMessageW(combo, CB_SETCURSEL, static_cast<WPARAM>(sel), 0);
 }
@@ -1435,6 +1484,25 @@ std::wstring ComboText(HWND combo) {
     SendMessageW(combo, CB_GETLBTEXT, static_cast<WPARAM>(sel),
                  reinterpret_cast<LPARAM>(buf.data()));
     return std::wstring(buf.data());
+}
+
+// True when what is selected in `combo` is the "Add mask..." action rather than a mask. The
+// stamp is the test; see the enum above for why the caption is not.
+bool ComboSelectionIsAddMask(HWND combo) {
+    if (!combo) return false;
+    const LRESULT sel = SendMessageW(combo, CB_GETCURSEL, 0, 0);
+    if (sel == CB_ERR) return false;
+    return SendMessageW(combo, CB_GETITEMDATA, static_cast<WPARAM>(sel), 0) == kMaskItemAdd;
+}
+
+// The name of the MASK a combo has selected - empty when nothing is selected, and empty when
+// the selection is the "Add mask..." action. Every caller that means "which mask did the user
+// choose" wants this rather than ComboText, which would hand back the action's caption: a name
+// no mask carries, which would then be written into a profile, refilled into a combo as a
+// selection that matches nothing, or printed in a status sentence.
+std::wstring SelectedMaskName(HWND combo) {
+    if (ComboSelectionIsAddMask(combo)) return std::wstring();
+    return ComboText(combo);
 }
 
 // ---------------------------------------------------------------------------
@@ -1681,9 +1749,11 @@ void LoadProfileToUi(SettingsState* st) {
 
     SetChecked(st->hEnabled, p.enabled);
     SetWindowTextW(st->hGame, p.game.c_str());
-    FillMaskCombo(st->hGameMask, st->work, p.gameMask);
+    // true: these two combos carry the "Add mask..." row. The Core map's combo does not - it
+    // has the button beside it already.
+    FillMaskCombo(st->hGameMask, st->work, p.gameMask, true);
     SetHeavyItems(st, p.heavy);
-    FillMaskCombo(st->hHeavyMask, st->work, p.heavyMask);
+    FillMaskCombo(st->hHeavyMask, st->work, p.heavyMask, true);
     // SetHeavyItems has just dropped the previous profile's readback rows along with its
     // entries. Refilled here rather than left to the timer: a second of a profile's heavy
     // list with the auto rows missing reads as "the rule has stopped", which is the exact
@@ -1720,12 +1790,19 @@ void StoreUiToProfile(SettingsState* st) {
     Profile& p = st->work.profiles[static_cast<size_t>(st->selProfile)];
     p.enabled = IsChecked(st->hEnabled);
     p.game = Trim(GetText(st->hGame));
-    std::wstring gm = ComboText(st->hGameMask);
+    // SelectedMaskName, NOT ComboText, AND THE DIFFERENCE IS THE POINT. Both mask combos carry
+    // an "Add mask..." row; its caption is not a mask name. ComboText would hand it back like
+    // any other string and this function would write it straight into the profile, leaving that
+    // profile pointing at a mask that does not exist - a silently broken configuration the user
+    // never typed. SelectedMaskName returns empty for that row (it tests the row's item data),
+    // and the empty guard already here then leaves the stored mask untouched.
+    std::wstring gm = SelectedMaskName(st->hGameMask);
     if (!gm.empty()) p.gameMask = gm;
     // Membership still comes from the listbox so adds and removes work. Order comes from the
     // user's canonical list so clicking between profiles can no longer silently rewrite it.
     p.heavy = RestoreCanonicalOrder(HeavyItems(st), st->heavyCanonical);
-    std::wstring hm = ComboText(st->hHeavyMask);
+    // Same guard, same reason, for the heavy mask.
+    std::wstring hm = SelectedMaskName(st->hHeavyMask);
     if (!hm.empty()) p.heavyMask = hm;
     p.autoPin = IsChecked(st->hAutoPin);
     int v = 0;
@@ -1966,7 +2043,10 @@ std::wstring AutoPinGameLabel(const Profile& p) {
 // The mask the rule moves processes ONTO. Read from the combo so it tracks the editor, with
 // the stored value as the fallback for the moment before the combo has a selection.
 std::wstring AutoPinTargetMask(const SettingsState* st, const Profile& p) {
-    std::wstring m = ComboText(st->hHeavyMask);
+    // SelectedMaskName: while the "Add mask..." prompt is up that row IS the combo's selection,
+    // and this window's 1 s timer keeps running behind the modal dialog. ComboText would put the
+    // action's caption into the sentence as though it were a mask.
+    std::wstring m = SelectedMaskName(st->hHeavyMask);
     if (m.empty()) m = p.heavyMask;
     return m.empty() ? std::wstring(L"the background mask") : m;
 }
@@ -2502,7 +2582,8 @@ bool UpdateMaskWarnings(SettingsState* st) {
     HWND combo[2] = { st->hGameMask, st->hHeavyMask };
     for (int i = 0; i < 2; ++i) {
         if (!pair[i]) continue;
-        std::wstring want = MaskParkedWarning(st, ComboText(combo[i]));
+        // SelectedMaskName: the "Add mask..." row is not a mask and has nothing to warn about.
+        std::wstring want = MaskParkedWarning(st, SelectedMaskName(combo[i]));
         if (GetText(pair[i]) == want) continue;
         SetWindowTextW(pair[i], want.c_str());
         // A warning belongs to the Profiles page. It may only become visible while that page
@@ -4033,31 +4114,46 @@ void OnResetMask(SettingsState* st, HWND hwnd) {
 // combos keep whatever they showed (a profile references a mask by NAME, and the name of
 // an existing mask never changes here); the map combo lands on `mapSelect`.
 void RefillMaskCombos(SettingsState* st, const std::wstring& mapSelect) {
-    FillMaskCombo(st->hGameMask, st->work, ComboText(st->hGameMask));
-    FillMaskCombo(st->hHeavyMask, st->work, ComboText(st->hHeavyMask));
+    // SelectedMaskName, not ComboText: the profile combos' current row may be the "Add mask..."
+    // action (this is reached from that very action), and its caption matches no mask, so
+    // ComboText would ask for a selection that cannot be satisfied and leave the combo blank.
+    // Empty is the honest answer there, and the "Add mask..." caller re-selects explicitly.
+    FillMaskCombo(st->hGameMask, st->work, SelectedMaskName(st->hGameMask), true);
+    FillMaskCombo(st->hHeavyMask, st->work, SelectedMaskName(st->hHeavyMask), true);
     FillMaskCombo(st->hMapMask, st->work, mapSelect);
     if (SendMessageW(st->hMapMask, CB_GETCURSEL, 0, 0) == CB_ERR && !st->work.masks.empty())
         SendMessageW(st->hMapMask, CB_SETCURSEL, 0, 0);
 }
 
-// "Add mask...": a NAME for a set of logical processors, nothing more. The new mask starts
-// as a copy of the mask being edited (design 5.1 - an empty mask is not a usable start,
-// and an empty assignment is how this app CLEARS a mask, see applier.cpp). It is
-// derived == false from birth: it was never derived from anything.
-void OnAddMask(SettingsState* st, HWND hwnd) {
-    const std::wstring current = ComboText(st->hMapMask);
-    const Mask* src = st->work.FindMask(current);
+// THE PROMPT-VALIDATE-CREATE SEQUENCE, AND THE ONLY COPY OF IT.
+//
+// Two things reach this: the Core map page's "Add mask..." BUTTON, and the "Add mask..." ROW
+// inside each Profiles-page mask combo. They differ only in which mask is copied and what ends
+// up selected where, so those are the caller's business and none of it is repeated here.
+//
+// A new mask starts as a copy of `copyFrom` (design 5.1 - an empty mask is not a usable start,
+// and an empty assignment is how this app CLEARS a mask, see applier.cpp). It is derived ==
+// false from birth: it was never derived from anything.
+//
+// Returns the created mask's name, or an EMPTY STRING when nothing was created - there is no
+// mask to copy, the user cancelled the prompt, or the name was refused. The caller must treat
+// empty as "restore whatever you had"; no combo is touched here.
+std::wstring PromptAndCreateMask(SettingsState* st, HWND hwnd, const std::wstring& copyFrom) {
+    const Mask* src = st->work.FindMask(copyFrom);
     if (!src) {
         MessageBoxW(hwnd,
                     L"Choose the mask to copy first. A new mask starts as a copy of the mask "
                     L"being edited.",
                     L"Game Optimizer", MB_OK | MB_ICONINFORMATION);
-        return;
+        return std::wstring();
     }
     std::wstring raw;
-    if (!PromptName(hwnd, L"Name for the new mask:", raw)) return;
+    if (!PromptName(hwnd, L"Name for the new mask:", raw)) return std::wstring();
 
-    const wchar_t* problem = nullptr;
+    // std::wstring rather than the const wchar_t* this used to be, because one of the branches
+    // below has to SPLICE the shared caption constant into its sentence instead of repeating it
+    // as a literal. Empty means "no problem", exactly as nullptr did.
+    std::wstring problem;
     switch (ValidateNewMaskName(raw, st->work.masks, DeriveMasks(*st->topo))) {
         case MaskNameProblem::None:
             break;
@@ -4069,6 +4165,18 @@ void OnAddMask(SettingsState* st, HWND hwnd) {
                       L"without regard to case.";
             break;
         case MaskNameProblem::ReservedDerivedName:
+            // ONE problem code, TWO reasons, so the sentence has to be CHOSEN rather than
+            // assumed. ValidateNewMaskName returns this both for the derived vocabulary and for
+            // the "Add mask..." caption, and the derived sentence would be simply untrue of the
+            // second - it recites a list the typed name is not in, which reads as a bug. The
+            // VALIDATOR still owns the decision; this only picks the wording, and it picks it
+            // off the same constant the row is built from, so there is nothing here to drift.
+            if (IEquals(TrimMaskName(raw), kAddMaskEntryCaption)) {
+                problem = std::wstring(L"That name belongs to the \"") + kAddMaskEntryCaption +
+                          L"\" entry in the mask lists, so a mask cannot be called it. "
+                          L"Choose a different name.";
+                break;
+            }
             // Do NOT recite the refused set item by item. The previous wording listed fewer
             // categories than IsDerivableMaskName actually refuses: it omitted Freq entirely
             // and showed "no SMT" on All alone, when every base has a "no SMT" form. Name the
@@ -4079,18 +4187,78 @@ void OnAddMask(SettingsState* st, HWND hwnd) {
                       L"also has a \"no SMT\" form). Choose a different name.";
             break;
     }
-    if (problem) {
-        MessageBoxW(hwnd, problem, L"Game Optimizer", MB_OK | MB_ICONWARNING);
-        return;
+    if (!problem.empty()) {
+        MessageBoxW(hwnd, problem.c_str(), L"Game Optimizer", MB_OK | MB_ICONWARNING);
+        return std::wstring();
     }
 
     // Copy the ids BEFORE push_back: `src` points into the vector being grown.
     Mask added{ TrimMaskName(raw), src->ids, false };
     st->work.masks.push_back(added);
-    RefillMaskCombos(st, added.name);
+    return added.name;
+}
+
+// The Core map page's "Add mask..." BUTTON. Copies the mask that page is editing and leaves it
+// editing the new one.
+void OnAddMask(SettingsState* st, HWND hwnd) {
+    const std::wstring added = PromptAndCreateMask(st, hwnd, ComboText(st->hMapMask));
+    if (added.empty()) return;
+    RefillMaskCombos(st, added);
     SelectMapMask(st);
     RelayoutIfWarningsChanged(st);
     RepaintChrome(hwnd);   // the stat row names and measures the selected mask
+}
+
+// Everything a settled selection in either Profiles-page mask combo requires. Factored out so
+// the plain CBN_SELCHANGE path and the "Add mask..." row run the SAME code - a parked-mask
+// warning that is refreshed on one route and not the other is a wrong answer on screen.
+void ProfileMaskSelectionChanged(SettingsState* st, HWND hwnd) {
+    RefreshLiveTopology(st);
+    // The heavy mask is the mask the Active sentence names.
+    const bool autoChanged = RefreshAutoPinStatus(st);
+    if (UpdateMaskWarnings(st)) {
+        SettingsLayout(st, hwnd);
+        RedrawSettings(hwnd);
+    } else if (autoChanged) {
+        RepaintChrome(hwnd);
+    }
+}
+
+// The "Add mask..." ROW inside a Profiles-page mask combo was chosen. `combo` is that combo -
+// hGameMask or hHeavyMask.
+//
+// The mask to copy and the selection to fall back to are the same thing: whatever the combo was
+// showing before the user started changing it, which is st->maskComboBeforeChange (see the
+// field for why it cannot be read from the control at this point).
+//
+// THE ROW MUST NEVER STILL BE SELECTED WHEN THIS RETURNS. Cancel, an empty name, a duplicate, a
+// reserved name and "nothing to copy" all land on the same restore, because in every one of
+// them the user has changed nothing and the combo must say so.
+void OnProfileMaskAdd(SettingsState* st, HWND hwnd, HWND combo) {
+    const std::wstring previous = st->maskComboBeforeChange;
+    const std::wstring added = PromptAndCreateMask(st, hwnd, previous);
+    const std::wstring want = added.empty() ? previous : added;
+
+    // Both profile combos are refilled either way: on success the list grew, and on failure
+    // this one still has to lose the action row's selection. The one the action came from gets
+    // `want`; the other keeps what it had.
+    FillMaskCombo(st->hGameMask, st->work,
+                  combo == st->hGameMask ? want : SelectedMaskName(st->hGameMask), true);
+    FillMaskCombo(st->hHeavyMask, st->work,
+                  combo == st->hHeavyMask ? want : SelectedMaskName(st->hHeavyMask), true);
+    if (!added.empty()) {
+        // The map combo lists masks too, so it has to see the new one - but its SELECTION is
+        // the Core map's own editing target and this add did not come from there, so it keeps
+        // the mask it had.
+        FillMaskCombo(st->hMapMask, st->work, ComboText(st->hMapMask));
+        if (SendMessageW(st->hMapMask, CB_GETCURSEL, 0, 0) == CB_ERR && !st->work.masks.empty())
+            SendMessageW(st->hMapMask, CB_SETCURSEL, 0, 0);
+        SelectMapMask(st);   // re-enables "Remove mask" against whatever the map now shows
+    }
+    // The snapshot is now stale by exactly one selection; make it the selection that stands.
+    st->maskComboBeforeChange = want;
+    ProfileMaskSelectionChanged(st, hwnd);
+    if (!added.empty()) RepaintChrome(hwnd);   // the mask count on the Core map's stat row moved
 }
 
 // "Remove mask": only a hand-made mask, and never one a profile still names (design 5.4 -
@@ -4285,7 +4453,9 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             st->hMapReset = Mk(hwnd, L"BUTTON", L"Reset to detected",
                                BS_OWNERDRAW | WS_TABSTOP, IDC_MAPRESET);
             SetButtonKind(st->hMapReset, theme::ButtonKind::Secondary);
-            st->hMapAdd = Mk(hwnd, L"BUTTON", L"Add mask...",
+            // The same constant the Profiles page's combo row is built from: the button and the
+            // row are the SAME action and must never end up captioned differently.
+            st->hMapAdd = Mk(hwnd, L"BUTTON", kAddMaskEntryCaption,
                              BS_OWNERDRAW | WS_TABSTOP, IDC_MAPADD);
             SetButtonKind(st->hMapAdd, theme::ButtonKind::Secondary);
             st->hMapRemove = Mk(hwnd, L"BUTTON", L"Remove mask",
@@ -4944,22 +5114,35 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDC_HEAVY:
                     return 0;   // selection only; the buttons above act on it
                 case IDC_GAMEMASK:
-                case IDC_HEAVYMASK:
+                case IDC_HEAVYMASK: {
+                    HWND combo = (id == IDC_GAMEMASK) ? st->hGameMask : st->hHeavyMask;
+                    // The two routes by which a selection can start to move, both fired while
+                    // the OLD selection is still current. CBN_DROPDOWN is the mouse; CBN_SETFOCUS
+                    // is the keyboard, where the arrow keys retarget a CBS_DROPDOWNLIST without
+                    // ever opening the list and so never send CBN_DROPDOWN at all. Missing
+                    // either one would leave the "Add mask..." row with the wrong mask to copy.
+                    if (code == CBN_DROPDOWN || code == CBN_SETFOCUS) {
+                        st->maskComboBeforeChange = SelectedMaskName(combo);
+                        return 0;
+                    }
                     // Warn at the moment of choosing, not after the user wonders why the
                     // mask did nothing. The choice is never blocked - a parked CCD can
                     // un-park, and the user may be assigning it deliberately.
                     if (code == CBN_SELCHANGE && !st->loading) {
-                        RefreshLiveTopology(st);
-                        // The heavy mask is the mask the Active sentence names.
-                        const bool autoChanged = RefreshAutoPinStatus(st);
-                        if (UpdateMaskWarnings(st)) {
-                            SettingsLayout(st, hwnd);
-                            RedrawSettings(hwnd);
-                        } else if (autoChanged) {
-                            RepaintChrome(hwnd);
+                        // Not a mask: the "Add mask..." action. It restores the selection
+                        // itself on every outcome, and runs the same refresh afterwards.
+                        if (ComboSelectionIsAddMask(combo)) {
+                            OnProfileMaskAdd(st, hwnd, combo);
+                            return 0;
                         }
+                        // A settled choice IS the new "before" for the next change - the arrow
+                        // keys can walk from mask to mask and reach the action without any
+                        // further CBN_DROPDOWN or CBN_SETFOCUS to re-snapshot.
+                        st->maskComboBeforeChange = SelectedMaskName(combo);
+                        ProfileMaskSelectionChanged(st, hwnd);
                     }
                     return 0;
+                }
                 case IDC_INSPECT:
                     ShowInspectReport(st, hwnd);
                     return 0;

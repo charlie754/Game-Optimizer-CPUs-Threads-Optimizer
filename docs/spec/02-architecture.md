@@ -350,11 +350,20 @@ and ignored**. The third is invisible to both the setter's return value and the 
 Consequences carried through the design:
 
 - The app never claims a mask is "active" on the strength of an API return. The tray says what
-  it *assigned*; Settings offers a *Verify placement* action that samples where the process is
-  actually running.
+  it *assigned*; Settings offers an *Inspect processes...* action that reports, per governed
+  process, the assigned mask and its processor count, what Windows reports back, how many of
+  the mask's processors are currently parked, and whether something else has set a restrictive
+  affinity mask.
+- **That report cannot show where a process is actually running, and it says so in its own
+  text.** Sampling placement means running `GetCurrentProcessorNumberEx` inside the target
+  process, which means injecting code; this app never injects and uses no undocumented calls.
+  So Inspect reports what was assigned plus the two documented routes into silent-ignore —
+  parked processors and a restrictive affinity mask — and never that a mask took effect.
 - The core map draws live `Parked` state, and Settings **warns when a selected mask is
   entirely parked**, because that is the configuration most likely to be silently ignored.
-- Gate B verifies placement, not assignment — see §8.
+- Gate B verifies placement, not assignment — see §8. It can do that only because the harness
+  samples from inside a child process it spawned itself; there is no such route into a user's
+  game.
 
 **Requested access rights are the minimum that works, deliberately.**
 `PROCESS_SET_LIMITED_INFORMATION` and `PROCESS_QUERY_LIMITED_INFORMATION` only. The app

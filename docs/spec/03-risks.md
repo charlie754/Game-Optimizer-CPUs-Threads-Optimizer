@@ -111,17 +111,28 @@ checks either one will confidently report success while doing nothing.
 **Mitigations**
 1. The tray reports what the app **assigned**, never that a mask is "active" — a distinction
    the UI copy has to keep, because the API cannot support the stronger claim.
-2. Settings offers **Verify placement**, which samples where a governed process is actually
-   running and compares it against the assigned mask.
+2. Settings offers **Inspect processes...**, which reports per governed process: the assigned
+   mask and its processor count, what Windows reports back, how many of the mask's processors
+   are currently parked, and whether something else has set a restrictive affinity mask.
+   **It does not confirm placement**, and its own text says so — showing where a process is
+   actually running would mean executing code inside it, and this app never injects anything.
 3. Settings **warns when a selected mask is entirely parked**, the configuration most likely
    to be ignored, and the core map draws live parked state.
 4. The app reads (never writes) each governed process's affinity mask and warns when one is
    set, because that silently defeats the CPU Set.
 5. Gate B verifies **placement, not assignment** — this finding is what forced that rewrite.
+   The gate can sample placement only because it owns the child process it measures; there is
+   no such route into a user's game.
 
-**Residual.** Sampling proves placement only during the sample window. A game that sets its
-own affinity mask mid-session can defeat the assignment afterwards, and the app will not
-notice until the next verify.
+**Residual, and it is larger than an earlier draft of this register claimed.** That draft
+credited a Settings action that sampled where a governed process was actually running; **no
+such action exists and none was ever built**, so mitigations 2-4 are not a check on placement.
+They detect the two *documented* routes into accepted-then-ignored — parked processors, and a
+restrictive affinity mask — and a mask ignored for any third reason still reads as applied.
+The Inspect report is also a snapshot taken when the user opens it, so a game that sets its own
+affinity mask mid-session is caught only if the user looks again. **The only placement evidence
+in this product is Gate B**: a child process the harness spawned, on the developer's machine,
+before release — never the user's game on the user's machine.
 
 ## 2b. Another program writes the same per-process API — **HIGH**
 
@@ -228,10 +239,12 @@ can park on its own. The two have not been separated by experiment here.
 
 **Residual.** If a global policy has parked the CCD a user just assigned a game to, the result
 is **indistinguishable from the app doing nothing** — and every API reports success. That is
-risk §2a, and surfacing parked state plus Verify placement is the whole mitigation; neither
-removes the conflict. **[A]** AMD's parking is also reported to be dynamic and load-reactive
-rather than a hard removal, so a parked CCD may un-park under load — not observed within the
-2 s measurement window, and not established here.
+risk §2a, and surfacing parked state is the whole mitigation — the core map, the
+entirely-parked warning, and the parked line in the Inspect report. That neither removes the
+conflict nor confirms the mask took effect: the app cannot observe placement. **[A]** AMD's
+parking is also reported to be dynamic and load-reactive rather than a hard removal, so a
+parked CCD may un-park under load — not observed within the 2 s measurement window, and not
+established here.
 
 ## 4. Child processes missed — **HIGH**
 
@@ -249,9 +262,11 @@ Both read from the headers on disk this turn. Scoped to that SDK version.
    process onto the game's descendant tree — the bug that would otherwise pin something
    random to the game CCD on a long-uptime desktop.
 3. Gate B item 2 makes "a child spawned *after* the parent was masked is governed within one
-   tick" a **release blocker**, verified by reading the child's own default CPU sets back —
-   not by inspecting the app's internal state, which would prove only that the app believes
-   it worked.
+   tick" a **release blocker**, verified by the §8.1 placement method on the child itself —
+   the harness samples `GetCurrentProcessorNumberEx` inside the child it spawned, which it can
+   do only because it owns that process. It is not verified by inspecting the app's internal
+   state, which would prove only that the app believes it worked, nor by reading the child's
+   default CPU sets back, which is the accepted-then-ignored trap §2a is about.
 
 **Residual.** A process that is a *logical* child but not a *process-tree* child — spawned
 through a broker or a pre-existing service, e.g. some launcher and overlay architectures —

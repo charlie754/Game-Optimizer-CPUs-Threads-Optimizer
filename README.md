@@ -195,8 +195,9 @@ tools\build-behaviour.bat  && build\behaviour_probe.exe
 
 ## Windows SmartScreen on first run
 
-The binary is not code-signed. This is a free tool and a code-signing certificate is a recurring
-cost, so there is no certificate and no signature — and Windows notices.
+The binary is not code-signed yet. Signing through SignPath Foundation, which is free for
+open-source projects, has been chosen and is being set up; at the time of writing it is not in
+place, so there is no signature — and Windows notices.
 
 The first time you run a downloaded `GameOptimizer.exe`, SmartScreen shows a prompt headed
 **"Windows protected your PC"** saying the app is unrecognised. **Run anyway** is not on it
@@ -229,11 +230,12 @@ that is hidden; all of it is in this repository.
 
 What to check before trusting any copy:
 
-1. The SHA256 of every release zip is printed in its GitHub release notes. Compare it with
+1. Recent releases print two SHA256 hashes in their GitHub release notes, one for the zip and
+   one for the loose exe. Compare the published zip hash with
    `certutil -hashfile GameOptimizer-vX.Y.Z-x64.zip SHA256` on the file you downloaded. If you
    already unpacked it and only have the loose exe, hash that instead with
-   `certutil -hashfile GameOptimizer.exe SHA256` - both hashes are published in the release
-   notes.
+   `certutil -hashfile GameOptimizer.exe SHA256`. Older releases do not all list a hash; if the
+   release you downloaded does not, you cannot use this check on it.
 2. If the hash matches and Defender still quarantines the exe, that is a false positive on this
    build. You can report it to Microsoft at https://www.microsoft.com/en-us/wdsi/filesubmission
    (choose "incorrectly detected", and set the submission priority to **Medium** - the form
@@ -388,7 +390,10 @@ Being specific here rather than implying more coverage than exists.
 
 If a mask cannot be applied to a process, the app says so by name rather than skipping quietly.
 If a mask is applied but ignored by the scheduler, no API reports that — which is why the core
-map shows live parked state and Settings offers *Verify placement*.
+map shows live parked state and Settings has an **Inspect processes** button on its General
+page. That report gives, per governed process, the mask that was assigned, what Windows
+reports back, how many of the mask's processors are parked, and whether something else has set
+a restrictive affinity mask. It cannot show where a process is actually running, and says so.
 
 ## Documentation
 
