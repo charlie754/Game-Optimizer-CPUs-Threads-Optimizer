@@ -185,16 +185,70 @@ also contend for the game itself.
 **The failure:** two schedulers fight. The user sets a per-game CPU Set; a global policy
 contradicts it; frame times get worse and the tool looks broken.
 
-**The mechanism, corrected.** An earlier draft of this document said Windows Game Mode "parks
-the second CCD". That is not accurate **[S]**. Game Mode does not park anything itself. On
-dual-CCD X3D parts the **AMD 3D V-Cache Performance Optimizer driver** (with the AMD PPM
-Provisioning driver) watches **Xbox Game Bar's "this process is a game" signal** and parks the
-non-V-Cache CCD so the game stays on the cache die. Game Bar and Game Mode are the
-*detection prerequisite* the AMD mechanism depends on — with Game Mode off, that automatic
-parking does not engage.
+**The mechanism, corrected twice.** An early draft said Windows Game Mode "parks the second CCD".
+Not accurate — Game Mode parks nothing itself. A second draft then said the **driver** watches
+**Xbox Game Bar's "this process is a game" signal** and parks the non-V-Cache CCD. 🔴 **That is
+also wrong, and it is the version that shipped in this file until 2026-09-06.** The driver has no
+callback, no timer and no notification registration of any kind; `README.md` was corrected on
+2026-08-31 and this register was not.
 
-That inverts the reason for the advisory but not the advice. The wizard's message is therefore
-about **which of two mechanisms is placing your game**, not about Game Mode being harmful:
+**[M] The measured mechanism, 2026-09-06** — established from the driver's INF, the agent binary's
+imports and strings, and the live registry, all agreeing. AMD ships **three** components and only
+one carries policy:
+
+| component | what it is | what it does |
+|---|---|---|
+| `amd3dvcacheSvc` | a Windows service | launches the agent below; no other behaviour was found |
+| `amd3dvcacheUser.exe` | a per-session process, **not** a service | where the policy decisions observed here are made |
+| `amd3dvcache.sys` | a kernel driver, PnP-bound to `ACPI\AMDI0101` | relays one 0/1 value to firmware |
+
+The agent hooks the **foreground window** (`SetWinEventHook` + `GetWindowThreadProcessId` +
+`QueryFullProcessImageNameW`) and subscribes to Windows' **effective power mode**
+(`PowerRegisterForEffectivePowerModeNotifications`, resolved from `Powrprof.dll` via
+`LoadLibraryW`/`GetProcAddress` — which is why it does **not** appear in the import table). It then
+looks the answer up in `HKLM\SYSTEM\CurrentControlSet\Services\amd3dvcacheSvc\Parameters\Preferences`:
+
+```
+DefaultType = 0
+EffectivePowerMode\GameMode       Mode = 5   Type = 1
+EffectivePowerMode\MixedReality   Mode = 6   Type = 1
+App\League of Legends             EndsWith = "League of Legends.exe"   Type = 0
+```
+
+**[M]** `Mode` 5 and 6 are `EffectivePowerModeGameMode` and `EffectivePowerModeMixedReality`, from
+`powersetting.h` in the Windows SDK. **The only per-game tuning visible in this registry data is
+one hardcoded exception** — [A] the registry shows what is configured, not everything the agent
+may decide at runtime.
+
+**So the practical consequences for this product change as follows:**
+
+- **Game Mode is still the plausible detection prerequisite, but for a different reason than the
+  Game Bar story gave.** The trigger is Windows reporting `EffectivePowerModeGameMode`.
+  **[A] Whether Windows reports that mode with the Game Mode toggle OFF has not been measured
+  here**, so "Game Mode off means the AMD mechanism does not engage" is **not** established.
+- **[A] What `Type = 1` does below the ACPI call is opaque from Windows.** CPPC preferred-core
+  reordering is the best-supported hypothesis — **[S]** third-party tooling reports the BIOS option
+  `CPPC Dynamic Preferred Cores` must be `Auto` or `Driver` or the optimizer device does not work
+  at all — and CCD parking is the reported observable. **The two have not been separated by
+  experiment, and this document no longer asserts either as the mechanism.**
+- **[M] AMD's stack statically imports no Windows CPU-placement API, and names none of them in
+  its binaries.** Neither the agent nor `AmdPpkgSvc.exe` nor `AmdAppCompatSvc.exe` imports or
+  names `SetProcessDefaultCpuSets`, `SetThreadSelectedCpuSets` or `SetProcessAffinityMask`
+  (positive control passing). **[A] That is three API names against three binaries at the
+  versions installed here — it is not a proof that no placement call exists**, since a name
+  assembled at runtime and resolved through `GetProcAddress` would appear in neither check, and
+  this document records elsewhere that AMD does resolve at least one API that way. On the
+  evidence actually gathered, **no overwriting of each other's calls was found — which is not a
+  compatibility guarantee.** They
+  collide through the machine, and §2a is how: a mask on a die that firmware has taken away is
+  accepted, echoed back and ignored.
+
+The measurements above are the whole of the public account. The working notes they came from
+are part of this project's internal engineering log, which is not published, so there is no
+document to link here.
+
+**None of that changes the advice, only its justification.** The wizard's message is about
+**which of two mechanisms is placing your game**, not about Game Mode being harmful:
 Game Optimizer does per-game placement explicitly, so leaving Windows' automatic mechanism on
 means two systems making the same decision by different rules.
 
@@ -215,6 +269,15 @@ avoid, and it is worth not conflating the two in user-facing copy.
   `amd3dvcacheSvc` service is **Running**.
 - At probe time **every one of the 16 logical processors on CCD1 reported `Parked=1`**,
   while all 16 on CCD0 reported `Parked=0`.
+
+**[M] Re-measured 2026-09-06, and the machine is now in the opposite state:** `amd3dvcache` and
+`amd3dvcacheSvc` are both **Stopped and Disabled**, `amd3dvcacheUser.exe` is **not running**, and
+all 32 logical processors report 79–100% of maximum frequency. 🔴 **That is a FREQUENCY sample,
+not a parking one** — Windows reports parking separately, through `SYSTEM_CPU_SET_INFORMATION`'s
+own `Parked` flag, and that flag was not read in this sample. It is inconsistent with heavy
+parking rather than evidence against it. The 2026-08-28
+lines above are kept as the dated observation they were, not deleted: a single sample of a value
+that flaps is not a state, and this pair of samples is the evidence for that.
 
 That last line is the risk in concrete form: something on this machine already applies a
 global CCD preference, with Game Mode *off*. **[A]** Attributing the parking specifically to
@@ -241,7 +304,17 @@ can park on its own. The two have not been separated by experiment here.
 is **indistinguishable from the app doing nothing** — and every API reports success. That is
 risk §2a, and surfacing parked state is the whole mitigation — the core map, the
 entirely-parked warning, and the parked line in the Inspect report. That neither removes the
-conflict nor confirms the mask took effect: the app cannot observe placement. **[A]** AMD's
+conflict nor confirms the mask took effect: **the app** cannot observe placement.
+
+🔴 **"The app cannot" is not "nothing can", and an earlier reading of this line blurred the two.**
+Adversarial review, 2026-09-06, refuted the broader claim. Sampling
+`GetCurrentProcessorNumberEx` needs code inside the target process, which this app will not do —
+**that narrow sentence stands.** But **[M]** `wpr.exe` ships in `C:\Windows\System32` with a
+built-in `CPU` profile, and ETW is a **privileged external context** that nobody had enumerated.
+**[A] No trace was captured**, so "ETW resolves per-thread processor for a named process" is
+sourced reasoning rather than a measurement here. Recorded as: *an external route probably exists
+and was never looked for*, **not** as a reason to put an admin-only trace session inside a tray
+app. **[A]** AMD's
 parking is also reported to be dynamic and load-reactive rather than a hard removal, so a
 parked CCD may un-park under load — not observed within the 2 s measurement window, and not
 established here.

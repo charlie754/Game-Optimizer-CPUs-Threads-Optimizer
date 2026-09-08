@@ -483,6 +483,8 @@ bool ParseConfig(const std::wstring& text, Config& out, std::wstring* error) {
                     // request failed with ERROR_INVALID_SERVICE_CONTROL, so that mechanism is gone.
                 } else if (IEquals(key, std::wstring(L"first_run_done"))) {
                     ParseBoolW(value, out.firstRunDone);
+                } else if (IEquals(key, std::wstring(L"show_vcache_warning"))) {
+                    ParseBoolW(value, out.showVCacheWarning);
                 } else {
                     known = false;
                 }
@@ -602,6 +604,7 @@ std::wstring SerializeConfig(const Config& c) {
     AppendKv(out, L"paused", BoolText(c.paused));
     AppendKv(out, L"vcache_original_start", std::to_wstring(c.vcacheOriginalStart));
     AppendKv(out, L"first_run_done", BoolText(c.firstRunDone));
+    AppendKv(out, L"show_vcache_warning", BoolText(c.showVCacheWarning));
     AppendUnknownFor(out, c, std::wstring(kSecGeneral), consumed);
     out += L"\r\n";
 

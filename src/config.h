@@ -64,6 +64,9 @@ struct Config {
     // changed nothing. Restoring a guessed Manual value would silently rewrite a user's setup.
     int  vcacheOriginalStart = -1;
     bool firstRunDone = false;
+    // Opt-out belongs to the V-Cache startup section only; Game Mode still reports itself.
+    // True here also keeps the warning for older configs that have no preference key yet.
+    bool showVCacheWarning = true;
 
     std::wstring topologySignature;       // guards stale CPU Set Ids - see topology.h
     std::vector<Mask> masks;

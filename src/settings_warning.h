@@ -48,9 +48,21 @@ inline std::wstring FormatFullyParkedMaskWarning(const std::wstring& maskName,
            L"it - the process keeps running elsewhere.";
 }
 
-// The Stop box is checked when the optimizer is NOT active. One definition, so the checkbox
-// and the startup warning can never disagree.
-inline bool VCacheStopBoxChecked(bool optimizerActive) { return !optimizerActive; }
+// THE BOX REFLECTS THE SERVICE START TYPE, NOT A RUNNING PROCESS, AND THAT DISTINCTION IS A
+// FIXED BUG. It used to key on IsAmdVCacheAgentRunning() while a click writes the SERVICE
+// start type through --vcache-run. Those are different objects: stop the service and its
+// per-session agent can still be alive, which pinned the box to "unchecked" and turned every
+// click into a STOP. The operator disabled the service three times in a row that way, and only
+// the log showed it. Checked now means exactly what the click means: "configured Disabled".
+//
+// A start value this code could not read comes back as -1, which is NOT 4, so the box shows
+// unchecked. That is the safe direction: it never claims a stop that was not configured.
+//
+// It reports CONFIGURATION and nothing else. It is handed a start type, never a service or
+// process state, so "checked" means "configured Disabled" and not "the optimizer is stopped
+// right now" - the per-session agent can outlive a disabled service, which is the whole
+// reason the paragraph above exists.
+inline bool VCacheStopBoxChecked(int serviceStartValue) { return serviceStartValue == 4; }
 
 // The restore control exists only for users stranded by the OLD disable feature, i.e. only
 // when a driver Start value was recorded.
@@ -59,5 +71,12 @@ inline bool ShowVCacheRestoreControl(int vcacheOriginalStart) { return vcacheOri
 // AMD's INF installs this service as SERVICE_AUTO_START (2). Stopping it means Disabled (4),
 // and clearing the box must restore AMD's own default rather than guess at Manual.
 inline int VCacheServiceStartTypeFor(bool stopRequested) { return stopRequested ? 4 : 2; }
+
+// The driver's restore value: what we recorded, or AMD's documented DEMAND_START default.
+// The service always restores to AMD's own SERVICE_AUTO_START (2), independent of what the
+// driver originally was. They differ in AMD's own INF (service is 2, driver is 3).
+inline int VCacheRestoreDriverStart(int recordedOriginal) {
+    return recordedOriginal >= 0 ? recordedOriginal : 3;
+}
 
 }  // namespace cd

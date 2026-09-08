@@ -14,3 +14,8 @@ docs/turns/
 .workflow/
 __pycache__/
 *.pyc
+
+# The wiki assembler builds wiki/log.d shards into wiki/hot.md and wiki/log.md.
+# The wiki itself is part of the internal engineering log and is not published, so
+# the tool that assembles it would be dead weight here.
+tools/wiki-assemble.ps1

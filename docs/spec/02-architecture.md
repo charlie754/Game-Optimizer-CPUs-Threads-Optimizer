@@ -193,8 +193,18 @@ Practical consequences the implementation depends on:
   process.** That is what makes the core map and mask editing load-bearing rather than
   cosmetic.
 
-**Hard rule for review:** `SetProcessAffinityMask` must appear in exactly zero source files.
-`tools\gate-a.bat` greps for it.
+**Hard rule for review:** `SetProcessAffinityMask` must never be **called** from `src\`.
+
+🔴 **The rule is "zero call sites", not "zero mentions", and the gate does not grep the source.**
+An earlier version of this line said the API "must appear in exactly zero source files" and that
+`tools\gate-a.bat` greps for it. Both were wrong, and the second was wrong in the direction that
+matters: **a source grep cannot tell a call from a comment**, and `src\applier.h:4` names the
+banned API *while explaining the ban*, which made a source grep fail on a correct tree.
+
+`tools\gate-a.bat` GATE A.2 inspects the **built binary's import table** with `dumpbin -imports`,
+and carries a **positive control**: if `SetProcessDefaultCpuSets` is *not* found in the imports the
+gate FAILS rather than passing, so it cannot pass vacuously on a binary it failed to read. A
+comment cannot fake an import.
 
 
 ## 5. Process watching and child inheritance
@@ -439,7 +449,13 @@ every stored `Id` wrong. On mismatch: re-derive, keep profiles, tell the user on
 **Gate A — build and hygiene**
 1. `tools\build.bat` exits 0, produces `build\GameOptimizer.exe`, and emits zero C4996 or
    C4477 warnings at `/W3`.
-2. `grep -r SetProcessAffinityMask src\` returns **nothing**. The §4 rule, enforced.
+2. `dumpbin -imports build\GameOptimizer.exe` does **not** list `SetProcessAffinityMask`, and
+   **does** list `SetProcessDefaultCpuSets`. The §4 rule, checked against the built binary rather
+   than the source, because a source grep also matches the ban's own documentation. The second
+   half is a positive control: without it, a gate that failed to read the binary at all would
+   report a pass. **This is a necessary check and not a sufficient one** — a call resolved at
+   runtime through `GetProcAddress` leaves no import entry, so what this proves is that the API
+   is not statically imported, not that no code path could ever reach it.
 3. `tests\run-tests.bat` exits 0 and prints its own total; a filtered subset is not a run.
 
 **Gate B — product depth**, each requiring an observation, not a compile:

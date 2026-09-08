@@ -195,9 +195,22 @@ tools\build-behaviour.bat  && build\behaviour_probe.exe
 
 ## Windows SmartScreen on first run
 
-The binary is not code-signed yet. Signing through SignPath Foundation, which is free for
-open-source projects, has been chosen and is being set up; at the time of writing it is not in
-place, so there is no signature — and Windows notices.
+The binary is not code-signed, and no certificate is pending. SignPath Foundation, whose
+programme is free for open-source projects, **declined this project on 3 September 2026** — it
+asks for established public visibility and sustained activity, and the repository was days old.
+That is a fair call and they invited a reapplication later.
+
+Two things are worth saying plainly rather than leaving a promise standing. Microsoft's own
+low-cost signing service restricts individual developers to the United States and Canada, and
+its organisation list does not cover this author's country. And signing is not an off switch for
+the detections described below: two of the three verdicts this app has received end in `!ml`,
+and machine-learning verdicts fire on signed software too — a Microsoft-signed installer was hit
+by the sibling detection `Wacatac.H!ml`. Whether a certificate would have changed *these
+particular* detections has not been tested and cannot be tested from here, so this file does not
+claim it either way. What signing buys that is documented is narrower than it looks — reputation
+carrying from one release to the next instead of restarting at zero each time.
+
+So there is no signature, and Windows notices.
 
 The first time you run a downloaded `GameOptimizer.exe`, SmartScreen shows a prompt headed
 **"Windows protected your PC"** saying the app is unrecognised. **Run anyway** is not on it

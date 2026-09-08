@@ -455,9 +455,35 @@ std::wstring AutostartCommand(const std::wstring& exePath) {
     return L"\"" + exePath + L"\" --tray";
 }
 
-bool AutostartNeedsMigration(const std::wstring& existingValue) {
-    return !existingValue.empty() && ToLower(existingValue).find(L"--tray") ==
-                                         std::wstring::npos;
+// The exe path out of a stored Run command. The command we write is
+// `"<exe>" --tray`, so the quoted form is the normal case; the bare form is what older
+// builds wrote and is still parsed so a mismatch there is detected too.
+// Returns an empty string when nothing sensible can be extracted, which every caller
+// treats as "do not claim a mismatch".
+std::wstring AutostartExeFromCommand(const std::wstring& command) {
+    if (command.empty()) return std::wstring();
+    if (command[0] == L'"') {
+        const size_t close = command.find(L'"', 1);
+        if (close == std::wstring::npos) return std::wstring();
+        return command.substr(1, close - 1);
+    }
+    const size_t space = command.find(L' ');
+    return space == std::wstring::npos ? command : command.substr(0, space);
+}
+
+bool AutostartNeedsMigration(const std::wstring& existingValue,
+                             const std::wstring& currentExe) {
+    if (existingValue.empty()) return false;
+    // Older builds wrote a flagless command, which would open Settings at every login.
+    if (ToLower(existingValue).find(L"--tray") == std::wstring::npos) return true;
+    // AND THE CASE THAT BIT A REAL USER: the value survives the exe being moved or
+    // replaced, so login keeps launching a stale copy while the user runs a new one and
+    // reasonably concludes a shipped feature is missing. Repair it to whatever is running
+    // now. Operator decision 2026-09-07, with the trade-off stated: running a portable
+    // copy once will repoint autostart at it.
+    const std::wstring stored = AutostartExeFromCommand(existingValue);
+    if (stored.empty() || currentExe.empty()) return false;   // never guess
+    return ToLower(stored) != ToLower(currentExe);
 }
 
 bool GetStartWithWindows() {
@@ -532,9 +558,8 @@ void MigrateAutostartCommand() {
     if (query != ERROR_SUCCESS) return;
 
     const std::wstring existingValue(value.data());
-    if (!AutostartNeedsMigration(existingValue)) return;
-
     const std::wstring exe = GetExePath();
+    if (!AutostartNeedsMigration(existingValue, exe)) return;
     if (exe.empty()) return;
     const std::wstring command = AutostartCommand(exe);
     const DWORD commandBytes =

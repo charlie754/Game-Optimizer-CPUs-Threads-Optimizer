@@ -41,11 +41,15 @@ int ReadServiceStartValue(const wchar_t* serviceName);
 // ---- Autostart (HKCU\Software\Microsoft\Windows\CurrentVersion\Run) ---------
 // The value is named "GameOptimizer".
 std::wstring AutostartCommand(const std::wstring& exePath);
-bool AutostartNeedsMigration(const std::wstring& existingValue);
+std::wstring AutostartExeFromCommand(const std::wstring& command);
+bool AutostartNeedsMigration(const std::wstring& existingValue,
+                             const std::wstring& currentExe);
 bool GetStartWithWindows();
 bool SetStartWithWindows(bool on);
-// Older builds wrote a flagless command, which would make login startup open Settings.
-// Repairs only an existing value; an absent value means the user left autostart disabled.
+// Repairs an existing value that lacks --tray, or that names a different exe copy. The flag
+// test is a substring search, so a stored command whose PATH happens to contain "--tray" reads
+// as already migrated; that is a pre-existing limitation of the flag half, not of the path half.
+// An absent value means the user left autostart disabled and is left alone.
 void MigrateAutostartCommand();
 
 // ---- Migration from the previous product name ("CoreDirector") --------------

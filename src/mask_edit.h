@@ -14,7 +14,8 @@ bool IEquals(const std::wstring& a, const std::wstring& b);
 // Pure helpers behind the "Add mask..." / "Remove mask" actions on the Core map page.
 // Nothing here places a thread anywhere; these only decide whether a NAME for a set of
 // logical processors is acceptable, and what to tell the user when one survives a topology
-// change. See docs\superpowers\specs\2026-08-31-custom-masks-design.md section 5.
+// change. The design note behind these rules lives in the project's internal engineering log,
+// which is not published; everything the rules actually do is in this file and its tests.
 
 // Leading and trailing whitespace stripped. The caller stores THIS form, so a name typed
 // as "  Streaming " cannot later fail to match "Streaming".

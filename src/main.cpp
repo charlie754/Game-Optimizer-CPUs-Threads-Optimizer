@@ -497,9 +497,24 @@ int RunVCacheSet(int requestedValue) {
     }
 
     const int priorRecordedStart = cfg.vcacheOriginalStart;
-    const DWORD targetStart = requestedValue == 1
+    // THE TWO KEYS GET INDEPENDENTLY COMPUTED VALUES ON RESTORE. Sharing one was a shipped
+    // bug. They may still coincide - a machine whose driver Start was recorded as 2 restores
+    // both to 2 - but each is derived on its own rather than one being copied to the other.
+    // cfg.vcacheOriginalStart records the DRIVER'S original Start only - the disable branch
+    // below sets it from driverStart and never looks at the service. Writing it to both keys
+    // left amd3dvcacheSvc at Manual(3) while AMD's own INF installs it SERVICE_AUTO_START(2),
+    // so after a reboot the driver loaded, the service did not, and the optimizer was silently
+    // dead. Measured in the field: StartServiceW failed with 1068 (ERROR_SERVICE_DEPENDENCY_FAIL)
+    // five times before anyone worked out why.
+    //   amd3dvcache     INF StartType = 3  SERVICE_DEMAND_START
+    //   amd3dvcacheSvc  INF StartType = 2  SERVICE_AUTO_START, Dependencies = amd3dvcache
+    // Disabling still sends 4 to both, which is correct: both are meant to be off.
+    const DWORD driverTarget = requestedValue == 1
         ? 4u
-        : static_cast<DWORD>(cfg.vcacheOriginalStart >= 0 ? cfg.vcacheOriginalStart : 3);
+        : static_cast<DWORD>(VCacheRestoreDriverStart(cfg.vcacheOriginalStart));
+    const DWORD serviceTarget = requestedValue == 1
+        ? 4u
+        : static_cast<DWORD>(VCacheServiceStartTypeFor(false));
     if (requestedValue == 1) {
         // Record the measured driver value before disabling anything. Manual (3) is common,
         // not guaranteed; a guessed restore value would silently change the user's setup.
@@ -512,7 +527,7 @@ int RunVCacheSet(int requestedValue) {
         }
     }
 
-    LONG driverWrite = WriteFixedServiceStartValue(kVCacheDriverKeyPath, targetStart);
+    LONG driverWrite = WriteFixedServiceStartValue(kVCacheDriverKeyPath, driverTarget);
     if (driverWrite != ERROR_SUCCESS) {
         if (requestedValue == 1)
             RestoreVCacheConfigValue(cfg, priorRecordedStart, configPath);
@@ -520,7 +535,7 @@ int RunVCacheSet(int requestedValue) {
         return 6;
     }
 
-    LONG serviceWrite = WriteFixedServiceStartValue(kVCacheServiceKeyPath, targetStart);
+    LONG serviceWrite = WriteFixedServiceStartValue(kVCacheServiceKeyPath, serviceTarget);
     if (serviceWrite != ERROR_SUCCESS) {
         const LONG driverRollback =
             WriteFixedServiceStartValue(kVCacheDriverKeyPath, static_cast<DWORD>(driverStart));
@@ -550,9 +565,9 @@ int RunVCacheSet(int requestedValue) {
         }
     }
 
-    LogLine(L"[vcache-set] configured amd3dvcache and amd3dvcacheSvc Start=%lu; "
+    LogLine(L"[vcache-set] configured amd3dvcache Start=%lu, amd3dvcacheSvc Start=%lu; "
             L"vcache_original_start=%d; restart required",
-            static_cast<unsigned long>(targetStart), cfg.vcacheOriginalStart);
+            static_cast<unsigned long>(driverTarget), static_cast<unsigned long>(serviceTarget), cfg.vcacheOriginalStart);
     return 0;
 }
 
@@ -1113,10 +1128,11 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE hPrevInst, LPWSTR lpCmdLine, int 
     }
 
     // ---- The environment warning: a GATE, not a notification ----------------
-    // Once at startup, on every launch, and on --tray too. No suppression, no gating by CPU
-    // and no "don't show again" - all three are operator decisions, not omissions. It builds
-    // nothing at all unless Windows Game Mode is ON or the AMD V-Cache optimizer is present,
-    // and on that ordinary machine this line costs nothing and returns at once.
+    // Once at startup, on every launch, and on --tray too. A per-warning "don't show this
+    // again" exists for the AMD V-Cache section ONLY, added on operator instruction
+    // 2026-09-06. There is still no suppression of the Game Mode half and no gating by CPU;
+    // both remain deliberate. It builds nothing unless Windows Game Mode is ON or the AMD
+    // V-Cache agent is running with its warning enabled, and otherwise returns at once.
     //
     // MODAL OVER SETTINGS, AND THAT IS WHY SETTINGS IS OPENED FIRST. The operator tested a
     // modeless build and reported the warning "hiding behind the main window", then tested a

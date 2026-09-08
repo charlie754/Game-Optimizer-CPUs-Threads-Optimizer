@@ -829,7 +829,7 @@ enum : int {
 };
 
 // Added separately so the stable control ids above keep their numeric values.
-enum : int { IDC_VCACHE_MANAGE = 1600, IDC_VCACHE_RESTORE = 1601 };
+enum : int { IDC_VCACHE_MANAGE = 1600, IDC_VCACHE_RESTORE = 1601, IDC_VCACHE_WARN = 1602 };
 
 // The Core map page's "Add mask..." / "Remove mask" buttons. Their own block, above every
 // id that WM_COMMAND already dispatches on, so nothing existing shifts.
@@ -1029,6 +1029,7 @@ struct SettingsState {
     // The checkbox carries no description paragraph - the operator removed it. Its caption
     // says what it does; the removed text repeated that and added driver detail that misled.
     HWND hVCacheManage = nullptr, hVCacheRestore = nullptr;
+    HWND hVCacheWarn = nullptr;
     HWND hPollLbl = nullptr, hPoll = nullptr;
     HWND hGameModeStatus = nullptr, hVCacheStatus = nullptr, hVCacheRestoreHint = nullptr;
     HWND hVCacheEffect = nullptr;
@@ -2337,6 +2338,7 @@ void DrawCpuMeterDim(HDC dc, const RECT& rc, double pct, int dpi, double thresho
 void StoreGeneralToWork(SettingsState* st) {
     st->work.startWithWindows = IsChecked(st->hStartup);
     st->work.notifications = IsChecked(st->hNotify);
+    st->work.showVCacheWarning = IsChecked(st->hVCacheWarn);
     int v = 0;
     if (ParseIntW(Trim(GetText(st->hPoll)), v)) st->work.pollMs = v;
 }
@@ -2454,7 +2456,7 @@ void OnVCacheManageToggle(SettingsState* st, HWND hwnd) {
                         L"Game Optimizer", MB_OK | MB_ICONWARNING);
         }
         // Set the box from reality on both ERROR_CANCELLED and other failures
-        SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
+        SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(ReadServiceStartValue(L"amd3dvcacheSvc")));
         RefreshEnvironmentStatus(st->env);
         if (UpdateEnvironmentSection(st)) SettingsLayout(st, hwnd);
         RedrawSettings(hwnd);
@@ -2482,7 +2484,7 @@ void OnVCacheManageToggle(SettingsState* st, HWND hwnd) {
     }
 
     // Always set the box from the final real state, success or not
-    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
+    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(ReadServiceStartValue(L"amd3dvcacheSvc")));
     RefreshEnvironmentStatus(st->env);
     if (UpdateEnvironmentSection(st)) SettingsLayout(st, hwnd);
     RedrawSettings(hwnd);
@@ -2701,7 +2703,7 @@ bool UpdateEnvironmentSection(SettingsState* st) {
     // class as the stale-snapshot defect above, one doorway along. This costs nothing: both
     // Start values were already read at the top of this function, which the timer calls once
     // a second, so the control simply stops being able to lie.
-    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
+    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(ReadServiceStartValue(L"amd3dvcacheSvc")));
 
     return hadEffect != hasEffect || hadRestoreHint != hasRestoreHint;
 }
@@ -3388,7 +3390,9 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         y = c.bottom + GAP;
     } else {
         int iw = W - 2 * PAD;
-        const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW + GT + ROW;
+        // The startup warning preference is independent of stopping the optimizer, so it
+        // gets its own row. Reserve that row in the card too, or the poll field spills out.
+        const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW + GT + ROW + GT + ROW;
         RECT c = AddCard(y, cardH, x0, W);
         int ix = c.left + PAD, iy = c.top + PAD;
         Put(st->hGenHdr, ix, iy, iw, HH);
@@ -3397,6 +3401,8 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hNotify, ix + theme::Dp(212, dpi), iy, theme::Dp(240, dpi), ROW);
         iy += ROW + GT;
         Put(st->hVCacheManage, ix, iy, iw, ROW);
+        iy += ROW + GT;
+        Put(st->hVCacheWarn, ix, iy, iw, ROW);
         iy += ROW + GT;
         Put(st->hPollLbl, ix, iy + (ROW - LH) / 2, theme::Dp(150, dpi), LH);
         Put(st->hPoll, ix + theme::Dp(150, dpi), iy + (ROW - RH) / 2,
@@ -3814,7 +3820,7 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
     HWND coremap[]  = { st->hMapHdr, st->hTopoText, st->hMapMaskLbl, st->hMapMask,
                         st->hMapReset, st->hMapAdd, st->hMapRemove, st->hMap, st->hMapFail };
     HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify,
-                        st->hVCacheManage, st->hPollLbl, st->hPoll,
+                        st->hVCacheManage, st->hVCacheWarn, st->hPollLbl, st->hPoll,
                         st->hGameModeStatus, st->hVCacheStatus, st->hVCacheRestoreHint,
                         st->hVCacheEffect,
                         st->hBlocked, st->hInspect };
@@ -3982,7 +3988,8 @@ void ApplyChanges(SettingsState* st, HWND hwnd) {
     SetWindowTextW(st->hPoll, std::to_wstring(st->work.pollMs).c_str());
     SetChecked(st->hNotify, st->work.notifications);
     SetChecked(st->hStartup, st->work.startWithWindows);
-    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
+    SetChecked(st->hVCacheWarn, st->work.showVCacheWarning);
+    SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(ReadServiceStartValue(L"amd3dvcacheSvc")));
     RepaintChrome(hwnd);   // masks may have been repaired, so the stat row may have moved
 }
 
@@ -4494,7 +4501,13 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 hwnd, L"BUTTON",
                 L"Stop AMD's 3D V-Cache optimizer",
                 BS_AUTOCHECKBOX | WS_TABSTOP, IDC_VCACHE_MANAGE);
-            // No description STATIC under the checkbox - the operator removed the paragraph,
+            // This reverses the startup checkbox without changing whether AMD's optimizer
+            // runs. It is an ordinary config preference, committed on OK/Apply below.
+            st->hVCacheWarn = Mk(
+                hwnd, L"BUTTON",
+                L"Show the AMD 3D V-Cache warning at startup",
+                BS_AUTOCHECKBOX | WS_TABSTOP, IDC_VCACHE_WARN);
+            // No description STATIC under the stop checkbox - the operator removed the paragraph,
             // and the control went with it so the layout closes up instead of leaving a gap.
             // The restore control is a safety net for users who used the old disable feature.
             // It exists only when vcache_original_start is recorded (>= 0).
@@ -4597,7 +4610,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // are now ours - see CheckBoxProc for why this is a subclass and not
                 // BS_OWNERDRAW, which would destroy BM_GETCHECK on these controls.
                 HWND checks[] = { st->hEnabled, st->hAutoPin, st->hStartup, st->hNotify,
-                                  st->hVCacheManage };
+                                  st->hVCacheManage, st->hVCacheWarn };
                 for (HWND h : checks) {
                     UseClassicChrome(h);
                     if (h) SetWindowSubclass(h, CheckBoxProc, kCheckSubclassId, 0);
@@ -4609,7 +4622,8 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             SetChecked(st->hStartup, st->work.startWithWindows);
             SetChecked(st->hNotify, st->work.notifications);
-            SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(cd::IsAmdVCacheAgentRunning()));
+            SetChecked(st->hVCacheWarn, st->work.showVCacheWarning);
+            SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(ReadServiceStartValue(L"amd3dvcacheSvc")));
             SetWindowTextW(st->hPoll, std::to_wstring(st->work.pollMs).c_str());
 
             FillMaskCombo(st->hMapMask, st->work,
@@ -4636,6 +4650,21 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetTimer(hwnd, kStatusTimer, 1000, nullptr);
             return 0;
         }
+        case WM_ENABLE:
+            // Settings opens BEFORE the modal startup warning. That warning can save the
+            // suppression while this window is disabled, so refresh the preference as the
+            // owner is re-enabled; otherwise the next Apply would undo it from this stale
+            // snapshot. Compare live to work first, so a modal closing with the preference
+            // unchanged does not touch the checkbox at all. It compares, it does not arbitrate:
+            // when the two genuinely disagree, live wins and an unsaved checkbox edit made
+            // while this window was disabled is overwritten. That is the documented behaviour,
+            // not a guarantee that such an edit is preserved.
+            if (wp && st && st->out &&
+                st->work.showVCacheWarning != st->out->showVCacheWarning) {
+                st->work.showVCacheWarning = st->out->showVCacheWarning;
+                SetChecked(st->hVCacheWarn, st->work.showVCacheWarning);
+            }
+            return 0;
         case WM_SIZE:
             // The class deliberately has no CS_HREDRAW/CS_VREDRAW, so a resize only
             // invalidates the newly exposed strip. Every child just moved, so the repaint

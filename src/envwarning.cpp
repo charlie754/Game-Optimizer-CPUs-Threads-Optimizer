@@ -46,7 +46,8 @@ const wchar_t kEnvWarnClass[] = L"GameOptimizerEnvWarning";
 enum : int {
     IDC_EW_OPENGM = 3101,
     IDC_EW_CLOSE,
-    IDC_EW_VCDISABLE
+    IDC_EW_VCDISABLE,
+    IDC_EW_VCHIDE
 };
 
 // The only string in this window that names a change this app can make to the machine, and
@@ -58,8 +59,8 @@ enum : int {
 const wchar_t kVCacheStopCaption[] = L"Stop AMD 3D V-Cache optimizer";
 
 // EXACTLY ONE OF THESE WINDOWS AT A TIME, AND THAT IS NOT SUPPRESSION. The single call site
-// runs once per launch and the window always appears; this only stops a second identical
-// window stacking on the first. Since the window became modal the guard can no longer fire -
+// runs once per launch and the warning decision controls whether it appears; this only stops a
+// second identical window stacking on the first. Since it became modal the guard cannot fire -
 // the call does not return while a window is up - and it is kept because a guard that cannot
 // fire is cheaper than a comment explaining why it was removed. It doubles as the modal
 // loop's "this window is gone" flag: WM_NCDESTROY clears it.
@@ -80,6 +81,25 @@ const UINT kLineFmt = DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_EN
 void SetCtlFont(HWND h, theme::Font f, int dpi) {
     if (!h) return;
     SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(theme::GetFont(f, dpi)), TRUE);
+}
+
+// A themed BS_AUTOCHECKBOX paints its own label with the visual style's near-black text
+// colour and ignores WM_CTLCOLORBTN, which on this dark card is an unreadable label -
+// measured on screen. SetWindowTheme(h,L"",L"") is the documented way off that path: the
+// control falls back to classic drawing, which DOES honour WM_CTLCOLORBTN. The cost is a
+// classic tick box, the same trade settings.cpp already accepts. Bound at runtime so the
+// exe gains no new import.
+void UseClassicChrome(HWND h) {
+    typedef HRESULT(WINAPI * SetWindowThemeFn)(HWND, LPCWSTR, LPCWSTR);
+    static SetWindowThemeFn fn = nullptr;
+    static bool tried = false;
+    if (!tried) {
+        tried = true;
+        HMODULE m = LoadLibraryW(L"uxtheme.dll");   // kept for process life, as comctl32 does
+        if (m) fn = reinterpret_cast<SetWindowThemeFn>(
+                        reinterpret_cast<void*>(GetProcAddress(m, "SetWindowTheme")));
+    }
+    if (fn && h) fn(h, L"", L"");
 }
 
 // The content rect of a card. Mirrors what theme::DrawCard returns, so layout (which has no
@@ -122,10 +142,10 @@ struct EnvWarnState {
 
     // THE ONE BORROW IN THIS STRUCT, and it is sound only because this window is MODAL:
     // ShowEnvironmentWarning does not return while the window exists, so the caller's Config
-    // outlives every message this state will ever see. NOTHING IN THIS WINDOW WRITES THROUGH
-    // IT ANY MORE: the V-Cache button stops a service and records nothing, so there is no
-    // config.ini value for this process to go stale on. The borrow is kept so the window can
-    // read the live Config without re-loading it, and any future write has a sound route.
+    // outlives every message this state will ever see. The V-Cache suppression checkbox now
+    // writes through it and saves immediately: saving a private copy would leave the rest of
+    // the app free to overwrite the preference with its older value on the next config save.
+    // The stop button still only stops the service and records nothing in this Config.
     Config* cfg = nullptr;
 
     // Whether the V-Cache card carries its stop button. Decided once, before the window is
@@ -141,12 +161,14 @@ struct EnvWarnState {
 
     int dpi = 96;
     HBRUSH bgBrush = nullptr;   // WM_CTLCOLOR* fallback; freed in WM_NCDESTROY
+    HBRUSH cardBrush = nullptr; // card background brush for hVcHide; freed in WM_NCDESTROY
 
     RECT gmCard = { 0, 0, 0, 0 };
     RECT vcCard = { 0, 0, 0, 0 };
 
     HWND hGm = nullptr, hVc = nullptr, hOpen = nullptr, hClose = nullptr;
     HWND hVcDisable = nullptr;
+    HWND hVcHide = nullptr;
 };
 
 // A read-only EDIT sends WM_CTLCOLORSTATIC, not WM_CTLCOLOREDIT. Left alone it would be
@@ -231,6 +253,10 @@ EnvWarnMetrics MeasureContent(EnvWarnState* st, HDC dc, int clientW, int dpi) {
         // machine whose optimizer agent is not running, which is every machine once anyone
         // has used this button.
         if (st->vcStopAvailable) m.vcCardH += GAPT + BH;
+        // Every V-Cache card has its own suppression row, even without a stop button. Use
+        // the decision, not hVcHide: this measure also runs BEFORE any controls exist, and
+        // sizing from a null handle then would put the checkbox outside the card on opening.
+        m.vcCardH += GAPT + BH;
         h += m.vcCardH + GAP;
     }
     h += BH + PAD;   // the footer row that carries Close
@@ -283,6 +309,9 @@ void EnvWarnLayout(EnvWarnState* st, HWND hwnd) {
         // The button row is not compressible: the floor has to reserve it, or squeezing the
         // window would give the deficit back out of a row that still has to be drawn.
         if (st->decision.showVCache && st->vcStopAvailable) vcFloor += GAPT + BH;
+        // The checkbox is a separate, equally non-compressible row. Only body text may
+        // surrender height when the window is made smaller; both controls stay reachable.
+        if (st->decision.showVCache) vcFloor += GAPT + BH;
         int gmRoom = m.gmCardH - gmFloor;
         int vcRoom = m.vcCardH - vcFloor;
         if (gmRoom < 0) gmRoom = 0;
@@ -318,9 +347,10 @@ void EnvWarnLayout(EnvWarnState* st, HWND hwnd) {
         const RECT in = CardInner(st->vcCard, d);
         const int bt = in.top + headH + GAPT;
         int bb = in.bottom;
-        // The body stops above the button row when there is one, exactly as the Game Mode
-        // card's body stops above its own.
+        // The body stops above BOTH control rows. The checkbox has its own row below the
+        // stop button, or takes that button's place when there is no stop action to offer.
         if (st->hVcDisable) bb -= GAPT + BH;
+        if (st->hVcHide) bb -= GAPT + BH;
         if (bb < bt + minTxt) bb = bt + minTxt;
         MoveWindow(st->hVc, in.left, bt, in.right - in.left, bb - bt, TRUE);
         if (st->hVcDisable) {
@@ -329,8 +359,11 @@ void EnvWarnLayout(EnvWarnState* st, HWND hwnd) {
             // A caption wider than the card ellipsises inside the button rather than running
             // off the card edge.
             if (bw > avail) bw = avail;
-            MoveWindow(st->hVcDisable, in.left, in.bottom - BH, bw, BH, TRUE);
+            const int buttonY = in.bottom - BH - (st->hVcHide ? GAPT + BH : 0);
+            MoveWindow(st->hVcDisable, in.left, buttonY, bw, BH, TRUE);
         }
+        if (st->hVcHide)
+            MoveWindow(st->hVcHide, in.left, in.bottom - BH, in.right - in.left, BH, TRUE);
         y = st->vcCard.bottom + GAP;
     } else {
         SetRectEmpty(&st->vcCard);
@@ -512,6 +545,10 @@ LRESULT CALLBACK EnvWarnProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     st->hVcDisable = Mk(hwnd, L"BUTTON", kVCacheStopCaption,
                                         BS_OWNERDRAW | WS_TABSTOP, IDC_EW_VCDISABLE);
                 }
+                // A real checkbox keeps BM_GETCHECK and keyboard toggling in Win32's
+                // hands, just like the Settings checkboxes; owner-draw loses that state.
+                st->hVcHide = Mk(hwnd, L"BUTTON", L"Don't show this again",
+                                 BS_AUTOCHECKBOX | WS_TABSTOP, IDC_EW_VCHIDE);
             }
             st->hClose = Mk(hwnd, L"BUTTON", L"Close", BS_OWNERDRAW | WS_TABSTOP,
                             IDC_EW_CLOSE);
@@ -520,7 +557,10 @@ LRESULT CALLBACK EnvWarnProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetCtlFont(st->hVc, theme::Font::UiBody, st->dpi);
             SetCtlFont(st->hOpen, theme::Font::UiBody, st->dpi);
             SetCtlFont(st->hVcDisable, theme::Font::UiBody, st->dpi);
+            SetCtlFont(st->hVcHide, theme::Font::UiBody, st->dpi);
             SetCtlFont(st->hClose, theme::Font::UiBody, st->dpi);
+
+            UseClassicChrome(st->hVcHide);
 
             EnvWarnLayout(st, hwnd);
             if (st->hClose) SetFocus(st->hClose);
@@ -567,8 +607,21 @@ LRESULT CALLBACK EnvWarnProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (msg == WM_CTLCOLORSTATIC && IsReadOnlyEdit(st, ctl)) m = WM_CTLCOLOREDIT;
             HBRUSH b = theme::OnCtlColor(m, dc, ctl);
             if (b) return reinterpret_cast<LRESULT>(b);
-            // Unhandled: still never fall back to the system's light brush.
+
             const theme::Palette& pal = theme::P();
+
+            // The V-Cache suppression checkbox sits inside the V-Cache card, which is painted
+            // with cardBg, not appBg. Paint it with the card background so the label and
+            // checkbox do not leave a mismatched strip behind the row.
+            if (st && msg == WM_CTLCOLORBTN && ctl == st->hVcHide) {
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, pal.textPrimary);
+                SetBkColor(dc, pal.cardBg);
+                if (!st->cardBrush) st->cardBrush = CreateSolidBrush(pal.cardBg);
+                if (st->cardBrush) return reinterpret_cast<LRESULT>(st->cardBrush);
+            }
+
+            // Unhandled: still never fall back to the system's light brush.
             SetBkMode(dc, TRANSPARENT);
             SetTextColor(dc, pal.textSecondary);
             SetBkColor(dc, pal.appBg);
@@ -585,6 +638,7 @@ LRESULT CALLBACK EnvWarnProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetCtlFont(st->hVc, theme::Font::UiBody, st->dpi);
             SetCtlFont(st->hOpen, theme::Font::UiBody, st->dpi);
             SetCtlFont(st->hVcDisable, theme::Font::UiBody, st->dpi);
+            SetCtlFont(st->hVcHide, theme::Font::UiBody, st->dpi);
             SetCtlFont(st->hClose, theme::Font::UiBody, st->dpi);
             const RECT* nr = reinterpret_cast<const RECT*>(lp);
             SetWindowPos(hwnd, nullptr, nr->left, nr->top, nr->right - nr->left,
@@ -606,6 +660,23 @@ LRESULT CALLBACK EnvWarnProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // needs their restart. Three deliberate steps, none of them automatic.
                     if (st) OnVCacheDisable(st, hwnd);
                     return 0;
+                case IDC_EW_VCHIDE:
+                    if (HIWORD(wp) == BN_CLICKED && st && st->cfg && st->hVcHide) {
+                        const bool checked =
+                            SendMessageW(st->hVcHide, BM_GETCHECK, 0, 0) == BST_CHECKED;
+                        // The caption says DON'T show; the config flag says SHOW. Persist
+                        // the inverse now, since this advisory window has no Apply step and
+                        // closing the app later must not be required to remember the choice.
+                        st->cfg->showVCacheWarning = !checked;
+                        std::wstring err;
+                        if (!SaveConfig(GetConfigPath(), *st->cfg, &err)) {
+                            // A failed preference save belongs in the log. Another modal
+                            // warning here would nag someone who just asked for less noise.
+                            LogLine(L"[envwarn] SaveConfig failed for show_vcache_warning: %s",
+                                    err.empty() ? L"(no detail)" : err.c_str());
+                        }
+                    }
+                    return 0;
                 case IDC_EW_CLOSE:
                 case IDOK:
                 case IDCANCEL:
@@ -624,6 +695,7 @@ LRESULT CALLBACK EnvWarnProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_NCDESTROY:
             if (st) {
                 if (st->bgBrush) { DeleteObject(st->bgBrush); st->bgBrush = nullptr; }
+                if (st->cardBrush) { DeleteObject(st->cardBrush); st->cardBrush = nullptr; }
                 delete st;
             }
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
@@ -657,7 +729,8 @@ void RegisterEnvWarnClass() {
 
 void ShowEnvironmentWarning(HWND owner, Config& cfg, const EnvironmentInfo& env,
                             const Topology& topo) {
-    const StartupWarningDecision decision = DecideStartupWarning(env, topo);
+    const StartupWarningDecision decision =
+        DecideStartupWarning(env, topo, cfg.showVCacheWarning);
     // Nothing to report, so nothing is built and NOTHING IS BLOCKED: no window, no window
     // class, no controls, no modal loop. This is the ordinary case on a machine with Game
     // Mode off and no AMD V-Cache optimizer installed, and the caller carries straight on.

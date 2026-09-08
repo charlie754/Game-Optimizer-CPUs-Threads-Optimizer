@@ -2684,22 +2684,99 @@ void Test_T4_NothingPresentStaysGeneric() {
 // U. The Stop toggle, and the anti-stranding restore control.
 // ===========================================================================
 
-void Test_U1_StopBoxIsCheckedWhenTheOptimizerIsNotActive() {
-    Case("U1 the Stop box is checked exactly when the optimizer is NOT active");
-    // "Checked" means stopped. Getting this backwards would show every user a ticked box on a
-    // machine where AMD's optimizer is running normally.
-    CHECK(cd::VCacheStopBoxChecked(false));
-    CHECK(!cd::VCacheStopBoxChecked(true));
+void Test_U1_StopBoxIsCheckedWhenTheServiceIsDisabled() {
+    Case("U1 the Stop box is checked exactly when the SERVICE is configured Disabled");
+    // "Checked" means stopped, and stopped is a SERVICE START TYPE, not a running process.
+    // Getting this backwards would show every user a ticked box on a machine where AMD's
+    // optimizer is configured normally.
+    CHECK(cd::VCacheStopBoxChecked(4));
+    CHECK(!cd::VCacheStopBoxChecked(2));
 }
 
-void Test_U2_StopBoxDependsOnNothingButTheLiveFlag() {
-    Case("U2 the Stop box depends on the live flag alone, never on config");
-    // This control has NO persisted value. It is a live mirror of the machine, so its helper
-    // takes exactly one argument and there is nowhere for a config value to enter. A stored
-    // value would survive the user stopping or starting the service outside our UI, and the
-    // box would then assert a state the machine is not in.
-    CHECK(cd::VCacheStopBoxChecked(false) == true);
-    CHECK(cd::VCacheStopBoxChecked(true) == false);
+void Test_U2_StopBoxDependsOnNothingButTheServiceStartType() {
+    Case("U2 the Stop box depends on the service start type alone, never on config");
+    // This control has NO persisted value. It is a live mirror of the machine's service
+    // configuration, so its helper takes exactly one argument and there is nowhere for a config
+    // value to enter. A stored value would survive the user changing the service outside our UI,
+    // and the box would then assert a state the machine is not in.
+    CHECK(cd::VCacheStopBoxChecked(4) == true);
+    CHECK(cd::VCacheStopBoxChecked(2) == false);
+}
+
+void Test_X1_ServiceDisabledIsChecked() {
+    Case("X1 SERVICE_DISABLED (4) -> box checked");
+    CHECK(cd::VCacheStopBoxChecked(4) == true);
+}
+
+void Test_X2_ServiceAutomaticIsUnchecked() {
+    Case("X2 SERVICE_AUTO (2) -> box unchecked");
+    CHECK(cd::VCacheStopBoxChecked(2) == false);
+}
+
+void Test_X3_ServiceManualIsUnchecked() {
+    Case("X3 SERVICE_MANUAL (3) -> box unchecked");
+    CHECK(cd::VCacheStopBoxChecked(3) == false);
+}
+
+void Test_X4_UnreadableServiceIsUnchecked() {
+    Case("X4 unreadable or missing service (-1) -> box unchecked, the SAFE direction");
+    // It never claims a stop that was not configured. On a machine with no AMD optimizer
+    // at all, the key cannot be read and we must not show a checked box.
+    CHECK(cd::VCacheStopBoxChecked(-1) == false);
+}
+
+void Test_X5_RoundTripProperty() {
+    Case("X5 round-trip: what the click writes and the box shows must agree");
+    // The click writes via VCacheServiceStartTypeFor, the box reads via VCacheStopBoxChecked.
+    CHECK(cd::VCacheStopBoxChecked(cd::VCacheServiceStartTypeFor(true))  == true);
+    CHECK(cd::VCacheStopBoxChecked(cd::VCacheServiceStartTypeFor(false)) == false);
+}
+
+void Test_Y1_AutostartExeFromQuotedCommandWithTray() {
+    Case("Y1 a quoted command with --tray yields just the executable path");
+    CHECK(cd::AutostartExeFromCommand(
+        L"\"C:\\Game Optimizer\\GameOptimizer.exe\" --tray") ==
+        L"C:\\Game Optimizer\\GameOptimizer.exe");
+}
+
+void Test_Y2_AutostartExeFromBareCommandWithTray() {
+    Case("Y2 a bare command with --tray yields just the executable path");
+    CHECK(cd::AutostartExeFromCommand(L"C:\\Apps\\GameOptimizer.exe --tray") ==
+        L"C:\\Apps\\GameOptimizer.exe");
+}
+
+void Test_Y3_AutostartExeEmptyAndUnclosedQuote() {
+    Case("Y3 empty commands and unclosed quotes yield an empty executable path");
+    CHECK(cd::AutostartExeFromCommand(L"") == L"");
+    CHECK(cd::AutostartExeFromCommand(
+        L"\"C:\\Game Optimizer\\GameOptimizer.exe --tray") == L"");
+}
+
+void Test_Y4_SameExeDifferentCaseWithTray() {
+    Case("Y4 the same executable with different letter case and --tray needs no migration");
+    CHECK(cd::AutostartNeedsMigration(
+        L"\"C:\\GAME OPTIMIZER\\GAMEOPTIMIZER.EXE\" --tray",
+        L"c:\\game optimizer\\gameoptimizer.exe") == false);
+}
+
+void Test_Y5_DifferentExePathsWithTray() {
+    Case("Y5 a stale executable path needs migration even with --tray");
+    CHECK(cd::AutostartNeedsMigration(
+        L"\"C:\\Old Copy\\GameOptimizer.exe\" --tray",
+        L"C:\\Game Optimizer\\GameOptimizer.exe") == true);
+}
+
+void Test_Y6_CurrentExeEmptyDifferentPaths() {
+    Case("Y6 an unreadable current executable path must not trigger migration");
+    CHECK(cd::AutostartNeedsMigration(
+        L"\"C:\\Old Copy\\GameOptimizer.exe\" --tray", L"") == false);
+}
+
+void Test_Y7_FlaglessCommandSamePathsReturnsTrue() {
+    Case("Y7 a matching executable path still needs migration without --tray");
+    CHECK(cd::AutostartNeedsMigration(
+        L"\"C:\\Game Optimizer\\GameOptimizer.exe\"",
+        L"C:\\Game Optimizer\\GameOptimizer.exe") == true);
 }
 
 void Test_U3_RestoreControlAppearsOnlyForUsersTheOldFeatureStranded() {
@@ -2734,6 +2811,39 @@ void Test_U5_StoppingDisablesAndClearingRestoresAmdsOwnDefault() {
     // fact leave the service permanently dead - it would never start at sign-in again, which is
     // exactly the trap the operator caught in the shipped helper text.
     CHECK_EQ(cd::VCacheServiceStartTypeFor(false), 2);
+}
+
+// ===========================================================================
+// V. V-Cache restore logic helpers.
+// ===========================================================================
+
+void Test_V1_RestoreDriverStartWithRecordedThree() {
+    Case("V1 VCacheRestoreDriverStart(3) == 3");
+    CHECK_EQ(cd::VCacheRestoreDriverStart(3), 3);
+}
+
+void Test_V2_RestoreDriverStartWithRecordedTwo() {
+    Case("V2 VCacheRestoreDriverStart(2) == 2");
+    CHECK_EQ(cd::VCacheRestoreDriverStart(2), 2);
+}
+
+void Test_V3_RestoreDriverStartWithNegativeOne() {
+    Case("V3 VCacheRestoreDriverStart(-1) == 3");
+    CHECK_EQ(cd::VCacheRestoreDriverStart(-1), 3);
+}
+
+void Test_V4_ServiceRestoreTypeIsAlwaysTwo() {
+    Case("V4 VCacheServiceStartTypeFor(false) == 2 — independent of recorded driver original");
+    // This is the actual bug: the service's restore value is INDEPENDENT of the driver's
+    // original recorded value. AMD's INF always installs the service as SERVICE_AUTO_START (2),
+    // so restore always means 2. The fix ensures driver and service are written separately.
+    CHECK_EQ(cd::VCacheServiceStartTypeFor(false), 2);
+}
+
+void Test_V5_ServiceDisableTypeIsAlwaysFour() {
+    Case("V5 VCacheServiceStartTypeFor(true) == 4 — the disable direction is unchanged");
+    // On disable, both driver and service go to Disabled (4). This direction is correct and unchanged.
+    CHECK_EQ(cd::VCacheServiceStartTypeFor(true), 4);
 }
 
 // ===========================================================================
@@ -2793,24 +2903,24 @@ void Test_I2_AutostartCommandQuotesExePath() {
 
 void Test_I3_EmptyAutostartDoesNotNeedMigration() {
     Case("I3 an absent autostart value does not need migration");
-    CHECK(!cd::AutostartNeedsMigration(L""));
+    CHECK(!cd::AutostartNeedsMigration(L"", L"C:\\Game Optimizer\\GameOptimizer.exe"));
 }
 
 void Test_I4_BareAutostartNeedsMigration() {
     Case("I4 a quoted bare executable path needs migration");
-    CHECK(cd::AutostartNeedsMigration(L"\"C:\\Game Optimizer\\GameOptimizer.exe\""));
+    CHECK(cd::AutostartNeedsMigration(L"\"C:\\Game Optimizer\\GameOptimizer.exe\"", L"C:\\Game Optimizer\\GameOptimizer.exe"));
 }
 
 void Test_I5_TrayAutostartDoesNotNeedMigration() {
     Case("I5 an autostart command with --tray does not need migration");
     CHECK(!cd::AutostartNeedsMigration(
-        L"\"C:\\Game Optimizer\\GameOptimizer.exe\" --tray"));
+        L"\"C:\\Game Optimizer\\GameOptimizer.exe\" --tray", L"C:\\Game Optimizer\\GameOptimizer.exe"));
 }
 
 void Test_I6_TrayDetectionIsCaseInsensitive() {
     Case("I6 an uppercase --TRAY flag does not need migration");
     CHECK(!cd::AutostartNeedsMigration(
-        L"\"C:\\Game Optimizer\\GameOptimizer.exe\" --TRAY"));
+        L"\"C:\\Game Optimizer\\GameOptimizer.exe\" --TRAY", L"C:\\Game Optimizer\\GameOptimizer.exe"));
 }
 
 // ===========================================================================
@@ -3077,7 +3187,7 @@ void Test_N1_NoDetectedConditionDoesNotShow() {
     cd::EnvironmentInfo env;
     env.gameModeState = cd::GameModeState::Off;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSingleDomain());
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
     CHECK(!decision.Any());
 }
 
@@ -3087,7 +3197,7 @@ void Test_N2_MultiDomainAmdGameModeIsActionable() {
     env.gameModeState = cd::GameModeState::On;
     env.isAmd = true;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSymmetricDualCcd());
+        cd::DecideStartupWarning(env, MakeSymmetricDualCcd(), true);
     CHECK(decision.showGameMode);
     CHECK(decision.gameModeTone == cd::WarningTone::Actionable);
 }
@@ -3098,7 +3208,7 @@ void Test_N3_SingleDomainGameModeIsInformational() {
     env.gameModeState = cd::GameModeState::On;
     env.isAmd = true;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSingleDomain());
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
     CHECK(decision.showGameMode);
     CHECK(decision.gameModeTone == cd::WarningTone::Informational);
 }
@@ -3109,7 +3219,7 @@ void Test_N4_NonAmdGameModeIsInformational() {
     env.gameModeState = cd::GameModeState::On;
     env.isAmd = false;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSymmetricDualCcd());
+        cd::DecideStartupWarning(env, MakeSymmetricDualCcd(), true);
     CHECK(decision.showGameMode);
     CHECK(decision.gameModeTone == cd::WarningTone::Informational);
 }
@@ -3119,7 +3229,7 @@ void Test_N5_NotDeterminableDoesNotShowGameMode() {
     cd::EnvironmentInfo env;
     env.gameModeState = cd::GameModeState::NotDeterminable;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSymmetricDualCcd());
+        cd::DecideStartupWarning(env, MakeSymmetricDualCcd(), true);
     CHECK(!decision.showGameMode);
 }
 
@@ -3131,7 +3241,7 @@ void Test_N6_VCacheOnlyShows() {
     env.amdVCacheServiceRunning = true;
     env.amdVCacheAgentRunning = true;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSingleDomain());
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
     CHECK(!decision.showGameMode);
     CHECK(decision.showVCache);
     CHECK(decision.Any());
@@ -3145,7 +3255,7 @@ void Test_N7_BothDetectedConditionsShow() {
     env.amdVCacheDriverRunning = true;
     env.amdVCacheAgentRunning = true;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSingleDomain());
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
     CHECK(decision.showGameMode);
     CHECK(decision.showVCache);
     CHECK(decision.Any());
@@ -3234,7 +3344,7 @@ void Test_N10_VCacheInstalledButNotRunningDoesNotShow() {
     // is installed but idle, so no warning.
     env.amdVCacheAgentRunning = false;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSingleDomain());
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
     CHECK(!decision.showVCache);
     CHECK(!decision.Any());
 }
@@ -3249,7 +3359,7 @@ void Test_N11_DriverAndServiceRunningWithoutAgentDoesNotShow() {
     env.amdVCacheDriverRunning = true;
     env.amdVCacheAgentRunning = false;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSingleDomain());
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
     CHECK(!decision.showVCache);
 }
 
@@ -3263,9 +3373,90 @@ void Test_N12_AgentRunningShowsVCache() {
     env.amdVCacheDriverRunning = true;
     env.amdVCacheAgentRunning = true;
     const cd::StartupWarningDecision decision =
-        cd::DecideStartupWarning(env, MakeSingleDomain());
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
     CHECK(decision.showVCache);
     CHECK(decision.Any());
+}
+
+// ===========================================================================
+// T. Per-warning startup preference (separate from the earlier agent-diagnostic T block).
+//
+// Suppression belongs to the V-Cache section alone. In particular, Game Mode must still
+// open the warning when the optimizer is active but the user has hidden its section.
+// Config round-trips pin both the opt-out and the upgrade default: an older config must
+// keep showing the warning until its user explicitly asks otherwise.
+// ===========================================================================
+void Test_T1_AgentRunningWithWarningEnabledShowsVCache() {
+    Case("T1 agent running with startup warning enabled shows V-Cache");
+    cd::EnvironmentInfo env;
+    env.amdVCacheAgentRunning = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
+    CHECK(decision.showVCache);
+}
+
+void Test_T2_AgentRunningWithWarningSuppressedHidesVCache() {
+    Case("T2 agent running with startup warning suppressed hides V-Cache");
+    cd::EnvironmentInfo env;
+    env.amdVCacheAgentRunning = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain(), false);
+    CHECK(!decision.showVCache);
+}
+
+void Test_T3_AgentNotRunningWithWarningEnabledHidesVCache() {
+    Case("T3 agent not running with startup warning enabled hides V-Cache");
+    cd::EnvironmentInfo env;
+    env.amdVCacheAgentRunning = false;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain(), true);
+    CHECK(!decision.showVCache);
+}
+
+void Test_T4_VCacheSuppressionDoesNotSuppressGameMode() {
+    Case("T4 V-Cache suppression leaves Game Mode On visible and opens the warning");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::On;
+    env.isAmd = true;
+    env.amdVCacheAgentRunning = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSymmetricDualCcd(), false);
+    CHECK(decision.showGameMode);
+    CHECK(decision.Any());
+    CHECK(!decision.showVCache);
+}
+
+void Test_T5_VCacheSuppressedAndGameModeOffDoesNotShow() {
+    Case("T5 agent running but suppressed with Game Mode Off does not open the warning");
+    cd::EnvironmentInfo env;
+    env.gameModeState = cd::GameModeState::Off;
+    env.amdVCacheAgentRunning = true;
+    const cd::StartupWarningDecision decision =
+        cd::DecideStartupWarning(env, MakeSingleDomain(), false);
+    CHECK(!decision.Any());
+}
+
+void Test_T6_VCacheWarningSuppressionRoundTrips() {
+    Case("T6 V-Cache startup warning opt-out is written and survives parsing");
+    cd::Config c;
+    c.showVCacheWarning = false;
+    const std::wstring serialized = cd::SerializeConfig(c);
+    CHECK(serialized.find(L"show_vcache_warning") != std::wstring::npos);
+    cd::Config roundTripped;
+    std::wstring err;
+    CHECK(cd::ParseConfig(serialized, roundTripped, &err));
+    CHECK(!roundTripped.showVCacheWarning);
+}
+
+void Test_T7_MissingVCacheWarningPreferenceDefaultsTrue() {
+    Case("T7 an older config without the V-Cache warning key keeps the warning enabled");
+    cd::Config c;
+    // Parse into a previously suppressed config too: the missing key must use the member
+    // default, not inherit whatever happened to be in the destination before loading.
+    c.showVCacheWarning = false;
+    std::wstring err;
+    CHECK(cd::ParseConfig(L"[general]\nfirst_run_done=1\n", c, &err));
+    CHECK(c.showVCacheWarning);
 }
 
 cd::Mask MakeMask(const std::wstring& name, const std::vector<ULONG>& ids, bool derived) {
@@ -3885,11 +4076,28 @@ int main() {
     Test_T4_NothingPresentStaysGeneric();
 
     std::printf("\n== U. The Stop toggle and the restore safety net ==\n");
-    Test_U1_StopBoxIsCheckedWhenTheOptimizerIsNotActive();
-    Test_U2_StopBoxDependsOnNothingButTheLiveFlag();
+    Test_U1_StopBoxIsCheckedWhenTheServiceIsDisabled();
+    Test_U2_StopBoxDependsOnNothingButTheServiceStartType();
+    Test_X1_ServiceDisabledIsChecked();
+    Test_X2_ServiceAutomaticIsUnchecked();
+    Test_X3_ServiceManualIsUnchecked();
+    Test_X4_UnreadableServiceIsUnchecked();
+    Test_X5_RoundTripProperty();
+    Test_Y1_AutostartExeFromQuotedCommandWithTray();
+    Test_Y2_AutostartExeFromBareCommandWithTray();
+    Test_Y3_AutostartExeEmptyAndUnclosedQuote();
+    Test_Y4_SameExeDifferentCaseWithTray();
+    Test_Y5_DifferentExePathsWithTray();
+    Test_Y6_CurrentExeEmptyDifferentPaths();
+    Test_Y7_FlaglessCommandSamePathsReturnsTrue();
     Test_U3_RestoreControlAppearsOnlyForUsersTheOldFeatureStranded();
     Test_U4_ParkedWarningNoLongerClaimsStoppingTheServiceIsUseless();
     Test_U5_StoppingDisablesAndClearingRestoresAmdsOwnDefault();
+    Test_V1_RestoreDriverStartWithRecordedThree();
+    Test_V2_RestoreDriverStartWithRecordedTwo();
+    Test_V3_RestoreDriverStartWithNegativeOne();
+    Test_V4_ServiceRestoreTypeIsAlwaysTwo();
+    Test_V5_ServiceDisableTypeIsAlwaysFour();
 
     std::printf("\n== V. Naming a custom mask ==\n");
     Test_V1_EmptyAndWhitespaceOnlyNamesAreEmpty();
@@ -3967,6 +4175,15 @@ int main() {
     Test_N10_VCacheInstalledButNotRunningDoesNotShow();
     Test_N11_DriverAndServiceRunningWithoutAgentDoesNotShow();
     Test_N12_AgentRunningShowsVCache();
+
+    std::printf("\n== T. Per-warning startup preference ==\n");
+    Test_T1_AgentRunningWithWarningEnabledShowsVCache();
+    Test_T2_AgentRunningWithWarningSuppressedHidesVCache();
+    Test_T3_AgentNotRunningWithWarningEnabledHidesVCache();
+    Test_T4_VCacheSuppressionDoesNotSuppressGameMode();
+    Test_T5_VCacheSuppressedAndGameModeOffDoesNotShow();
+    Test_T6_VCacheWarningSuppressionRoundTrips();
+    Test_T7_MissingVCacheWarningPreferenceDefaultsTrue();
 
     std::printf("\n== O. Preserve custom masks across topology changes ==\n");
     Test_O1_NoCustomMasksReturnsDerivedExactly();

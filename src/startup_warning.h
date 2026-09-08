@@ -15,7 +15,8 @@ struct StartupWarningDecision {
 };
 
 inline StartupWarningDecision DecideStartupWarning(const EnvironmentInfo& env,
-                                                    const Topology& topo) {
+                                                    const Topology& topo,
+                                                    bool showVCacheWarning) {
     StartupWarningDecision decision;
     decision.showGameMode = env.gameModeState == GameModeState::On;
     decision.gameModeTone = topo.domains.size() > 1 && env.isAmd
@@ -27,8 +28,9 @@ inline StartupWarningDecision DecideStartupWarning(const EnvironmentInfo& env,
     // anything is actually steering. The previous predicate was also vacuous: the
     // service DEPENDS ON the driver, so "service || driver" reduced to "driver",
     // which is PnP-pinned true on any X3D machine and fired the warning
-    // unconditionally.
-    decision.showVCache = env.amdVCacheAgentRunning;
+    // unconditionally. The user can now suppress this ONE warning; the extra term is that
+    // per-warning preference, and Game Mode above is deliberately unaffected by it.
+    decision.showVCache = env.amdVCacheAgentRunning && showVCacheWarning;
     return decision;
 }
 
