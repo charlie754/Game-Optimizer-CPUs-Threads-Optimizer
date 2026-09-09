@@ -62,6 +62,10 @@ bool SameGoverned(const std::vector<GovernedProcess>& a,
         // the count and the masks stayed the same - which is the one transition the new
         // readout exists to show.
         if (a[i].autoPinned != b[i].autoPinned) return false;
+        // Compared for exactly the reason autoPinned is. The extreme-mode sweep churns - a
+        // background app starts, an installer exits - and if only the COUNT were compared the
+        // window would keep showing the set it saw when the game launched.
+        if (a[i].extremeSwept != b[i].extremeSwept) return false;
         if (a[i].maskName != b[i].maskName) return false;
         if (a[i].name != b[i].name) return false;
     }
@@ -160,22 +164,56 @@ bool ResolveMask(const Config& cfg, const std::wstring& name, std::vector<ULONG>
 // ComputeDesired - pure
 // ---------------------------------------------------------------------------
 
+bool ExtremeSweepActive(const Profile& p) {
+    return p.extremeMode && !p.heavyMask.empty();
+}
+
+bool ExtremeSweepEligible(const Config& cfg,
+                          DWORD pid,
+                          const std::wstring& exeBaseName,
+                          const std::set<DWORD>& gameSet,
+                          const std::set<DWORD>& selfSet) {
+    if (IsReservedPid(pid)) return false;
+    // No name means the exclusion list could not be consulted. See engine.h.
+    if (exeBaseName.empty()) return false;
+    if (gameSet.find(pid) != gameSet.end()) return false;
+    if (selfSet.find(pid) != selfSet.end()) return false;
+    if (cfg.IsExcluded(exeBaseName)) return false;
+    return true;
+}
+
 std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
                                              const Config& cfg,
                                              DWORD foregroundPid,
                                              std::vector<std::wstring>& sticky,
                                              const Profile** matchedProfile,
                                              DWORD selfPid,
-                                             std::set<DWORD>* autoPinnedOut) {
+                                             std::set<DWORD>* autoPinnedOut,
+                                             std::set<DWORD>* extremeSweptOut,
+                                             ProfileSelection* selection) {
     std::map<DWORD, std::wstring> desired;
     if (matchedProfile) *matchedProfile = nullptr;
     if (autoPinnedOut) autoPinnedOut->clear();
+    if (extremeSweptOut) extremeSweptOut->clear();
 
-    // --- Rule 1: the first ENABLED SPECIFIC profile whose game matches a live process. ---
+    // A caller with no state of its own gets a fresh one. ONE code path, not two: every rule
+    // below runs against `sel` whether the watcher owns it or this line invented it, so a
+    // stateless call cannot drift away from the stateful one.
+    ProfileSelection localSel;
+    ProfileSelection& sel = selection ? *selection : localSel;
+
+    // --- Rule 1: the ENABLED SPECIFIC profile that owns the FOREGROUND. -------------------
+    //
+    // EVERY matching profile is gathered, not just the first. Stopping at the first one - in
+    // config-file order - is exactly the defect this rule was rewritten to fix: on the
+    // reference machine Palworld sits above Overwatch 2 in config.ini, so with both games
+    // alive Palworld took the V-Cache mask no matter which one was on screen.
+    //
     // All Games profiles are skipped here and considered only in Rule 1b, so a specific
     // profile ALWAYS wins over All Games no matter where it sits in the vector.
-    const Profile* prof = nullptr;
-    DWORD gamePid = 0;
+    std::vector<SelectionCandidate> cands;
+    std::vector<const Profile*> candProf;
+    std::vector<DWORD> candPid;
     for (size_t i = 0; i < cfg.profiles.size(); ++i) {
         const Profile& p = cfg.profiles[i];
         if (!p.enabled) continue;
@@ -183,9 +221,12 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
         if (p.game.empty()) continue;
         DWORD pid = 0;
         if (!LowestLiveGamePid(snap, p, pid)) continue;
-        prof = &p;
-        gamePid = pid;
-        break;
+        SelectionCandidate c;
+        c.name = p.name;
+        c.ownsForeground = false;
+        cands.push_back(c);
+        candProf.push_back(&p);
+        candPid.push_back(pid);
     }
 
     // --- Rule 1b: ONLY if nothing above matched, the All Games profile. ------------------
@@ -204,15 +245,68 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
     // Win32 - on its OWN COPY of the Config, immediately before every ComputeDesired call.
     // The user's on-disk config never carries a generated list, and a test can simply set the
     // field by hand.
-    if (!prof) {
+    //
+    // IT JOINS THE SAME CANDIDATE LIST rather than being chosen separately afterwards, and
+    // that is deliberate. It only ever joins an EMPTY list, so the precedence is unchanged -
+    // a specific profile still always wins. What it buys is that the selection state above
+    // stays honest across the boundary: when a specific game later starts, the incumbent
+    // named in `sel` is not in the new candidate list, so the specific profile takes over at
+    // once (Released) instead of having to serve a three-second dwell it never earned.
+    if (cands.empty()) {
         const Profile* all = cfg.AllGamesProfile();
         if (all && all->enabled && !all->game.empty()) {
             DWORD pid = 0;
             if (LowestLiveGamePid(snap, *all, pid)) {
-                prof = all;
-                gamePid = pid;
+                SelectionCandidate c;
+                c.name = all->name;
+                c.ownsForeground = false;
+                cands.push_back(c);
+                candProf.push_back(all);
+                candPid.push_back(pid);
             }
         }
+    }
+
+    // WHOSE WINDOW IS ON SCREEN. The foreground window is very often NOT the game process
+    // itself - a launcher, a child window, an anti-cheat shim or a second executable the
+    // game spawned - so membership is tested against the game's whole family.
+    //
+    // Descendants() is reused rather than re-walked, for the same reason rule 4 reuses it:
+    // it is the one place that knows a ppid is only an edge when the parent is live AND was
+    // created no later than the child, and a second walk would be a second chance to get the
+    // pid-reuse guard wrong.
+    //
+    // THE WALK IS SKIPPED ENTIRELY BELOW TWO CANDIDATES, and that is a proof rather than an
+    // optimisation: with one candidate ChooseProfile returns index 0 whether or not it owns
+    // the foreground - there is no incumbent to defend and no challenger to prefer - so the
+    // flag cannot change the answer. ONE GAME RUNNING THEREFORE COSTS EXACTLY NOTHING, which
+    // is the strongest form of "the single-game behaviour is unchanged". Test AA13 pins the
+    // invariant this rests on, so the shortcut cannot outlive its own justification.
+    //
+    // ponytail: Descendants() rebuilds its child index on every call, so the worst case here
+    // is one index build per candidate on the ticks where the foreground belongs to none of
+    // them (a browser, the desktop). Measured shape: ~250 processes, and it stops at the
+    // first owner. If a machine ever runs enough enabled profiles for that to show in
+    // lastTickMs, the upgrade is one shared child index built per tick and passed in.
+    if (cands.size() > 1 && foregroundPid != 0 && !IsReservedPid(foregroundPid)) {
+        for (size_t i = 0; i < cands.size(); ++i) {
+            if (candPid[i] == foregroundPid) { cands[i].ownsForeground = true; break; }
+            const std::vector<DWORD> fam = snap.Descendants(candPid[i]);
+            bool owns = false;
+            for (size_t f = 0; f < fam.size(); ++f) {
+                if (fam[f] == foregroundPid) { owns = true; break; }
+            }
+            if (owns) { cands[i].ownsForeground = true; break; }
+        }
+    }
+
+    const int pick = ChooseProfile(cands, ForegroundSwitchDwellTicks(cfg.pollMs), sel);
+
+    const Profile* prof = nullptr;
+    DWORD gamePid = 0;
+    if (pick >= 0) {
+        prof = candProf[static_cast<size_t>(pick)];
+        gamePid = candPid[static_cast<size_t>(pick)];
     }
 
     // No profile matches: nothing is governed anywhere, and the sticky auto-pin list is
@@ -330,7 +424,33 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
         sticky.clear();
     }
 
-    // --- Rule 5: gameSet beats heavySet beats autoSet. -----------------------------------
+    // --- Rule 4b: EXTREME GAME MODE. -----------------------------------------------------
+    //
+    // THE ONE RULE THAT MOVES A PROCESS NOBODY NAMED AND NOTHING MEASURED. Rules 3 and 4
+    // between them still leave the whole rest of the machine unmasked - measured on the
+    // reference desktop, 226 live processes of which 135 had used CPU time - and every one of
+    // those is free to be scheduled onto the game's own group. This rule closes that gap by
+    // putting EVERY remaining process on the profile's heavy mask for as long as the profile
+    // is governing.
+    //
+    // IT ONLY RUNS WHILE A PROFILE IS GOVERNING. That is not a check written here: control
+    // never reaches this point unless `prof` matched, because the no-match path returned an
+    // empty map far above. Stop the game and the diff in Engine::Impl::Tick clears every one
+    // of these on the next tick, exactly as it does for rules 3 and 4.
+    //
+    // EVERY exclusion is honoured, default and user, with no override - see
+    // ExtremeSweepEligible. That is the single most important line in this rule.
+    std::set<DWORD> extremeSet;
+    if (ExtremeSweepActive(*prof)) {
+        const std::map<DWORD, ProcInfo>& all = snap.All();
+        for (std::map<DWORD, ProcInfo>::const_iterator it = all.begin(); it != all.end(); ++it) {
+            if (!ExtremeSweepEligible(cfg, it->first, it->second.name, gameSet, selfSet))
+                continue;
+            extremeSet.insert(it->first);
+        }
+    }
+
+    // --- Rule 5: gameSet beats heavySet beats autoSet beats extremeSet. ------------------
     for (std::set<DWORD>::const_iterator it = gameSet.begin(); it != gameSet.end(); ++it)
         desired[*it] = prof->gameMask;
     for (std::set<DWORD>::const_iterator it = heavySet.begin(); it != heavySet.end(); ++it) {
@@ -345,6 +465,16 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
         // mask this rule actually decided. A pid autoSet also holds but gameSet or heavySet
         // won would otherwise be labelled "the app chose this" in the UI when the user did.
         if (autoPinnedOut) autoPinnedOut->insert(*it);
+    }
+    for (std::set<DWORD>::const_iterator it = extremeSet.begin(); it != extremeSet.end(); ++it) {
+        if (gameSet.find(*it) != gameSet.end()) continue;
+        if (heavySet.find(*it) != heavySet.end()) continue;
+        if (autoSet.find(*it) != autoSet.end()) continue;
+        desired[*it] = prof->heavyMask;
+        // Same reasoning as autoPinnedOut, and it matters more here: a process rule 4 picked
+        // on measured CPU% carries the AUTO tag the settings window shows, and re-attributing
+        // it to the blanket sweep would take that tag away from the rule that earned it.
+        if (extremeSweptOut) extremeSweptOut->insert(*it);
     }
 
     return desired;
@@ -384,6 +514,69 @@ std::vector<std::wstring> AutoPinnedExeNames(const EngineStatus& st,
         out.push_back(it->second);
     }
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// ExtremeSweptExes / ExtremeSweptProcessCount - pure
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Count-descending, then by the LOWERCASED name so the order cannot change when the same
+// executable is reported with different casing by two snapshots. A stable, total order
+// matters more than it looks: this list is rebuilt once a second and a tie broken by
+// anything unstable would make the rows dance.
+bool SweptExeLess(const SweptExe& a, const SweptExe& b) {
+    if (a.count != b.count) return a.count > b.count;
+    return ToLower(a.name) < ToLower(b.name);
+}
+
+}  // namespace
+
+std::vector<SweptExe> ExtremeSweptExes(const EngineStatus& st,
+                                       const std::vector<std::wstring>& alreadyListed) {
+    std::set<std::wstring> skip;
+    for (size_t i = 0; i < alreadyListed.size(); ++i) {
+        const std::wstring key = ToLower(BaseName(Trim(alreadyListed[i])));
+        if (!key.empty()) skip.insert(key);
+    }
+
+    // Keyed on the lowercased basename, valued with the casing the SNAPSHOT reported - the
+    // same rule AutoPinnedExeNames follows, so "NVIDIA Broadcast.exe" reads as itself.
+    std::map<std::wstring, SweptExe> byKey;
+    for (size_t i = 0; i < st.governed.size(); ++i) {
+        const GovernedProcess& g = st.governed[i];
+        if (!g.extremeSwept) continue;
+        const std::wstring name = BaseName(Trim(g.name));
+        if (name.empty()) continue;                   // unreadable: nothing honest to print
+        const std::wstring key = ToLower(name);
+        if (skip.find(key) != skip.end()) continue;
+        std::map<std::wstring, SweptExe>::iterator it = byKey.find(key);
+        if (it == byKey.end()) {
+            SweptExe e;
+            e.name = name;
+            e.count = 1;
+            byKey[key] = e;
+        } else {
+            ++it->second.count;
+        }
+    }
+
+    std::vector<SweptExe> out;
+    out.reserve(byKey.size());
+    for (std::map<std::wstring, SweptExe>::const_iterator it = byKey.begin();
+         it != byKey.end(); ++it) {
+        out.push_back(it->second);
+    }
+    std::stable_sort(out.begin(), out.end(), SweptExeLess);
+    return out;
+}
+
+size_t ExtremeSweptProcessCount(const EngineStatus& st) {
+    size_t n = 0;
+    for (size_t i = 0; i < st.governed.size(); ++i)
+        if (st.governed[i].extremeSwept) ++n;
+    return n;
 }
 
 // ---------------------------------------------------------------------------
@@ -438,6 +631,12 @@ struct Engine::Impl {
     std::vector<std::wstring> sticky;
     std::map<DWORD, AppliedRec> applied;
     std::wstring lastProfileName;
+
+    // RULE 1's memory: which profile is governing, and how long a challenger has held the
+    // foreground. It lives HERE and not in ComputeDesired because that function has no
+    // statics and must not grow one - see profile_select.h. Tick-local, so tickMu guards it
+    // exactly as it guards `sticky`, which it sits beside for the same reason.
+    ProfileSelection selection;
 
     // What the last completed probe said about AMD's V-Cache agent, so the tick logs the
     // transition and not the state. Starts Never: the first probe of a run is itself news.
@@ -635,10 +834,17 @@ int Engine::Impl::Tick() {
     const Profile* matched = nullptr;
     std::map<DWORD, std::wstring> desired;
     std::set<DWORD> autoPinned;
+    std::set<DWORD> extremeSwept;
     if (pausedCopy) {
         // Paused means "govern nothing". An empty desired map makes the diff below clear
         // every applied mask on this very tick, and keeps clearing it until resumed.
+        //
+        // The selection is dropped for the same reason the sticky list is: on resume the
+        // game in front should be pinned AT ONCE, not three seconds later, and a stale
+        // incumbent left over from before the pause would be defended by rule 4 against the
+        // game that is actually on screen.
         sticky.clear();
+        selection = ProfileSelection();
     } else {
         // The Win32 half of the All Games rule, done HERE and not inside ComputeDesired, so
         // the decision function stays pure and unit-testable. No-op unless an enabled All
@@ -648,7 +854,8 @@ int Engine::Impl::Tick() {
         // route: rule 4 must not pin the app's own sponsor-panel browser subtree, and the
         // pure function is told which pid is ours rather than asking Win32 itself.
         desired = ComputeDesired(fresh, cfgCopy, GetForegroundPid(), sticky, &matched,
-                                 GetCurrentProcessId(), &autoPinned);
+                                 GetCurrentProcessId(), &autoPinned, &extremeSwept,
+                                 &selection);
     }
 
     // GAME DETECTION SIGNAL (operator request 9) is NOT implemented, on purpose.
@@ -679,13 +886,40 @@ int Engine::Impl::Tick() {
                         static_cast<unsigned long>(oc.lastError));
             }
         }
-        JournalRemove(pid);
         applied.erase(pid);
     }
+    // ONE rewrite for the whole batch, AFTER every clear. Per-pid JournalRemove cost 4-7 ms
+    // each (see applier.h), which is invisible at the six processes rules 2-4 govern and is
+    // 0.8 s of watcher thread at the ~200 extreme game mode governs - and this loop runs in
+    // full the moment the game exits or the profile changes.
+    //
+    // AFTER the clears, not before, because that ordering IS the journal's contract: an entry
+    // may only leave the file once the assignment it records is gone. Removing first and
+    // crashing mid-loop would leave processes masked with nothing on disk to recover them.
+    JournalRemoveMany(toClear);
 
     // --- diff: new pids, and pids whose desired mask NAME changed ------------------------
     // Re-issuing an identical mask every 250 ms would be pointless syscall traffic, so the
     // name comparison is the whole gate.
+    //
+    // TWO PASSES SINCE EXTREME GAME MODE, and the split is a cost fix rather than a redesign.
+    // The first pass decides what to do and journals EVERY new pid in one rewrite; the second
+    // does the applying. The journal-before-apply guarantee is unchanged and is in fact
+    // stronger - every entry is on disk before the FIRST setter call, rather than each one
+    // just before its own - and the 4-7 ms per-entry cost measured in applier.h is paid once
+    // instead of once per process.
+    struct Pending {
+        DWORD pid;
+        std::wstring want;
+        std::vector<ULONG> ids;
+        bool isNew;
+        std::wstring name;
+        ULONGLONG creationTime;
+    };
+    std::vector<Pending> pending;
+    std::vector<JournalEntry> toJournal;
+    pending.reserve(desired.size());
+
     for (std::map<DWORD, std::wstring>::const_iterator it = desired.begin();
          it != desired.end(); ++it) {
         const DWORD pid = it->first;
@@ -695,41 +929,86 @@ int Engine::Impl::Tick() {
         const bool isNew = (a == applied.end());
         if (!isNew && a->second.maskName == want) continue;
 
-        std::vector<ULONG> ids;
-        if (!ResolveMask(cfgCopy, want, ids)) {
+        Pending p;
+        p.pid = pid;
+        p.want = want;
+        p.isNew = isNew;
+        if (!ResolveMask(cfgCopy, want, p.ids)) {
             LogLine(L"engine: profile names mask '%s' which is not in the config; pid %lu left alone",
                     want.c_str(), static_cast<unsigned long>(pid));
             continue;
         }
 
         const ProcInfo* pi = fresh.Find(pid);
+        p.name = pi ? pi->name : std::wstring();
+        p.creationTime = pi ? pi->creationTime : 0;
+        pending.push_back(p);
+
+        if (isNew) {
+            JournalEntry e;
+            e.pid = pid;
+            e.creationTime = p.creationTime;
+            e.name = p.name;
+            toJournal.push_back(e);
+        }
+    }
+
+    // Written BEFORE any apply below, so a crash between here and a setter call cannot strand
+    // a process on half the machine.
+    JournalAddMany(toJournal);
+
+    // The blanket sweep's refusals, collected rather than logged one line each - see the note
+    // on extremeSweptOut in engine.h.
+    std::vector<std::wstring> extremeDenied;
+    // Pids whose entry has to come back OUT: the process was gone, or the apply was refused
+    // so nothing landed. Batched like the adds, and the window that opens between the failure
+    // and the removal is safe in the one direction that matters - the journal briefly names a
+    // pid that carries no assignment, so a crash inside it costs a redundant clear on the next
+    // launch. The reverse mistake, a masked process with no journal entry, is the one the
+    // journal exists to prevent and it is not reachable from here.
+    std::vector<DWORD> journalDrop;
+
+    for (size_t i = 0; i < pending.size(); ++i) {
+        const Pending& p = pending[i];
         AppliedRec rec;
-        rec.maskName = want;
-        rec.name = pi ? pi->name : std::wstring();
-        rec.creationTime = pi ? pi->creationTime : 0;
+        rec.maskName = p.want;
+        rec.name = p.name;
+        rec.creationTime = p.creationTime;
         rec.blocked = false;
 
-        // Written BEFORE the first apply, so a crash between here and the next line cannot
-        // strand the process on half the machine.
-        if (isNew) JournalAdd(pid, rec.creationTime, rec.name);
-
-        ApplyOutcome oc = want.empty() ? ClearCpuSets(pid) : ApplyCpuSets(pid, ids);
+        ApplyOutcome oc = p.want.empty() ? ClearCpuSets(p.pid) : ApplyCpuSets(p.pid, p.ids);
         rec.applyResult = oc.result;
         if (oc.result == ApplyResult::Ok) {
-            applied[pid] = rec;
+            applied[p.pid] = rec;
         } else if (oc.result == ApplyResult::Gone) {
-            JournalRemove(pid);
-            applied.erase(pid);
+            journalDrop.push_back(p.pid);
+            applied.erase(p.pid);
         } else {
             // AccessDenied / InvalidParameter / OtherError. Recorded, never silently
             // skipped: it is counted into blockedCount and listed by name in Settings.
             rec.blocked = true;
-            applied[pid] = rec;
-            if (isNew) JournalRemove(pid);   // nothing landed, so nothing to recover
-            LogLine(L"engine: apply pid %lu mask '%s' failed: %s (err %lu)",
-                    static_cast<unsigned long>(pid), want.c_str(),
-                    ApplyResultName(oc.result),
-                    static_cast<unsigned long>(oc.lastError));
+            applied[p.pid] = rec;
+            if (p.isNew) journalDrop.push_back(p.pid);   // nothing landed, nothing to recover
+
+            // ONE LINE PER PROCESS IS RIGHT FOR RULES 2-4 AND WRONG FOR RULE 4b. An app the
+            // user named, or one the CPU% rule measured, being refused is news. A blanket
+            // sweep of the whole desktop being refused by every elevated process on it is the
+            // EXPECTED outcome - this app runs unelevated on purpose - and a hundred identical
+            // AccessDenied lines would bury the failures that are news, in a log that rotates
+            // by truncation. Those are counted here and summarised in one line below. They are
+            // still counted into blockedCount and still named on the General page, so the
+            // promise that nothing is skipped silently is kept where the user reads it.
+            const bool sweptAndDenied =
+                (oc.result == ApplyResult::AccessDenied) &&
+                (extremeSwept.find(p.pid) != extremeSwept.end());
+            if (sweptAndDenied) {
+                extremeDenied.push_back(p.name.empty() ? std::wstring(L"(unnamed)") : p.name);
+            } else {
+                LogLine(L"engine: apply pid %lu mask '%s' failed: %s (err %lu)",
+                        static_cast<unsigned long>(p.pid), p.want.c_str(),
+                        ApplyResultName(oc.result),
+                        static_cast<unsigned long>(oc.lastError));
+            }
 
             // InvalidParameter from the SETTER means the CPU Set Ids themselves were
             // refused (ERROR_CPU_SET_INVALID / ERROR_INVALID_PARAMETER) - the stored ids no
@@ -743,12 +1022,34 @@ int Engine::Impl::Tick() {
                             L"(err %lu). The stored CPU Set Ids no longer match this "
                             L"machine; the topology needs re-detecting. Not re-detecting "
                             L"automatically - flag raised for the UI.",
-                            static_cast<unsigned long>(pid), want.c_str(),
+                            static_cast<unsigned long>(p.pid), p.want.c_str(),
                             static_cast<unsigned long>(oc.lastError));
                 }
                 staleTopology = true;
             }
         }
+    }
+    JournalRemoveMany(journalDrop);
+
+    if (!extremeDenied.empty()) {
+        // Distinct executables, so the line says what a user can act on rather than repeating
+        // one name forty times. The count is of PROCESSES and the list is of APPS, and the
+        // sentence says which is which.
+        std::set<std::wstring> distinct;
+        for (size_t i = 0; i < extremeDenied.size(); ++i) distinct.insert(extremeDenied[i]);
+        std::wstring names;
+        size_t shown = 0;
+        for (std::set<std::wstring>::const_iterator it = distinct.begin();
+             it != distinct.end() && shown < 12; ++it, ++shown) {
+            if (!names.empty()) names += L", ";
+            names += *it;
+        }
+        if (distinct.size() > shown)
+            names += L" and " + std::to_wstring(distinct.size() - shown) + L" more";
+        LogLine(L"engine: extreme game mode - %d processes in %d apps refused the mask "
+                L"(access denied; this app runs unelevated on purpose): %s",
+                static_cast<int>(extremeDenied.size()),
+                static_cast<int>(distinct.size()), names.c_str());
     }
 
     // --- rebuild the published status ----------------------------------------------------
@@ -818,6 +1119,10 @@ int Engine::Impl::Tick() {
         const ProcInfo* pi = fresh.Find(it->first);
         if (pi) g.name = pi->name;
         g.autoPinned = (autoPinned.find(it->first) != autoPinned.end());
+        // From the set rule 4b actually decided, never re-derived here. The two flags cannot
+        // both be true: ComputeDesired's rule-5 loops insert each pid into at most one of the
+        // published sets.
+        g.extremeSwept = (extremeSwept.find(it->first) != extremeSwept.end());
         std::map<DWORD, AppliedRec>::const_iterator a = applied.find(it->first);
         g.blocked = (a != applied.end() && a->second.blocked);
         g.applyResult = a != applied.end() ? a->second.applyResult
@@ -849,10 +1154,18 @@ int Engine::Impl::Tick() {
     //
     // What the watcher CAN do without a header change is make the transition visible, so a
     // missing stamp is diagnosable from the log rather than by guesswork.
+    //
+    // AND IT SAYS WHY. With two games running the profile can change because one of them
+    // just started, because one of them just exited, or because the operator alt-tabbed and
+    // held the other game in front for the full dwell - and those three read identically in
+    // a log that only names the winner. The reason comes from ComputeDesired's own decision
+    // (ProfileSelection::reason), so the log cannot describe a rule the engine did not run.
     if (st.profileName != lastProfileName && !st.profileName.empty()) {
-        LogLine(L"engine: profile '%s' selected (was '%s'); MRU stamp is the UI's to write",
+        LogLine(L"engine: profile '%s' selected (was '%s'), reason: %s; "
+                L"MRU stamp is the UI's to write",
                 st.profileName.c_str(),
-                lastProfileName.empty() ? L"(none)" : lastProfileName.c_str());
+                lastProfileName.empty() ? L"(none)" : lastProfileName.c_str(),
+                SelectReasonText(selection.reason));
     }
     lastProfileName = st.profileName;
 

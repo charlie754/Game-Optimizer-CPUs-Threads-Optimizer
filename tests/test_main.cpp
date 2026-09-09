@@ -43,9 +43,12 @@
 #include "settings_warning.h"
 #include "envwarning_text.h"
 #include "firstrun_text.h"
+#include "irq_policy.h"
+#include "irq_probe.h"
 #include "startup_warning.h"
 #include "topology.h"
 #include "util.h"
+#include "version_label.h"
 
 // ===========================================================================
 // Private-member access for ProcessSnapshot (header untouched).
@@ -167,6 +170,64 @@ std::string Show(cd::Confidence c) {
         case cd::Confidence::High: return "Confidence::High";
     }
     return "Confidence::<bad>";
+}
+
+// The interrupt readout's four enums. THESE ARE REQUIRED, NOT OPTIONAL: there is no generic
+// fallback in this harness, so CHECK_EQ on a type with no Show() overload is a COMPILE error
+// rather than an ugly diagnostic.
+std::string Show(cd::IrqRefusal r) {
+    switch (r) {
+        case cd::IrqRefusal::None: return "IrqRefusal::None";
+        case cd::IrqRefusal::MultipleProcessorGroups: return "IrqRefusal::MultipleProcessorGroups";
+        case cd::IrqRefusal::TooManyProcessors: return "IrqRefusal::TooManyProcessors";
+        case cd::IrqRefusal::UnexpectedProcessorNumbering:
+            return "IrqRefusal::UnexpectedProcessorNumbering";
+        case cd::IrqRefusal::CountersUnavailable: return "IrqRefusal::CountersUnavailable";
+    }
+    return "IrqRefusal::<bad>";
+}
+
+std::string Show(cd::IrqPolicyState s) {
+    switch (s) {
+        case cd::IrqPolicyState::NotConfigured: return "IrqPolicyState::NotConfigured";
+        case cd::IrqPolicyState::Configured: return "IrqPolicyState::Configured";
+        case cd::IrqPolicyState::Unreadable: return "IrqPolicyState::Unreadable";
+    }
+    return "IrqPolicyState::<bad>";
+}
+
+std::string Show(cd::IrqAgreement a) {
+    switch (a) {
+        case cd::IrqAgreement::Unreadable: return "IrqAgreement::Unreadable";
+        case cd::IrqAgreement::NeitherPresent: return "IrqAgreement::NeitherPresent";
+        case cd::IrqAgreement::PolicyOnly: return "IrqAgreement::PolicyOnly";
+        case cd::IrqAgreement::TargetOnly: return "IrqAgreement::TargetOnly";
+        case cd::IrqAgreement::Agree: return "IrqAgreement::Agree";
+        case cd::IrqAgreement::Disagree: return "IrqAgreement::Disagree";
+    }
+    return "IrqAgreement::<bad>";
+}
+
+std::string Show(cd::GameGroupSource g) {
+    switch (g) {
+        case cd::GameGroupSource::LiveProfile: return "GameGroupSource::LiveProfile";
+        case cd::GameGroupSource::MachineDefault: return "GameGroupSource::MachineDefault";
+        case cd::GameGroupSource::Unknown: return "GameGroupSource::Unknown";
+    }
+    return "GameGroupSource::<bad>";
+}
+
+// Rule 1's reason code. REQUIRED for CHECK_EQ on a SelectReason, and a new enumerator
+// without a case here is a -W3 warning rather than a silent "<bad>" in a failure message.
+std::string Show(cd::SelectReason r) {
+    switch (r) {
+        case cd::SelectReason::Unchanged: return "SelectReason::Unchanged";
+        case cd::SelectReason::First: return "SelectReason::First";
+        case cd::SelectReason::Foreground: return "SelectReason::Foreground";
+        case cd::SelectReason::Released: return "SelectReason::Released";
+        case cd::SelectReason::Cleared: return "SelectReason::Cleared";
+    }
+    return "SelectReason::<bad>";
 }
 
 std::string Show(cd::MaskNameProblem p) {
@@ -3999,6 +4060,2063 @@ void Test_V6_TopologyChangedPreservedSentence() {
                                  L"open the Core map and check each one."));
 }
 
+// ===========================================================================
+// W / X / Y.  The interrupt and DPC readout (src\irq_policy.h).
+//
+// Every one of these is PURE. The readout's OS half - PDH, cfgmgr32, the registry reads -
+// lives in irq_probe.cpp, which no test links; what is testable was deliberately put in the
+// header so this harness reaches it with no change to tools\build-tests.bat.
+//
+// NOTE ON THE LETTERS: the banners in main() had W, X and Y free, but the FUNCTION prefixes
+// Test_X1..X5 and Test_Y1..Y7 were already taken by the V-Cache and autostart groups. Every
+// name below therefore carries an Irq infix, so the group letters can match the banners
+// without colliding with an existing identifier.
+// ===========================================================================
+
+// ---- Synthetic machines this readout has to refuse ------------------------
+
+cd::Topology MakeTwoProcessorGroups() {
+    cd::Topology t = MakeReference(false);
+    // FinishTopology forces groupCount to 1, so this is set AFTERWARDS on purpose.
+    t.groupCount = 2;
+    return t;
+}
+
+cd::Topology MakeGroupCountOneButAnEntryInGroupOne() {
+    cd::Topology t = MakeReference(false);
+    t.groupCount = 1;
+    t.entries[17].Group = 1;
+    return t;
+}
+
+cd::Topology MakeNinetySixLogicalProcessors() {
+    cd::Topology t;
+    for (ULONG lp = 0; lp < 96; ++lp) {
+        const ULONG llc = (lp < 48) ? 0u : 48u;
+        t.entries.push_back(
+            Entry(lp, (lp / 2u) * 2u, llc, (BYTE)0, llc == 0u ? 98304ull : 32768ull));
+    }
+    FinishTopology(t);
+    return t;
+}
+
+cd::Topology MakeNumberingThatStartsAtSixtyFour() {
+    cd::Topology t;
+    for (ULONG lp = 64; lp < 96; ++lp) {
+        const ULONG llc = (lp < 80) ? 0u : 16u;
+        t.entries.push_back(Entry(lp, ((lp - 64) / 2u) * 2u, llc, (BYTE)0,
+                                  llc == 0u ? 98304ull : 32768ull));
+    }
+    FinishTopology(t);
+    return t;
+}
+
+cd::CoreDpcStat IrqStat(ULONG lp, int samples, double dpc, double isr, bool inGroup) {
+    cd::CoreDpcStat c;
+    c.lp = lp;
+    c.samples = samples;
+    c.meanDpcPct = dpc;
+    c.minDpcPct = dpc;
+    c.maxDpcPct = dpc;
+    c.meanIsrPct = isr;
+    c.minIsrPct = isr;
+    c.maxIsrPct = isr;
+    c.inGameGroup = inGroup;
+    return c;
+}
+
+void AllPairwiseDistinct(const std::vector<std::wstring>& v, const char* what) {
+    for (size_t i = 0; i < v.size(); ++i) {
+        ++g_total;
+        if (v[i].empty())
+            Fail(__FILE__, __LINE__, what, "an empty sentence", "a non-empty sentence");
+        for (size_t j = i + 1; j < v.size(); ++j) {
+            ++g_total;
+            if (v[i] == v[j])
+                Fail(__FILE__, __LINE__, what, Utf8(v[i]),
+                     "a sentence used by only one value");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// W. Mask arithmetic and machine scope.
+// ---------------------------------------------------------------------------
+
+void Test_W1_IrqGoldenVector() {
+    Case("W1 golden vector - the measured bytes decode to the measured processors");
+    // [M] These are the exact bytes read back off the reference machine's RTX 4090 on
+    // 2026-09-08: AssignmentSetOverride = 00 00 ff ff 00 00 00 00.
+    const BYTE golden[8] = { 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00 };
+    ULONG_PTR mask = 0;
+    CHECK(cd::IrqRegBytesToMask(golden, sizeof(golden), mask));
+    CHECK_EQ(mask, 0x00000000FFFF0000ull);
+    CHECK_EQ(cd::FormatCpuList(mask), L"16-31");
+    CHECK_EQ(cd::FormatCpuListWithCount(mask), L"CPUs 16-31 (16 processors)");
+    CHECK_EQ(cd::IrqPopCount(mask), 16);
+}
+
+void Test_W2_IrqTranspositionIsAFailureInTheSuite() {
+    Case("W2 a transposed buffer decodes to the GAME's own processors and is not the golden mask");
+    // THE TRANSPOSITION HAZARD IS DOCUMENTED HERE RATHER THAN IN A COMMENT. ff ff 00 00 is
+    // the same eight bytes in the wrong order, and it names CPUs 0-15 - the half of the
+    // reference machine the game is put on. Nothing in this product writes this value, and
+    // the decoder must still not quietly agree with the correct one.
+    const BYTE transposed[8] = { 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+    ULONG_PTR mask = 0;
+    CHECK(cd::IrqRegBytesToMask(transposed, sizeof(transposed), mask));
+    CHECK_EQ(mask, 0x000000000000FFFFull);
+    CHECK_EQ(cd::FormatCpuList(mask), L"0-15");
+    CHECK_NE(mask, 0x00000000FFFF0000ull);
+}
+
+void Test_W3_IrqDecoderLengths() {
+    Case("W3 the decoder accepts 4 and 8 bytes and refuses every other length");
+    const BYTE four[4] = { 0x00, 0x00, 0xFF, 0xFF };
+    ULONG_PTR mask = 0;
+    CHECK(cd::IrqRegBytesToMask(four, sizeof(four), mask));
+    CHECK_EQ(mask, 0x00000000FFFF0000ull);
+
+    const BYTE odd[16] = { 0 };
+    ULONG_PTR untouched = 0x1234ull;
+    CHECK(!cd::IrqRegBytesToMask(odd, 3, untouched));
+    CHECK(!cd::IrqRegBytesToMask(odd, 16, untouched));
+    CHECK(!cd::IrqRegBytesToMask(odd, 0, untouched));
+    CHECK(!cd::IrqRegBytesToMask(nullptr, 8, untouched));
+    CHECK_EQ(untouched, 0x1234ull);   // a refused decode leaves the caller's value alone
+}
+
+void Test_W13_IrqRegistryReadGuards() {
+    Case("W13 a registry value that changed between the two size queries is refused, not indexed");
+    // [M] Council review 2026-09-08 called this the blocker. ReadBinaryValue checked the size
+    // the FIRST RegQueryValueExW reported and then trusted the SECOND, so a value that shrank
+    // to zero bytes between the two returned true holding an EMPTY vector - and the caller in
+    // irq_probe.cpp took &bytes[0] of it, which is undefined behaviour. These are the two
+    // guards that removed it, both lifted into the pure half so this test can reach them.
+    CHECK(cd::IrqRegSecondReadIsUsable(ERROR_SUCCESS, 8, 8));
+    CHECK(cd::IrqRegSecondReadIsUsable(ERROR_SUCCESS, 8, 4));    // shrank, but really read
+    CHECK(!cd::IrqRegSecondReadIsUsable(ERROR_SUCCESS, 8, 0));   // THE BLOCKER
+    CHECK(!cd::IrqRegSecondReadIsUsable(ERROR_SUCCESS, 8, 9));   // grew past the buffer
+    CHECK(!cd::IrqRegSecondReadIsUsable(ERROR_MORE_DATA, 8, 8));
+    CHECK(!cd::IrqRegSecondReadIsUsable(ERROR_ACCESS_DENIED, 8, 8));
+
+    // AND THE CALL SITE DOES NOT RELY ON THE CALLEE. The vector form refuses an empty buffer
+    // instead of forming &bytes[0] on it, so the undefined behaviour cannot be reached even
+    // if some future reader hands it one.
+    std::vector<BYTE> empty;
+    ULONG_PTR untouched = 0x1234ull;
+    CHECK(!cd::IrqRegBytesToMask(empty, untouched));
+    CHECK_EQ(untouched, 0x1234ull);
+
+    // [M] The reference machine's own bytes, through the vector form this time.
+    const BYTE goldenBytes[8] = { 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00 };
+    std::vector<BYTE> golden(goldenBytes, goldenBytes + 8);
+    ULONG_PTR mask = 0;
+    CHECK(cd::IrqRegBytesToMask(golden, mask));
+    CHECK_EQ(mask, 0x00000000FFFF0000ull);
+
+    // A length the decoder refuses is still refused through the vector form, and still leaves
+    // the caller's mask alone.
+    std::vector<BYTE> three(3, 0);
+    CHECK(!cd::IrqRegBytesToMask(three, untouched));
+    CHECK_EQ(untouched, 0x1234ull);
+}
+
+void Test_W4_IrqFormatCpuList() {
+    Case("W4 processor lists collapse runs and never invent one");
+    CHECK_EQ(cd::FormatCpuList(0x0000000000000111ull), L"0, 4, 8");
+    CHECK_EQ(cd::FormatCpuList(0x000000000000023Bull), L"0-1, 3-5, 9");
+    CHECK_EQ(cd::FormatCpuList(0ull), L"");
+    CHECK_EQ(cd::FormatCpuList(0x8000000000000000ull), L"63");
+    CHECK_EQ(cd::FormatCpuList(0x0000000000000001ull), L"0");
+    CHECK_EQ(cd::FormatCpuListWithCount(0ull), L"no processors");
+    CHECK_EQ(cd::FormatCpuListWithCount(0x0000000000000001ull), L"CPUs 0 (1 processor)");
+    CHECK_EQ(cd::IrqPopCount(0ull), 0);
+    CHECK_EQ(cd::IrqPopCount(0xFFFFFFFFFFFFFFFFull), 64);
+}
+
+void Test_W5_IrqTemporalTargetSetDecode() {
+    Case("W5 the two measured temporal target sets decode to complementary striped halves");
+    // [M] 2026-09-08: the reference machine's RTX 5090 read TargetSet = 0x99999999 and its
+    // RTX 4090 read 0x66666666. They are exact bitwise complements over 32 processors, which
+    // is what made the striped split visible in the first place.
+    const ULONG_PTR five = cd::IrqTargetSetToMask(0x99999999u);
+    const ULONG_PTR four = cd::IrqTargetSetToMask(0x66666666u);
+    CHECK_EQ(cd::FormatCpuList(five), L"0, 3-4, 7-8, 11-12, 15-16, 19-20, 23-24, 27-28, 31");
+    CHECK_EQ(cd::FormatCpuList(four), L"1-2, 5-6, 9-10, 13-14, 17-18, 21-22, 25-26, 29-30");
+    CHECK_EQ(cd::IrqPopCount(five), 16);
+    CHECK_EQ(cd::IrqPopCount(four), 16);
+    CHECK_EQ(five & four, 0ull);
+    CHECK_EQ(five | four, 0x00000000FFFFFFFFull);
+}
+
+void Test_W6_IrqReferenceMachineIsInScope() {
+    Case("W6 POSITIVE CONTROL - the reference machine is not refused");
+    // Without this the refusal tests below could all pass on an evaluator that refuses every
+    // machine it is ever shown.
+    CHECK_EQ(cd::IrqEvaluateMachine(MakeReference(false)), cd::IrqRefusal::None);
+    CHECK_EQ(cd::IrqEvaluateMachine(MakeIntelHybrid()), cd::IrqRefusal::None);
+    CHECK_EQ(cd::IrqEvaluateMachine(MakeSingleDomain()), cd::IrqRefusal::None);
+    CHECK(!cd::IrqRefusalIsHard(cd::IrqRefusal::None));
+}
+
+void Test_W7_IrqTwoGroupsRefused() {
+    Case("W7 two processor groups are refused, by EITHER of two independent tests");
+    // groupCount alone cannot carry this gate: topology.cpp rewrites a failed group query
+    // from 0 to 1, so a machine whose query failed looks single-group. The per-entry Group
+    // field comes from a different API and is checked separately.
+    CHECK_EQ(cd::IrqEvaluateMachine(MakeTwoProcessorGroups()),
+             cd::IrqRefusal::MultipleProcessorGroups);
+    CHECK_EQ(cd::IrqEvaluateMachine(MakeGroupCountOneButAnEntryInGroupOne()),
+             cd::IrqRefusal::MultipleProcessorGroups);
+    CHECK(cd::IrqRefusalIsHard(cd::IrqRefusal::MultipleProcessorGroups));
+}
+
+void Test_W8_IrqTooManyProcessorsRefused() {
+    Case("W8 more than 64 logical processors is refused");
+    CHECK_EQ(cd::IrqEvaluateMachine(MakeNinetySixLogicalProcessors()),
+             cd::IrqRefusal::TooManyProcessors);
+}
+
+void Test_W9_IrqUnexpectedNumberingRefused() {
+    Case("W9 numbering that does not start at 0 is refused rather than guessed at");
+    CHECK_EQ(cd::IrqEvaluateMachine(MakeNumberingThatStartsAtSixtyFour()),
+             cd::IrqRefusal::UnexpectedProcessorNumbering);
+    cd::Topology empty;
+    CHECK_EQ(cd::IrqEvaluateMachine(empty), cd::IrqRefusal::UnexpectedProcessorNumbering);
+}
+
+void Test_W10_IrqBuildMaskWholeChain() {
+    Case("W10 the whole chain - named mask, ids, lps, mask - on the reference machine");
+    const cd::Topology t = MakeReference(false);
+    const std::vector<cd::Mask> masks = cd::DeriveMasks(t);
+
+    const cd::Mask* freq = MaskNamed(masks, L"Freq");
+    CHECK(freq != nullptr);
+    if (freq) {
+        ULONG_PTR mask = 0;
+        CHECK(cd::BuildIrqMask(t, cd::LpsForIds(t, freq->ids), mask));
+        CHECK_EQ(mask, 0x00000000FFFF0000ull);
+        CHECK_EQ(cd::FormatCpuListWithCount(mask), L"CPUs 16-31 (16 processors)");
+    }
+
+    const cd::Mask* cache = MaskNamed(masks, L"Cache");
+    CHECK(cache != nullptr);
+    if (cache) {
+        ULONG_PTR mask = 0;
+        CHECK(cd::BuildIrqMask(t, cd::LpsForIds(t, cache->ids), mask));
+        CHECK_EQ(mask, 0x000000000000FFFFull);
+    }
+}
+
+void Test_W11_IrqBuildMaskRefuses() {
+    Case("W11 the mask builder refuses rather than silently dropping a processor");
+    const cd::Topology t = MakeReference(false);
+    ULONG_PTR mask = 0xAAAAull;
+    CHECK(!cd::BuildIrqMask(t, std::vector<ULONG>(), mask));
+
+    std::vector<ULONG> absent;
+    absent.push_back(0);
+    absent.push_back(99);
+    CHECK(!cd::BuildIrqMask(t, absent, mask));
+
+    std::vector<ULONG> tooHigh;
+    tooHigh.push_back(64);
+    CHECK(!cd::BuildIrqMask(t, tooHigh, mask));
+    CHECK_EQ(mask, 0xAAAAull);   // untouched on every refusal
+}
+
+void Test_W12_IrqRefusalReasonsAreDistinct() {
+    Case("W12 every refusal has its own non-empty sentence, None included");
+    const cd::IrqRefusal all[] = {
+        cd::IrqRefusal::None, cd::IrqRefusal::MultipleProcessorGroups,
+        cd::IrqRefusal::TooManyProcessors, cd::IrqRefusal::UnexpectedProcessorNumbering,
+        cd::IrqRefusal::CountersUnavailable
+    };
+    std::vector<std::wstring> said;
+    for (size_t i = 0; i < ARRAYSIZE(all); ++i) said.push_back(cd::IrqRefusalReason(all[i]));
+    AllPairwiseDistinct(said, "IrqRefusalReason is non-empty and pairwise distinct");
+    // IrqRefusalIsHard is true for every value BUT None. A refusal that reads as "not a
+    // refusal" would let the window show a readout it has already decided is wrong.
+    for (size_t i = 0; i < ARRAYSIZE(all); ++i)
+        CHECK_EQ(cd::IrqRefusalIsHard(all[i]), all[i] != cd::IrqRefusal::None);
+}
+
+// ---------------------------------------------------------------------------
+// X. The honesty of the readout.
+// ---------------------------------------------------------------------------
+
+void Test_X1_IrqTooFewSamplesIsNeverMeasuredAndNeverHot() {
+    Case("X1 fewer than three valid samples is not measured, whatever the mean says");
+    const cd::CoreDpcStat loudButThin = IrqStat(3, 2, 36.87, 13.97, true);
+    CHECK(!cd::IrqCoreIsMeasured(loudButThin));
+    CHECK(!cd::IrqCoreIsHot(loudButThin));
+    const cd::CoreDpcStat loudAndReal = IrqStat(3, 3, 36.87, 13.97, true);
+    CHECK(cd::IrqCoreIsMeasured(loudAndReal));
+    CHECK(cd::IrqCoreIsHot(loudAndReal));
+}
+
+void Test_X2_IrqHotIsInterruptPlusDpc() {
+    Case("X2 hot is interrupt service PLUS DPC, at or above the printed threshold");
+    CHECK_EQ(cd::IrqCombinedPct(IrqStat(0, 7, 3.0, 2.0, true)), 5.0);
+    CHECK(cd::IrqCoreIsHot(IrqStat(0, 7, 3.0, 2.0, true)));     // exactly at the threshold
+    CHECK(!cd::IrqCoreIsHot(IrqStat(0, 7, 2.0, 2.0, true)));
+    // Either half alone can carry it: an ISR-heavy processor is as unreachable by a CPU Set
+    // as a DPC-heavy one.
+    CHECK(cd::IrqCoreIsHot(IrqStat(0, 7, 0.0, 9.0, true)));
+    CHECK(cd::IrqCoreIsHot(IrqStat(0, 7, 9.0, 0.0, true)));
+}
+
+void Test_X3_IrqGroupMembershipIsExact() {
+    Case("X3 group membership is set from the group's own processor list and cleared otherwise");
+    std::vector<cd::CoreDpcStat> cores;
+    for (ULONG lp = 0; lp < 8; ++lp) cores.push_back(IrqStat(lp, 7, 0.0, 0.0, true));
+    std::vector<ULONG> group;
+    group.push_back(2);
+    group.push_back(5);
+    cd::IrqMarkGameGroup(cores, group);
+    for (size_t i = 0; i < cores.size(); ++i)
+        CHECK_EQ(cores[i].inGameGroup, cores[i].lp == 2 || cores[i].lp == 5);
+    std::vector<ULONG> allLps;
+    for (ULONG lp = 0; lp < 8; ++lp) allLps.push_back(lp);
+    CHECK_EQ(cd::IrqCoresInGroup(allLps, group), 2);
+
+    // An EMPTY group list marks nothing - it must not fall back to "everything".
+    cd::IrqMarkGameGroup(cores, std::vector<ULONG>());
+    for (size_t i = 0; i < cores.size(); ++i) CHECK(!cores[i].inGameGroup);
+    CHECK_EQ(cd::IrqCoresInGroup(allLps, std::vector<ULONG>()), 0);
+}
+
+void Test_X4_IrqHottestInGroupIgnoresTheRestOfTheMachine() {
+    Case("X4 the in-group hottest ignores a louder processor outside the group");
+    std::vector<cd::CoreDpcStat> cores;
+    cores.push_back(IrqStat(1, 7, 36.87, 13.97, false));   // loudest, but not in the group
+    cores.push_back(IrqStat(18, 7, 0.10, 0.05, true));
+    cores.push_back(IrqStat(19, 7, 0.40, 0.05, true));
+    CHECK_EQ(cd::IrqHottestInGroupIndex(cores), 2);
+    CHECK_EQ(cd::IrqHottestOverallIndex(cores), 0);
+    CHECK(!cd::IrqHotCoreIsInGameGroup(cores));
+}
+
+void Test_X5_IrqNothingMeasuredInTheGroup() {
+    Case("X5 a group with no valid samples reports -1, never a processor it did not measure");
+    std::vector<cd::CoreDpcStat> cores;
+    cores.push_back(IrqStat(1, 7, 36.87, 13.97, false));
+    cores.push_back(IrqStat(18, 1, 0.10, 0.05, true));     // one sample: not measured
+    CHECK_EQ(cd::IrqHottestInGroupIndex(cores), -1);
+    CHECK(!cd::IrqHotCoreIsInGameGroup(cores));
+    CHECK_EQ(cd::IrqQuietCoresInGroup(cores), 0);          // unmeasured is not quiet either
+}
+
+void Test_X6_IrqQuietCount() {
+    Case("X6 the quiet count is measured in-group processors at or under the printed floor");
+    std::vector<cd::CoreDpcStat> cores;
+    cores.push_back(IrqStat(0, 7, 0.00, 0.00, true));
+    cores.push_back(IrqStat(1, 7, 0.50, 0.50, true));      // exactly 1.00 - quiet
+    cores.push_back(IrqStat(2, 7, 0.90, 0.20, true));      // 1.10 - not quiet
+    cores.push_back(IrqStat(3, 7, 36.87, 13.97, true));
+    cores.push_back(IrqStat(16, 7, 0.00, 0.00, false));    // outside the group
+    std::vector<ULONG> allLps, group;
+    for (ULONG lp = 0; lp < 4; ++lp) { allLps.push_back(lp); group.push_back(lp); }
+    allLps.push_back(16);
+    CHECK_EQ(cd::IrqCoresInGroup(allLps, group), 4);
+    CHECK_EQ(cd::IrqQuietCoresInGroup(cores), 2);
+    CHECK(cd::IrqHotCoreIsInGameGroup(cores));
+}
+
+void Test_X7_IrqReferenceMachineWarningFires() {
+    Case("X7 the reference machine's own numbers produce the warning this page exists for");
+    // [M] 2026-09-08: ISR 13.97% / DPC 36.87% on one processor while the rest of that CCD
+    // sat at 0.00%.
+    std::vector<cd::CoreDpcStat> cores;
+    cores.push_back(IrqStat(3, 7, 36.87, 13.97, true));
+    for (ULONG lp = 4; lp < 16; ++lp) cores.push_back(IrqStat(lp, 7, 0.00, 0.00, true));
+    CHECK(cd::IrqHotCoreIsInGameGroup(cores));
+
+    // The same numbers on a processor OUTSIDE the group are not this warning.
+    std::vector<cd::CoreDpcStat> outside;
+    outside.push_back(IrqStat(3, 7, 36.87, 13.97, false));
+    for (ULONG lp = 16; lp < 32; ++lp) outside.push_back(IrqStat(lp, 7, 0.00, 0.00, true));
+    CHECK(!cd::IrqHotCoreIsInGameGroup(outside));
+}
+
+void Test_X8_IrqAgreementCoversEveryState() {
+    Case("X8 the two interrupt keys are classified, including the measured disagreement");
+    cd::IrqPolicyReadout r;
+    r.readFailed = true;
+    CHECK_EQ(cd::IrqClassifyAgreement(r), cd::IrqAgreement::Unreadable);
+
+    r = cd::IrqPolicyReadout();
+    CHECK_EQ(cd::IrqClassifyAgreement(r), cd::IrqAgreement::NeitherPresent);
+
+    r = cd::IrqPolicyReadout();
+    r.policyPresent = true;
+    r.policyMask = 0x00000000FFFF0000ull;
+    CHECK_EQ(cd::IrqClassifyAgreement(r), cd::IrqAgreement::PolicyOnly);
+
+    r = cd::IrqPolicyReadout();
+    r.targetPresent = true;
+    r.targetMask = cd::IrqTargetSetToMask(0x99999999u);
+    CHECK_EQ(cd::IrqClassifyAgreement(r), cd::IrqAgreement::TargetOnly);
+
+    r = cd::IrqPolicyReadout();
+    r.policyPresent = true;
+    r.policyMask = 0x00000000FFFF0000ull;
+    r.targetPresent = true;
+    r.targetMask = 0x00000000FFFF0000ull;
+    CHECK_EQ(cd::IrqClassifyAgreement(r), cd::IrqAgreement::Agree);
+
+    // [M] THE REFERENCE MACHINE'S OWN RTX 4090, 2026-09-08. The static policy named CPUs
+    // 16-31 and Windows' own temporal target set named the striped complement, which
+    // includes the processor that was carrying the load. Showing only the first would have
+    // reported the input and called it the outcome.
+    r = cd::IrqPolicyReadout();
+    r.policyPresent = true;
+    r.policyMask = 0x00000000FFFF0000ull;
+    r.targetPresent = true;
+    r.targetMask = cd::IrqTargetSetToMask(0x66666666u);
+    CHECK_EQ(cd::IrqClassifyAgreement(r), cd::IrqAgreement::Disagree);
+    const std::wstring said = cd::IrqAgreementText(cd::IrqAgreement::Disagree, r);
+    CHECK(said.find(L"CPUs 16-31 (16 processors)") != std::wstring::npos);
+    CHECK(said.find(L"1-2, 5-6, 9-10, 13-14, 17-18, 21-22, 25-26, 29-30") !=
+          std::wstring::npos);
+}
+
+void Test_X9_IrqSwitchCompleteness() {
+    Case("X9 every enum value has its own sentence - a new value fails here, not on screen");
+    cd::IrqPolicyReadout r;
+    r.policyPresent = true;
+    r.policyMask = 0x00000000FFFF0000ull;
+    r.targetPresent = true;
+    r.targetMask = cd::IrqTargetSetToMask(0x66666666u);
+
+    const cd::IrqAgreement agreements[] = {
+        cd::IrqAgreement::Unreadable, cd::IrqAgreement::NeitherPresent,
+        cd::IrqAgreement::PolicyOnly, cd::IrqAgreement::TargetOnly,
+        cd::IrqAgreement::Agree, cd::IrqAgreement::Disagree
+    };
+    std::vector<std::wstring> said;
+    for (size_t i = 0; i < ARRAYSIZE(agreements); ++i)
+        said.push_back(cd::IrqAgreementText(agreements[i], r));
+    AllPairwiseDistinct(said, "IrqAgreementText covers every value distinctly");
+
+    const cd::IrqPolicyState states[] = { cd::IrqPolicyState::NotConfigured,
+                                          cd::IrqPolicyState::Configured,
+                                          cd::IrqPolicyState::Unreadable };
+    std::vector<std::wstring> stateText;
+    for (size_t i = 0; i < ARRAYSIZE(states); ++i)
+        stateText.push_back(cd::IrqPolicyStateText(states[i], L"CPUs 16-31 (16 processors)"));
+    AllPairwiseDistinct(stateText, "IrqPolicyStateText covers every value distinctly");
+
+    const cd::GameGroupSource sources[] = { cd::GameGroupSource::LiveProfile,
+                                            cd::GameGroupSource::MachineDefault,
+                                            cd::GameGroupSource::Unknown };
+    std::vector<std::wstring> phrases;
+    for (size_t i = 0; i < ARRAYSIZE(sources); ++i)
+        phrases.push_back(cd::GameGroupPhrase(sources[i]));
+    AllPairwiseDistinct(phrases, "GameGroupPhrase covers every value distinctly");
+}
+
+void Test_X12_IrqPresentButUndecodablePolicyIsNeverAbsent() {
+    Case("X12 a policy that is there and will not decode reads as unreadable, never as not set");
+    // [M] Council review 2026-09-08, C2 / H3. An AssignmentSetOverride of a length this page
+    // cannot decode used to leave policyPresent false with nothing else set, so the device
+    // reported "Not set. Windows chooses this device's interrupt processors." That is the one
+    // fold the comment above IrqPolicyState forbids: unreadable folded into absent.
+    cd::IrqPolicyReadout r;
+    r.policyUnreadable = true;
+    CHECK_EQ(cd::IrqClassifyAgreement(r), cd::IrqAgreement::Unreadable);
+    CHECK_EQ(cd::IrqPolicyStateOf(r), cd::IrqPolicyState::Unreadable);
+
+    // ...and it does not become "this device carries no interrupt affinity policy" merely
+    // because Windows recorded a target set of its own beside it.
+    r.targetPresent = true;
+    r.targetMask = cd::IrqTargetSetToMask(0x66666666u);
+    CHECK_EQ(cd::IrqClassifyAgreement(r), cd::IrqAgreement::Unreadable);
+    CHECK_EQ(cd::IrqPolicyStateOf(r), cd::IrqPolicyState::Unreadable);
+
+    // THE TWO STATES THAT MUST NOT MOVE. A device with nothing under Affinity Policy is still
+    // "not set", and a decoded policy is still "set to".
+    cd::IrqPolicyReadout absent;
+    CHECK_EQ(cd::IrqClassifyAgreement(absent), cd::IrqAgreement::NeitherPresent);
+    CHECK_EQ(cd::IrqPolicyStateOf(absent), cd::IrqPolicyState::NotConfigured);
+    cd::IrqPolicyReadout configured;
+    configured.policyPresent = true;
+    configured.policyMask = 0x00000000FFFF0000ull;
+    CHECK_EQ(cd::IrqClassifyAgreement(configured), cd::IrqAgreement::PolicyOnly);
+    CHECK_EQ(cd::IrqPolicyStateOf(configured), cd::IrqPolicyState::Configured);
+
+    // THE WIRING, NOT ONLY THE CLASSIFIER. IrqDevice::Readout is where the probe's two flags
+    // are folded, and overridePresent used to be written there and read nowhere at all.
+    cd::IrqDevice undecodable;
+    undecodable.overridePresent = true;    // the value IS in the registry
+    undecodable.overrideDecoded = false;   // and this page could not read it
+    CHECK(undecodable.Readout().policyUnreadable);
+    CHECK_EQ(cd::IrqPolicyStateOf(undecodable.Readout()), cd::IrqPolicyState::Unreadable);
+    CHECK_EQ(cd::IrqClassifyAgreement(undecodable.Readout()), cd::IrqAgreement::Unreadable);
+
+    cd::IrqDevice nothingThere;
+    CHECK(!nothingThere.Readout().policyUnreadable);
+    CHECK_EQ(cd::IrqPolicyStateOf(nothingThere.Readout()), cd::IrqPolicyState::NotConfigured);
+
+    cd::IrqDevice decoded;
+    decoded.overridePresent = true;
+    decoded.overrideDecoded = true;
+    decoded.overrideMask = 0x00000000FFFF0000ull;
+    CHECK(!decoded.Readout().policyUnreadable);
+    CHECK_EQ(cd::IrqPolicyStateOf(decoded.Readout()), cd::IrqPolicyState::Configured);
+}
+
+void Test_X13_IrqUnmeasuredGroupMemberIsStillInTheGroup() {
+    Case("X13 a group processor the counters never returned is still in the group and still in M");
+    // [M] Council review 2026-09-08, C3 / H8. Membership used to be read off the SAMPLED
+    // results, so a processor PDH never named left the group entirely: it painted as though it
+    // were outside, and "N of M processors in that group" quietly described a smaller set than
+    // the mask the same page had just printed.
+    std::vector<ULONG> allLps;
+    for (ULONG lp = 0; lp < 32; ++lp) allLps.push_back(lp);
+    std::vector<ULONG> group;
+    for (ULONG lp = 0; lp < 16; ++lp) group.push_back(lp);
+
+    // Only two of the sixteen returned anything at all.
+    std::vector<cd::CoreDpcStat> cores;
+    cores.push_back(IrqStat(3, 7, 36.87, 13.97, false));
+    cores.push_back(IrqStat(4, 7, 0.00, 0.00, false));
+    cd::IrqMarkGameGroup(cores, group);
+
+    CHECK_EQ(cd::IrqCoresInGroup(allLps, group), 16);   // the GROUP's size, not the sample's
+    CHECK(cd::IrqLpIsInGameGroup(9, group));            // never sampled, still in the group
+    CHECK(cd::IrqLpIsInGameGroup(3, group));
+    CHECK(!cd::IrqLpIsInGameGroup(16, group));
+
+    // The counts that are ABOUT MEASUREMENT still are: an unmeasured processor is neither
+    // quiet nor loud, and it does not become quiet by being in the group.
+    CHECK_EQ(cd::IrqQuietCoresInGroup(cores), 1);
+    CHECK(cd::IrqHotCoreIsInGameGroup(cores));
+
+    // An empty group list is not "everything", and a group naming processors this machine does
+    // not have does not inflate the count.
+    CHECK_EQ(cd::IrqCoresInGroup(allLps, std::vector<ULONG>()), 0);
+    std::vector<ULONG> beyond;
+    beyond.push_back(40);
+    beyond.push_back(99);
+    CHECK_EQ(cd::IrqCoresInGroup(allLps, beyond), 0);
+    CHECK_EQ(cd::IrqCoresInGroup(std::vector<ULONG>(), group), 0);
+}
+
+// EVERY user-facing string this readout can put on screen, in one place. Both halves of the
+// wording gate run over exactly this list, so a sentence added to irq_policy.h and not added
+// here is the one way the gate can be got round - which is why the list is assembled from the
+// accessor functions rather than from copies of their text.
+std::vector<std::wstring> IrqEveryUserString() {
+    std::vector<std::wstring> v;
+    v.push_back(cd::IrqBenchIntroText());
+    v.push_back(cd::IrqDeviceHeadingText());
+    v.push_back(cd::IrqNoDevicesText());
+    v.push_back(cd::IrqWindowsChoosesText());
+    v.push_back(cd::IrqUnreadableColumnText());
+    v.push_back(cd::IrqNotRecordedText());
+    v.push_back(cd::IrqNotSetText());
+    v.push_back(cd::IrqNotStartedText());
+    v.push_back(cd::IrqCardHeadingText());
+    v.push_back(cd::IrqCardLineText());
+    v.push_back(cd::IrqCardButtonCaption());
+    v.push_back(cd::IrqReproductionCommand());
+
+    const cd::IrqRefusal refusals[] = {
+        cd::IrqRefusal::None, cd::IrqRefusal::MultipleProcessorGroups,
+        cd::IrqRefusal::TooManyProcessors, cd::IrqRefusal::UnexpectedProcessorNumbering,
+        cd::IrqRefusal::CountersUnavailable
+    };
+    for (size_t i = 0; i < ARRAYSIZE(refusals); ++i)
+        v.push_back(cd::IrqRefusalReason(refusals[i]));
+
+    const cd::IrqPolicyState states[] = { cd::IrqPolicyState::NotConfigured,
+                                          cd::IrqPolicyState::Configured,
+                                          cd::IrqPolicyState::Unreadable };
+    for (size_t i = 0; i < ARRAYSIZE(states); ++i)
+        v.push_back(cd::IrqPolicyStateText(states[i], L"CPUs 16-31 (16 processors)"));
+
+    cd::IrqPolicyReadout r;
+    r.policyPresent = true;
+    r.policyMask = 0x00000000FFFF0000ull;
+    r.targetPresent = true;
+    r.targetMask = cd::IrqTargetSetToMask(0x66666666u);
+    const cd::IrqAgreement agreements[] = {
+        cd::IrqAgreement::Unreadable, cd::IrqAgreement::NeitherPresent,
+        cd::IrqAgreement::PolicyOnly, cd::IrqAgreement::TargetOnly,
+        cd::IrqAgreement::Agree, cd::IrqAgreement::Disagree
+    };
+    for (size_t i = 0; i < ARRAYSIZE(agreements); ++i)
+        v.push_back(cd::IrqAgreementText(agreements[i], r));
+
+    const cd::GameGroupSource sources[] = { cd::GameGroupSource::LiveProfile,
+                                            cd::GameGroupSource::MachineDefault,
+                                            cd::GameGroupSource::Unknown };
+    for (size_t i = 0; i < ARRAYSIZE(sources); ++i) {
+        v.push_back(cd::GameGroupPhrase(sources[i]));
+        v.push_back(cd::IrqGameGroupSentence(sources[i], L"Cache", 0x000000000000FFFFull));
+        v.push_back(cd::IrqNoGroupMeasuredSentence(sources[i], L"Cache"));
+        v.push_back(cd::IrqHotCoreSentence(IrqStat(3, 7, 36.87, 13.97, true), 14, 16,
+                                           sources[i], L"Cache"));
+        v.push_back(cd::IrqHotCoreOutsideGroupSentence(IrqStat(1, 7, 36.87, 13.97, false),
+                                                       sources[i], L"Cache"));
+    }
+    v.push_back(cd::IrqNoHotCoreSentence(IrqStat(4, 7, 0.20, 0.11, true)));
+    v.push_back(cd::IrqNotMeasuredSentence(9));
+    v.push_back(cd::FormatCpuListWithCount(0x00000000FFFF0000ull));
+    v.push_back(cd::FormatCpuListWithCount(0ull));
+    return v;
+}
+
+void Test_X10_IrqWordingTripwire() {
+    Case("X10 THE TRIPWIRE - no string on this page promises anything the product cannot keep");
+    // A TRIPWIRE, NOT THE GATE. It catches the words that would turn an instrument into a
+    // claim; the exact-text pins in group Y are what stop a rewrite that avoids all of them
+    // and still says something new. Said here so no future session mistakes one for the
+    // other.
+    //
+    // IT RUNS AT ALL BECAUSE THE PRODUCT'S OWN NAME IS ABSENT FROM src\irq_policy.h BY
+    // DESIGN - every sentence there says "this page". An earlier draft of this feature would
+    // have banned the same token while its copy said the application's name four times, so
+    // the gate would have been relaxed on its first run and by exception forever.
+    const wchar_t* const tier1[] = {
+        L"fps", L"framerate", L"frame rate", L"smoother", L"boost", L"speed up", L"faster",
+        L"improve", L"better", L"guarantee", L"optimi", L"fix", L"verified", L"proven",
+        L"working", L"active", L"will help", L"should help", L"in effect"
+    };
+    const std::vector<std::wstring> strings = IrqEveryUserString();
+
+    // POSITIVE CONTROL: the scan must be able to find a banned token when one is really
+    // there, or a clean run proves nothing at all.
+    {
+        const std::wstring planted = L"this page will make your game FASTER";
+        bool found = false;
+        for (size_t t = 0; t < ARRAYSIZE(tier1); ++t)
+            if (cd::ToLower(planted).find(cd::ToLower(tier1[t])) != std::wstring::npos)
+                found = true;
+        CHECK(found);
+    }
+
+    CHECK(strings.size() > 30);
+    for (size_t i = 0; i < strings.size(); ++i) {
+        const std::wstring folded = cd::ToLower(strings[i]);
+        for (size_t t = 0; t < ARRAYSIZE(tier1); ++t) {
+            ++g_total;
+            if (folded.find(cd::ToLower(tier1[t])) != std::wstring::npos) {
+                Fail(__FILE__, __LINE__, "Tier-1 wording ban", Utf8(strings[i]),
+                     std::string("a sentence with no \"") + Utf8(tier1[t]) + "\" in it");
+            }
+        }
+    }
+}
+
+void Test_X11_IrqEveryStringIsNonEmpty() {
+    Case("X11 no user-facing string on this page is empty");
+    // A blank label reads as a machine with nothing to say. The one string allowed to be
+    // empty is FormatCpuList of an empty mask, and it is deliberately not in this list.
+    const std::vector<std::wstring> strings = IrqEveryUserString();
+    for (size_t i = 0; i < strings.size(); ++i) CHECK(!strings[i].empty());
+}
+
+// ---------------------------------------------------------------------------
+// Y. The sentences that carry numbers, pinned character for character.
+//
+// THIS IS THE GATE. Any edit to any of these sentences fails the build until a human
+// re-approves it, which is the only check that can catch "this makes your game run well"
+// while still permitting "this is not a remedy". Modelled on Test_P1 above, this tree's
+// existing precedent for pinning a literal.
+// ---------------------------------------------------------------------------
+
+void Test_Y1_IrqHotCoreSentenceIsExact() {
+    Case("Y1 the hot-processor warning matches character for character");
+    cd::CoreDpcStat c = IrqStat(3, 7, 36.87, 13.97, true);
+    c.minDpcPct = 36.80;
+    c.maxDpcPct = 36.94;
+    const std::wstring expected =
+        L"CPU 3 spent 36.87% of the capture on DPCs and 13.97% on interrupt service "
+        L"(DPC range 36.80-36.94% over 7 samples). It is in \"Cache\", the group your game is "
+        L"assigned to. 14 of the 16 processors in that group stayed at or under 1.00%.";
+    CHECK_EQ(cd::IrqHotCoreSentence(c, 14, 16, cd::GameGroupSource::LiveProfile, L"Cache"),
+             expected);
+}
+
+void Test_Y2_IrqNoHotCoreSentenceIsExact() {
+    Case("Y2 the quiet-group sentence matches character for character");
+    const std::wstring expected =
+        L"Nothing in the game's group is above 5.00% of interrupt and DPC time together. "
+        L"The highest is CPU 4 at 0.31%.";
+    CHECK_EQ(cd::IrqNoHotCoreSentence(IrqStat(4, 7, 0.20, 0.11, true)), expected);
+}
+
+void Test_Y3_IrqOutsideGroupSentenceIsExact() {
+    Case("Y3 the outside-the-group sentence matches character for character");
+    const std::wstring expected =
+        L"CPU 1 spent 36.87% of the capture on DPCs and 13.97% on interrupt service. "
+        L"It is NOT in \"Cache\", this machine's default game group - no game is running "
+        L"right now, so it is outside the processors this page would warn about.";
+    CHECK_EQ(cd::IrqHotCoreOutsideGroupSentence(IrqStat(1, 7, 36.87, 13.97, false),
+                                                cd::GameGroupSource::MachineDefault, L"Cache"),
+             expected);
+}
+
+void Test_Y4_IrqNothingMeasuredSentencesAreExact() {
+    Case("Y4 'not measured' never reads as 0.00%, and says so in as many words");
+    const std::wstring group =
+        L"No processor in \"Freq\", the group your game is assigned to, returned enough valid "
+        L"samples to report. That is not the same as those processors being idle.";
+    CHECK_EQ(cd::IrqNoGroupMeasuredSentence(cd::GameGroupSource::LiveProfile, L"Freq"), group);
+
+    const std::wstring one =
+        L"CPU 9 - not measured. Fewer than 3 valid samples were returned for it. That is not "
+        L"the same as 0.00%.";
+    CHECK_EQ(cd::IrqNotMeasuredSentence(9), one);
+}
+
+void Test_Y5_IrqGameGroupSentenceIsExact() {
+    Case("Y5 the group sentence names its SOURCE, never only the mask");
+    const std::wstring expected =
+        L"Measured against \"Cache\", this machine's default game group - no game is running "
+        L"right now: CPUs 0-15 (16 processors).";
+    CHECK_EQ(cd::IrqGameGroupSentence(cd::GameGroupSource::MachineDefault, L"Cache",
+                                      0x000000000000FFFFull),
+             expected);
+}
+
+void Test_Y6_IrqReproductionCommandIsExact() {
+    Case("Y6 the reproduction command matches the capture this page actually takes");
+    const std::wstring expected =
+        L"Check this yourself: Get-Counter '\\Processor Information(*)\\% DPC Time',"
+        L"'\\Processor Information(*)\\% Interrupt Time' -SampleInterval 1 -MaxSamples 8 - "
+        L"an instance named \"0,3\" is CPU 3 in processor group 0. This page throws away the "
+        L"first collection, because a rate counter has nothing to compare against yet, and "
+        L"averages the remaining 7.";
+    CHECK_EQ(cd::IrqReproductionCommand(), expected);
+    // The command has to describe the capture the code takes, not a capture somebody typed
+    // once: both numbers in it come from kIrqCollects and kIrqMinSamples.
+    CHECK_EQ(cd::kIrqCollects, 8);
+    CHECK_EQ(cd::kIrqMinSamples, 3);
+}
+
+void Test_Y7_IrqPolicyStateTextIsExact() {
+    Case("Y7 the per-device policy sentences match character for character");
+    CHECK_EQ(cd::IrqPolicyStateText(cd::IrqPolicyState::NotConfigured, L""),
+             L"Not set. Windows chooses this device's interrupt processors.");
+    CHECK_EQ(cd::IrqPolicyStateText(cd::IrqPolicyState::Configured,
+                                    L"CPUs 16-31 (16 processors)"),
+             L"Set to CPUs 16-31 (16 processors). That is what the registry holds; it is not "
+             L"a statement about where interrupts land.");
+    CHECK_EQ(cd::IrqPolicyStateText(cd::IrqPolicyState::Unreadable, L""),
+             L"This page could not read this device's interrupt policy. That is not the same "
+             L"as there being none - it means the read failed.");
+}
+
+void Test_Y8_IrqDisagreementSentenceIsExact() {
+    Case("Y8 the disagreement sentence - the whole point of the readout - is pinned");
+    cd::IrqPolicyReadout r;
+    r.policyPresent = true;
+    r.policyMask = 0x00000000FFFF0000ull;
+    r.targetPresent = true;
+    r.targetMask = cd::IrqTargetSetToMask(0x66666666u);
+    const std::wstring expected =
+        L"THESE TWO DISAGREE. The policy on this device names CPUs 16-31 (16 processors), and "
+        L"the target set Windows recorded for it names "
+        L"CPUs 1-2, 5-6, 9-10, 13-14, 17-18, 21-22, 25-26, 29-30 (16 processors). The policy "
+        L"is what somebody asked for; the target set is what Windows wrote down. This page "
+        L"cannot tell you which of them the hardware is following.";
+    CHECK_EQ(cd::IrqAgreementText(cd::IrqAgreement::Disagree, r), expected);
+}
+
+void Test_Y9_IrqNoSentenceHardcodesAGroupName() {
+    Case("Y9 no sentence hardcodes a group name - Cache and CCD0 are both real machines");
+    // [M] The reference part emits "Cache" / "Freq"; a symmetric dual-CCD part emits
+    // "CCD0" / "CCD1". A sentence that named either would be wrong on the other machine.
+    const cd::CoreDpcStat c = IrqStat(3, 7, 36.87, 13.97, true);
+    const std::wstring cache =
+        cd::IrqHotCoreSentence(c, 14, 16, cd::GameGroupSource::LiveProfile, L"Cache");
+    const std::wstring ccd0 =
+        cd::IrqHotCoreSentence(c, 14, 16, cd::GameGroupSource::LiveProfile, L"CCD0");
+    CHECK(cache.find(L"Cache") != std::wstring::npos);
+    CHECK(cache.find(L"CCD0") == std::wstring::npos);
+    CHECK(ccd0.find(L"CCD0") != std::wstring::npos);
+    CHECK(ccd0.find(L"Cache") == std::wstring::npos);
+
+    // An EMPTY mask name drops the quoted name rather than printing empty quotes.
+    const std::wstring unnamed =
+        cd::IrqHotCoreSentence(c, 14, 16, cd::GameGroupSource::Unknown, L"");
+    CHECK(unnamed.find(L"\"\"") == std::wstring::npos);
+    CHECK(unnamed.find(L"a group this page could not identify") != std::wstring::npos);
+}
+
+void Test_Y11_IrqCardLineIsExact() {
+    Case("Y11 the Settings card sentence - the one seen without opening the page - is pinned");
+    // THIS PIN IS THE FIX. [M] Council review 2026-09-08, C1 / H1: the card used to say "no
+    // processor assignment can move one" and "there is a kind of stutter nothing on this
+    // window can reach". The first is contradicted by this project's own measurement - the
+    // interrupt and DPC load moved from CPU 1 to CPU 3 when Windows' temporal TargetSet
+    // changed - and the second asserts a symptom no frame rate was ever measured for. The
+    // deny-list in X10 caught neither, because neither says a banned word. Only an exact pin
+    // can catch a sentence that is merely too strong, which is why this test exists.
+    const std::wstring expected =
+        L"CPU Sets move threads. A driver's deferred procedure call is not a thread - it runs "
+        L"above every thread on its processor - so the processor assignment this window makes "
+        L"cannot move one. This opens a read-only readout of where interrupt and DPC time is "
+        L"landing on this machine. It measures; it changes nothing.";
+    CHECK_EQ(std::wstring(cd::IrqCardLineText()), expected);
+
+    // The two struck claims, named so no rewording can quietly restore them.
+    const std::wstring folded = cd::ToLower(std::wstring(cd::IrqCardLineText()));
+    CHECK(folded.find(L"stutter") == std::wstring::npos);
+    CHECK(folded.find(L"no processor assignment") == std::wstring::npos);
+    CHECK(folded.find(L"any processor assignment") == std::wstring::npos);
+
+    // The card and the bench intro must not contradict each other: both scope the claim to
+    // what moves THREADS, and the intro is the longer form of the same sentence.
+    const std::wstring intro = cd::ToLower(std::wstring(cd::IrqBenchIntroText()));
+    CHECK(intro.find(L"stutter") == std::wstring::npos);
+    CHECK(intro.find(L"cpu sets move threads") != std::wstring::npos);
+    CHECK(folded.find(L"cpu sets move threads") != std::wstring::npos);
+}
+
+void Test_Y10_IrqPercentFormatting() {
+    Case("Y10 every figure is two decimals, so the screen and the clipboard agree");
+    CHECK_EQ(cd::IrqFormatPct(0.0), L"0.00");
+    CHECK_EQ(cd::IrqFormatPct(36.87), L"36.87");
+    CHECK_EQ(cd::IrqFormatPct(100.0), L"100.00");
+}
+
+
+// ===========================================================================
+// Z.  EXTREME GAME MODE - the blanket sweep (engine.h rule 4b).
+//
+// Z is the first free banner letter: A-Y are all taken, and W/X/Y went to the interrupt
+// bench. Written from the header comments in config.h, engine.h and settings_warning.h.
+//
+// The whole rule is reachable without an OS: ExtremeSweepActive and ExtremeSweepEligible are
+// pure by construction, and ComputeDesired is driven with the same synthetic snapshots
+// section C uses. Nothing below opens a process.
+// ===========================================================================
+
+// The snapshot section C uses plus the things a BLANKET sweep has to reason about and the
+// other rules never see: an ordinary process nobody named, an excluded process that is NOT on
+// the heavy list, a wildcard-excluded process, and a process whose name could not be read.
+//
+//   pid 400  parent.exe                <- ordinary, nobody named it
+//   pid 500  explorer.exe              <- ordinary here (the fixture's exclusion list is its own)
+//   pid 1000 Overwatch.exe             <- the game
+//   pid 1001/1002 descendants          <- game mask
+//   pid 1003 EasyAntiCheat.exe         <- descendant AND excluded
+//   pid 1004 OBS.exe                   <- descendant AND heavy
+//   pid 2000 notepad.exe               <- THE PROCESS THIS RULE EXISTS FOR
+//   pid 3000 OBS.exe                   <- heavy, not a descendant
+//   pid 3001 audiodg.exe               <- heavy AND excluded (rule 3's override)
+//   pid 5000 encoder.exe               <- EXCLUDED and on nobody's heavy list
+//   pid 5001 amd3dvcacheUser.exe       <- excluded by the trailing-* wildcard
+//   pid 5002 <empty name>              <- unreadable: the exclusion list cannot be consulted
+//   pid 6000 msedgewebview2.exe        <- OUR OWN child (parent 9000 == selfPid)
+//   pid 9000 GameOptimizer.exe         <- selfPid
+cd::ProcessSnapshot MakeExtremeSnapshot() {
+    cd::ProcessSnapshot s = MakeGameSnapshot();
+    AddProc(s, 5000, 500, L"encoder.exe", 610, 0, 0.0);
+    AddProc(s, 5001, 500, L"amd3dvcacheUser.exe", 620, 0, 0.0);
+    AddProc(s, 5002, 500, L"", 630, 0, 0.0);
+    AddProc(s, 9000, 500, L"GameOptimizer.exe", 640, 0, 0.0);
+    AddProc(s, 6000, 9000, L"msedgewebview2.exe", 650, 0, 0.0);
+    return s;
+}
+
+cd::Config MakeExtremeConfig(const cd::Topology& t, bool extreme) {
+    cd::Config c = MakeEngineConfig(t, false);
+    // The wildcard form DefaultExclusions() actually ships, so the test exercises the same
+    // matcher the product does rather than a plain name.
+    c.exclusions.push_back(L"amd3dvcache*");
+    c.profiles[0].extremeMode = extreme;
+    return c;
+}
+
+void Test_Z1_DefaultIsOff() {
+    Case("Z1 extreme game mode is OFF by default - the struct, and every shipped profile");
+    cd::Profile fresh;
+    CHECK_EQ(fresh.extremeMode, false);
+
+    cd::Topology t = MakeReference(false);
+    cd::Config c = cd::DefaultConfig(t);
+    CHECK(c.profiles.size() >= 2);
+    for (size_t i = 0; i < c.profiles.size(); ++i) CHECK_EQ(c.profiles[i].extremeMode, false);
+}
+
+void Test_Z2_RoundTripAndOldConfigs() {
+    Case("Z2 extreme_mode survives a save/load round trip, both ways");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = cd::DefaultConfig(t);
+    c.profiles[0].extremeMode = true;
+    c.profiles[1].extremeMode = false;
+
+    cd::Config back;
+    std::wstring err;
+    CHECK(cd::ParseConfig(cd::SerializeConfig(c), back, &err));
+    CHECK_EQ(err, L"");
+    CHECK(back.profiles.size() >= 2);
+    CHECK_EQ(back.profiles[0].extremeMode, true);
+    CHECK_EQ(back.profiles[1].extremeMode, false);
+
+    Case("Z2b a config written before this feature loads with the mode OFF, not preserved raw");
+    // The key is absent, so the model default has to survive AND the line must not come back
+    // as an unknown key - a build that re-emitted it would be writing a setting it cannot read.
+    const std::wstring old =
+        L"[general]\r\nversion=1\r\n\r\n"
+        L"[masks]\r\nCache=0 1 2 3\r\n\r\n"
+        L"[profile:Overwatch]\r\nenabled=true\r\ngame=Overwatch.exe\r\ngame_mask=Cache\r\n";
+    cd::Config oldCfg;
+    CHECK(cd::ParseConfig(old, oldCfg, &err));
+    CHECK_EQ((int)oldCfg.profiles.size(), 1);
+    if (!oldCfg.profiles.empty()) CHECK_EQ(oldCfg.profiles[0].extremeMode, false);
+    // BoolText writes 1/0, not true/false - checked against config.cpp, not assumed.
+    CHECK(cd::SerializeConfig(oldCfg).find(L"extreme_mode=0") != std::wstring::npos);
+}
+
+void Test_Z3_SweepActiveNeedsAMaskToSweepOnto() {
+    Case("Z3 the sweep is active only when it is ON and there is somewhere to sweep to");
+    cd::Profile p;
+    p.heavyMask = L"Freq";
+
+    p.extremeMode = false;
+    CHECK_EQ(cd::ExtremeSweepActive(p), false);
+
+    p.extremeMode = true;
+    CHECK_EQ(cd::ExtremeSweepActive(p), true);
+
+    // An empty heavy mask resolves to "clear this process's assignment". Sweeping the whole
+    // machine into a clear would strip assignments this program never made.
+    p.heavyMask.clear();
+    CHECK_EQ(cd::ExtremeSweepActive(p), false);
+}
+
+void Test_Z4_EligibilityIsSevenHardGates() {
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeExtremeConfig(t, true);
+    std::set<DWORD> gameSet;
+    gameSet.insert(1000);
+    gameSet.insert(1001);
+    std::set<DWORD> selfSet;
+    selfSet.insert(9000);
+    selfSet.insert(6000);
+
+    Case("Z4 an ordinary process nobody named IS eligible - the positive control");
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 2000, L"notepad.exe", gameSet, selfSet), true);
+
+    Case("Z4b pids 0 and 4 are never eligible, whatever they are called");
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 0, L"Idle", gameSet, selfSet), false);
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 4, L"System", gameSet, selfSet), false);
+
+    Case("Z4c a process whose name could not be read is REFUSED, not assumed safe");
+    // The exclusion list is matched BY NAME, so no name means it could not be consulted.
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 5002, L"", gameSet, selfSet), false);
+
+    Case("Z4d the game's own set is not swept - it is already on the game mask");
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 1000, L"Overwatch.exe", gameSet, selfSet), false);
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 1001, L"OverwatchChild.exe", gameSet, selfSet), false);
+
+    Case("Z4e our own subtree is not swept, by PARENTAGE and not by name");
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 9000, L"GameOptimizer.exe", gameSet, selfSet), false);
+    // The name is not excluded and is not ours; only descent from selfPid saves it.
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 6000, L"msedgewebview2.exe", gameSet, selfSet), false);
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 6001, L"msedgewebview2.exe", gameSet, selfSet), true);
+
+    Case("Z4f an EXCLUDED name is never swept - exact, case-insensitive, and wildcard");
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 5000, L"encoder.exe", gameSet, selfSet), false);
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 5000, L"ENCODER.EXE", gameSet, selfSet), false);
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 5001, L"amd3dvcacheUser.exe", gameSet, selfSet), false);
+
+    Case("Z4g THE OVERRIDE RULE 3 HAS IS NOT INHERITED: an excluded name on the heavy list "
+         "is still refused by the sweep");
+    // audiodg.exe is BOTH excluded and on this profile's heavy list. Rule 3 honours it,
+    // because that entry is the user naming one process. A blanket sweep is not a user naming
+    // anything, so the same name is refused here - and this predicate is not even shown the
+    // heavy list, which is the structural reason it cannot be talked round.
+    CHECK(std::find(c.profiles[0].heavy.begin(), c.profiles[0].heavy.end(),
+                    std::wstring(L"audiodg.exe")) != c.profiles[0].heavy.end());
+    CHECK_EQ(c.IsExcluded(L"audiodg.exe"), true);
+    CHECK_EQ(cd::ExtremeSweepEligible(c, 3001, L"audiodg.exe", gameSet, selfSet), false);
+}
+
+void Test_Z5_TheRuleThroughComputeDesired() {
+    cd::Topology t = MakeReference(false);
+    cd::ProcessSnapshot s = MakeExtremeSnapshot();
+
+    // Fixture sanity, so nothing below can pass for the wrong reason.
+    CHECK(s.Find(2000) != nullptr);
+    CHECK(s.Find(5002) != nullptr);
+
+    Case("Z5 WITH THE MODE OFF, a process nobody named gets no mask at all");
+    cd::Config off = MakeExtremeConfig(t, false);
+    std::vector<std::wstring> sticky1;
+    const cd::Profile* m1 = nullptr;
+    std::map<DWORD, std::wstring> r1 = cd::ComputeDesired(s, off, 1000, sticky1, &m1, 9000);
+    CHECK(m1 != nullptr);
+    CHECK(!Has(r1, 2000));   // notepad
+    CHECK(!Has(r1, 400));    // parent.exe
+    CHECK(!Has(r1, 500));    // explorer.exe
+
+    Case("Z5b WITH THE MODE ON, every one of them is on the heavy mask");
+    cd::Config on = MakeExtremeConfig(t, true);
+    std::vector<std::wstring> sticky2;
+    const cd::Profile* m2 = nullptr;
+    std::set<DWORD> autoPinned;
+    std::set<DWORD> swept;
+    std::map<DWORD, std::wstring> r2 =
+        cd::ComputeDesired(s, on, 1000, sticky2, &m2, 9000, &autoPinned, &swept);
+    CHECK(m2 != nullptr);
+    CHECK_EQ(MaskOf(r2, 2000), L"Freq");
+    CHECK_EQ(MaskOf(r2, 400), L"Freq");
+    CHECK_EQ(MaskOf(r2, 500), L"Freq");
+
+    Case("Z5c the sweep never overrides the GAME mask");
+    CHECK_EQ(MaskOf(r2, 1000), L"Cache no SMT");
+    CHECK_EQ(MaskOf(r2, 1001), L"Cache no SMT");
+    CHECK_EQ(MaskOf(r2, 1002), L"Cache no SMT");
+
+    Case("Z5d every exclusion is honoured by the sweep - default, user and wildcard");
+    CHECK(!Has(r2, 5000));   // encoder.exe, excluded, on nobody's heavy list
+    CHECK(!Has(r2, 5001));   // amd3dvcacheUser.exe, excluded by the trailing-* wildcard
+    CHECK(!Has(r2, 1003));   // EasyAntiCheat.exe, an excluded descendant
+
+    Case("Z5e a process whose name could not be read is left alone");
+    CHECK(!Has(r2, 5002));
+
+    Case("Z5f reserved pids and our own subtree are left alone");
+    CHECK(!Has(r2, 0));
+    CHECK(!Has(r2, 4));
+    CHECK(!Has(r2, 9000));
+    CHECK(!Has(r2, 6000));
+
+    Case("Z5g an EXCLUDED name on the heavy list still gets rule 3's mask, and rule 4b has "
+         "not quietly taken the credit");
+    CHECK_EQ(MaskOf(r2, 3001), L"Freq");            // audiodg.exe, rule 3's override
+    CHECK(swept.find(3001) == swept.end());         // ...but not attributed to the sweep
+    CHECK(swept.find(2000) != swept.end());         // notepad.exe IS the sweep's
+    CHECK(swept.find(1000) == swept.end());         // the game never is
+    CHECK_EQ((int)autoPinned.size(), 0);            // autoPin is off in this fixture
+}
+
+void Test_Z6_NothingIsSweptWithoutAGoverningProfile() {
+    Case("Z6 no profile matches -> the sweep does not run, however extreme the profile is");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeExtremeConfig(t, true);
+
+    // The game is NOT running; everything else on the machine is.
+    cd::ProcessSnapshot s;
+    AddProc(s, 500, 400, L"explorer.exe", 100, 0, 0.0);
+    AddProc(s, 2000, 500, L"notepad.exe", 120, 0, 0.0);
+    AddProc(s, 3000, 500, L"OBS.exe", 150, 0, 0.0);
+
+    std::vector<std::wstring> sticky;
+    const cd::Profile* matched = reinterpret_cast<const cd::Profile*>(0x1);
+    std::set<DWORD> swept;
+    std::map<DWORD, std::wstring> r =
+        cd::ComputeDesired(s, c, 500, sticky, &matched, 0, nullptr, &swept);
+    CHECK_EQ((int)r.size(), 0);
+    CHECK(matched == nullptr);
+    CHECK_EQ((int)swept.size(), 0);
+
+    Case("Z6b a DISABLED extreme profile sweeps nothing either");
+    cd::Config disabled = MakeExtremeConfig(t, true);
+    disabled.profiles[0].enabled = false;
+    cd::ProcessSnapshot live = MakeExtremeSnapshot();
+    std::vector<std::wstring> sticky2;
+    const cd::Profile* m2 = reinterpret_cast<const cd::Profile*>(0x1);
+    std::map<DWORD, std::wstring> r2 = cd::ComputeDesired(live, disabled, 1000, sticky2, &m2);
+    CHECK_EQ((int)r2.size(), 0);
+    CHECK(m2 == nullptr);
+}
+
+void Test_Z7_AnEmptyHeavyMaskSweepsNothing() {
+    Case("Z7 an empty heavy mask means no sweep - a blanket CLEAR is not what this mode is");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeExtremeConfig(t, true);
+    c.profiles[0].heavyMask.clear();
+    c.profiles[0].heavy.clear();   // or rule 3 would assign the same empty mask by itself
+
+    cd::ProcessSnapshot s = MakeExtremeSnapshot();
+    std::vector<std::wstring> sticky;
+    const cd::Profile* matched = nullptr;
+    std::set<DWORD> swept;
+    std::map<DWORD, std::wstring> r =
+        cd::ComputeDesired(s, c, 1000, sticky, &matched, 9000, nullptr, &swept);
+    CHECK(matched != nullptr);
+    CHECK_EQ((int)swept.size(), 0);
+    CHECK(!Has(r, 2000));
+    // The game is still governed; only the sweep stood down.
+    CHECK_EQ(MaskOf(r, 1000), L"Cache no SMT");
+}
+
+void Test_Z8_AutoPinKeepsItsOwnLabel() {
+    Case("Z8 a process rule 4 chose keeps the AUTO label and is not re-attributed to 4b");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeExtremeConfig(t, true);
+    c.profiles[0].autoPin = true;
+
+    cd::ProcessSnapshot s = MakeExtremeSnapshot();
+    // notepad has been over the threshold long enough to qualify, and the game owns the
+    // foreground, which is rule 4's other precondition.
+    AddProc(s, 2000, 500, L"notepad.exe", 120, cd::kAutoPinDebounceTicks, 40.0);
+
+    std::vector<std::wstring> sticky;
+    const cd::Profile* matched = nullptr;
+    std::set<DWORD> autoPinned;
+    std::set<DWORD> swept;
+    std::map<DWORD, std::wstring> r =
+        cd::ComputeDesired(s, c, 1000, sticky, &matched, 9000, &autoPinned, &swept);
+
+    CHECK_EQ(MaskOf(r, 2000), L"Freq");
+    CHECK(autoPinned.find(2000) != autoPinned.end());   // rule 4 got there first
+    CHECK(swept.find(2000) == swept.end());             // so rule 4b did not claim it
+    // ...and the sweep still did its own job on everything rule 4 did not qualify.
+    CHECK(swept.find(400) != swept.end());
+    CHECK_EQ(MaskOf(r, 400), L"Freq");
+}
+
+void Test_Z9_AutoPinGreysUnderExtremeMode() {
+    Case("Z9 extreme game mode greys the auto-pin group, and nothing else does");
+    // The rule the operator asked for, 2026-09-09. Extreme mode moves EVERY non-game,
+    // non-excluded process; auto-pin moves the subset above a threshold. One is a strict
+    // subset of the other, so the whole auto-pin group is inert while extreme mode is on.
+    //
+    // IF THIS PREDICATE WERE INVERTED the percent field would be the only control on the
+    // page you could type into while it had no effect, and the box that IS live would be
+    // greyed. If it were "simplified" to always-true the grey-out silently disappears and
+    // nothing else in this project can see that.
+    CHECK_EQ(cd::AutoPinControlsEnabled(false), true);
+    CHECK_EQ(cd::AutoPinControlsEnabled(true), false);
+
+    Case("Z9b the greyed status line says WHY, and never says the setting is off");
+    // The sentence is pinned. The failure it guards is subtle and was nearly shipped: the
+    // obvious implementation reuses the existing "Auto-pin is off for this profile"
+    // sentence, which tells the operator their stored setting has been cleared - and the
+    // whole point of this change is that Profile::autoPin is NOT touched.
+    const std::wstring superseded = cd::AutoPinSupersededByExtremeText();
+    CHECK_EQ(superseded,
+             L"Extreme game mode already moves every background process, so this rule cannot "
+             L"add anything while it is on.");
+    CHECK(superseded.find(L"is off") == std::wstring::npos);
+    CHECK(superseded.find(L"Extreme game mode") != std::wstring::npos);
+
+    Case("Z9c THE TRIPWIRE - the new sentence promises no frame rate either");
+    // The same list Z11d applies to the V-Cache row, applied here, with the same positive
+    // control: a scan that cannot find a planted word proves nothing about a clean run.
+    const wchar_t* banned[] = { L"fps", L"frame", L"faster", L"smoother", L"boost",
+                                L"working", L"verified", L"guarantee" };
+    {
+        const std::wstring planted = cd::ToLower(std::wstring(L"this build is FASTER"));
+        bool found = false;
+        for (size_t b = 0; b < sizeof(banned) / sizeof(banned[0]); ++b)
+            if (planted.find(cd::ToLower(banned[b])) != std::wstring::npos) found = true;
+        CHECK(found);
+    }
+    const std::wstring folded = cd::ToLower(superseded);
+    for (size_t b = 0; b < sizeof(banned) / sizeof(banned[0]); ++b)
+        CHECK(folded.find(cd::ToLower(banned[b])) == std::wstring::npos);
+
+    Case("Z9d GREY, NOT CLEAR - both flags survive a round trip with extreme mode on");
+    // The window greys the auto-pin group; it must never uncheck it. That is a UI fact and
+    // no headless test can click a check box, so this is the closest runnable guard: the two
+    // settings are independent in the model and in the file, so a build that "simplified"
+    // the grey-out into clearing autoPin has to break something visible here as well.
+    cd::Topology t = MakeReference(false);
+    cd::Config c = cd::DefaultConfig(t);
+    c.profiles[0].autoPin = true;
+    c.profiles[0].autoPinPercent = 12;
+    c.profiles[0].extremeMode = true;
+    cd::Config back;
+    std::wstring err;
+    CHECK(cd::ParseConfig(cd::SerializeConfig(c), back, &err));
+    CHECK_EQ(err, L"");
+    CHECK(back.profiles.size() >= 1);
+    CHECK_EQ(back.profiles[0].autoPin, true);
+    CHECK_EQ(back.profiles[0].extremeMode, true);
+    CHECK_EQ(back.profiles[0].autoPinPercent, 12);
+}
+
+void Test_Z12_InfoIconTooltipWording() {
+    Case("Z12 the two paragraphs that moved behind an (i) still say what they said");
+    // PINNED, character for character, for the same reason AmdVCacheActiveWarningText is:
+    // a tooltip is invisible to every other check in this project - no layout measures it,
+    // no screenshot contains it unless someone hovers - so the string is the only thing
+    // that can be asserted on at all.
+    CHECK_EQ(cd::AutoPinInfoTipText(),
+             L"While this game is in front, processes that stay above the threshold move to "
+             L"the background mask until the game exits. The list above tags them AUTO.");
+    CHECK_EQ(cd::ExtremeModeInfoTipText(),
+             L"Not only the busy ones and not only the ones you named - everything except "
+             L"the game and the exclusion list.");
+
+    Case("Z12b the AUTO legend survived the move - it lives nowhere else now");
+    // The heavy list tags rows AUTO and the caption that explained the tag was this
+    // paragraph. Drop the word here and the tag is unexplained anywhere in the product.
+    CHECK(cd::AutoPinInfoTipText().find(L"AUTO") != std::wstring::npos);
+
+    Case("Z12c the deleted sentence is GONE, not merely moved into the tooltip");
+    // Operator instruction, 2026-09-09: delete "It needs the background mask unparked: use
+    // \"Stop AMD's 3D V-Cache optimizer\" on the Setting page." A change that hid it behind
+    // the icon instead of deleting it would look identical on screen and is exactly what
+    // this checks.
+    const std::wstring tip = cd::ExtremeModeInfoTipText();
+    // POSITIVE CONTROL: the search must find these fragments when they really are present.
+    const std::wstring planted =
+        L"It needs the background mask unparked: use \"Stop AMD's 3D V-Cache optimizer\" on "
+        L"the Setting page.";
+    CHECK(planted.find(L"unparked") != std::wstring::npos);
+    CHECK(planted.find(L"V-Cache") != std::wstring::npos);
+    CHECK(planted.find(L"Setting page") != std::wstring::npos);
+    CHECK(tip.find(L"unparked") == std::wstring::npos);
+    CHECK(tip.find(L"V-Cache") == std::wstring::npos);
+    CHECK(tip.find(L"Setting page") == std::wstring::npos);
+
+    Case("Z12d THE TRIPWIRE - neither tooltip promises a frame rate");
+    const wchar_t* banned[] = { L"fps", L"frame", L"faster", L"smoother", L"boost",
+                                L"working", L"verified", L"guarantee" };
+    std::vector<std::wstring> all;
+    all.push_back(cd::ToLower(cd::AutoPinInfoTipText()));
+    all.push_back(cd::ToLower(cd::ExtremeModeInfoTipText()));
+    for (size_t i = 0; i < all.size(); ++i) {
+        CHECK(!all[i].empty());
+        for (size_t b = 0; b < sizeof(banned) / sizeof(banned[0]); ++b)
+            CHECK(all[i].find(cd::ToLower(banned[b])) == std::wstring::npos);
+    }
+}
+
+void Test_Z11_VCacheActiveRow() {
+    Case("Z11 the row's sentence is the operator's wording, character for character");
+    // PINNED, not spot-checked. This is the whole visible product of the feature, it
+    // interpolates nothing, and the layout height it is measured against is a constant only
+    // as long as the string is. A reworded sentence must fail here and be re-measured.
+    CHECK_EQ(cd::AmdVCacheActiveWarningText(),
+             L"Warning - AMD 3D V-Cache is active. Game would not be fully optimized. "
+             L"Please turn it off in Setting");
+
+    Case("Z11b it points at the tab by its NEW name - 'Setting', not 'General'");
+    // The tab was renamed in the same change. A warning that sends the user to a tab that
+    // does not exist is worse than no warning, and this is the assertion that ties the two
+    // halves of that change together.
+    CHECK(cd::AmdVCacheActiveWarningText().find(L"in Setting") != std::wstring::npos);
+    CHECK(cd::AmdVCacheActiveWarningText().find(L"General") == std::wstring::npos);
+
+    Case("Z11c the row is driven by the AGENT, and EITHER live source can raise it");
+    // The engine's flag is the stronger fact - it is only ever set while a game is actually
+    // governed - but it is false at idle by construction, so on its own it would hide the
+    // row from a user who opened Settings with no game running. The environment probe is
+    // unconditional. Either one alone must raise the row.
+    CHECK(cd::ShowAmdVCacheActiveWarning(true, false));    // agent up, no game governed
+    CHECK(cd::ShowAmdVCacheActiveWarning(false, true));    // the watcher saw it mid-game
+    CHECK(cd::ShowAmdVCacheActiveWarning(true, true));
+    CHECK(!cd::ShowAmdVCacheActiveWarning(false, false));  // nothing running: NO row
+
+    Case("Z11d THE TRIPWIRE - the new sentence promises no frame rate either");
+    // The same list Z9c applies to the extreme-mode wording, applied to this row. It is run
+    // over the string the product actually returns, not over a copy pasted into the test.
+    const wchar_t* banned[] = { L"fps", L"frame", L"faster", L"smoother", L"boost",
+                                L"working", L"verified", L"guarantee" };
+    const std::wstring folded = cd::ToLower(cd::AmdVCacheActiveWarningText());
+    // POSITIVE CONTROL: the scan must be able to find one of these when it is really there,
+    // or a clean run proves nothing.
+    {
+        const std::wstring planted = cd::ToLower(std::wstring(L"this build is FASTER"));
+        bool found = false;
+        for (size_t b = 0; b < sizeof(banned) / sizeof(banned[0]); ++b)
+            if (planted.find(cd::ToLower(banned[b])) != std::wstring::npos) found = true;
+        CHECK(found);
+    }
+    for (size_t b = 0; b < sizeof(banned) / sizeof(banned[0]); ++b)
+        CHECK(folded.find(cd::ToLower(banned[b])) == std::wstring::npos);
+
+    Case("Z11e THIS ROW IS THE SURVIVOR, and it must stay on the page in plain sight");
+    // 2026-09-09: the extreme-mode live parked line was DELETED and the two explanatory
+    // paragraphs went behind an (i). This row did neither, deliberately - a warning behind
+    // an icon is a warning that does not work - and it is now the only voice on the page
+    // that names the optimizer. So it must not have drifted into being one of the tooltips,
+    // and neither tooltip may have taken over its subject.
+    const std::wstring vcache = cd::AmdVCacheActiveWarningText();
+    CHECK(vcache != cd::AutoPinInfoTipText());
+    CHECK(vcache != cd::ExtremeModeInfoTipText());
+    CHECK(vcache.find(L"V-Cache") != std::wstring::npos);
+    CHECK(cd::AutoPinInfoTipText().find(L"V-Cache") == std::wstring::npos);
+    CHECK(cd::ExtremeModeInfoTipText().find(L"V-Cache") == std::wstring::npos);
+}
+
+void Test_Z10_BlockedLineGroupsAndCaps() {
+    Case("Z10 nothing blocked - the promise sentence is unchanged");
+    CHECK_EQ(cd::FormatBlockedProcessesLine(std::vector<std::wstring>(), 10),
+             L"No processes are currently blocked. Game Optimizer runs unelevated on "
+             L"purpose; anything it cannot touch will be named here rather than skipped "
+             L"silently.");
+
+    Case("Z10b many processes of one app are ONE name, and the two counts are both reported");
+    std::vector<std::wstring> many;
+    for (int i = 0; i < 40; ++i) many.push_back(L"svchost.exe");
+    many.push_back(L"MsMpEng.exe");
+    const std::wstring line = cd::FormatBlockedProcessesLine(many, 10);
+    CHECK_EQ(line,
+             L"Blocked (access denied), 41 processes in 2 apps: MsMpEng.exe, svchost.exe. "
+             L"These are elevated or protected processes; no mask was applied to them.");
+
+    Case("Z10c case and path do not create a second app");
+    std::vector<std::wstring> mixed;
+    mixed.push_back(L"SvcHost.exe");
+    mixed.push_back(L"svchost.exe");
+    mixed.push_back(L"C:\\Windows\\System32\\SVCHOST.EXE");
+    const std::wstring one = cd::FormatBlockedProcessesLine(mixed, 10);
+    CHECK(one.find(L"3 processes in 1 apps") != std::wstring::npos);
+    CHECK(one.find(L"SvcHost.exe") != std::wstring::npos);   // the casing first seen
+
+    Case("Z10d THE CAP - the line names ten apps and says how many it did not name");
+    std::vector<std::wstring> lots;
+    for (int i = 0; i < 26; ++i) {
+        wchar_t b[32];
+        swprintf_s(b, 32, L"app%02d.exe", i);
+        lots.push_back(b);
+    }
+    const std::wstring capped = cd::FormatBlockedProcessesLine(lots, 10);
+    CHECK(capped.find(L"26 processes in 26 apps") != std::wstring::npos);
+    CHECK(capped.find(L"app00.exe") != std::wstring::npos);
+    CHECK(capped.find(L"app09.exe") != std::wstring::npos);
+    CHECK(capped.find(L"app10.exe") == std::wstring::npos);
+    CHECK(capped.find(L"and 16 more") != std::wstring::npos);
+    // The cap exists so a fixed-height control cannot clip the sentence. 460 characters is
+    // three lines of Font::UiSmall at this page's own minimum width; the worst case measured
+    // 307 and wrapped to two.
+    CHECK((int)capped.size() < 460);
+
+    Case("Z10e a cap of 0 means no cap - and a process with no readable name is still counted");
+    std::vector<std::wstring> withBlank;
+    withBlank.push_back(L"a.exe");
+    withBlank.push_back(L"");
+    withBlank.push_back(L"   ");
+    const std::wstring blanks = cd::FormatBlockedProcessesLine(withBlank, 0);
+    CHECK(blanks.find(L"3 processes in 2 apps") != std::wstring::npos);
+    CHECK(blanks.find(L"(name unreadable)") != std::wstring::npos);
+    CHECK(blanks.find(L"and ") == std::wstring::npos);   // no cap, so nothing was withheld
+}
+
+// ===========================================================================
+// AC. EXTREME GAME MODE'S READOUT - what the blanket sweep actually moved.
+//
+// THE DEFECT, in the operator's words: "Extreme Mode should show what other application had
+// been pinned into heavy mask. Now, it's 0 show." Rule 4b moves ~150 processes across ~60
+// executables and, until this round, not one of them appeared anywhere in the settings
+// window - so a working sweep and a switched-off one looked identical.
+//
+// Every expectation below is written from the header comments on ExtremeSweptExes,
+// ExtremeSweptProcessCount (src\engine.h) and FormatExtremeSweptLine
+// (src\settings_warning.h).
+// ===========================================================================
+
+cd::GovernedProcess Swept(DWORD pid, const wchar_t* name) {
+    cd::GovernedProcess g;
+    g.pid = pid;
+    g.name = name;
+    g.maskName = L"Freq";
+    g.extremeSwept = true;
+    return g;
+}
+
+void Test_AC1_SweptExesGroupCountAndSortByCount() {
+    // CATCHES: a pid rule 4 chose being re-attributed to the blanket sweep (or the reverse);
+    // two casings or a full path counting as two apps; an executable the user listed
+    // themselves being reported as something the app chose; and - the one a naive
+    // implementation gets wrong - the order degenerating to alphabetical, which would make
+    // the display cap show four arbitrary apps instead of the four that moved the most.
+    Case("AC1 the sweep groups to executables, counts each, and puts the biggest first");
+    cd::EngineStatus st;
+    st.governed.push_back(Swept(101, L"svchost.exe"));
+    st.governed.push_back(Swept(102, L"SVCHOST.EXE"));                 // same app, other case
+    st.governed.push_back(Swept(103, L"C:\\Windows\\svchost.exe"));    // same app, by path
+    st.governed.push_back(Swept(104, L"chrome.exe"));
+    st.governed.push_back(Swept(105, L"chrome.exe"));
+    st.governed.push_back(Swept(106, L"notepad.exe"));
+    st.governed.push_back(Gov(107, L"claude.exe", true));   // rule 4, NOT the sweep
+    st.governed.push_back(Gov(108, L"Overwatch.exe", false));          // the game itself
+    st.governed.push_back(Swept(109, L""));                            // unreadable name
+
+    std::vector<std::wstring> none;
+    std::vector<cd::SweptExe> v = cd::ExtremeSweptExes(st, none);
+    CHECK_EQ((int)v.size(), 3);
+    CHECK_EQ(v[0].name, L"svchost.exe");
+    CHECK_EQ((int)v[0].count, 3);
+    CHECK_EQ(v[1].name, L"chrome.exe");
+    CHECK_EQ((int)v[1].count, 2);
+    CHECK_EQ(v[2].name, L"notepad.exe");
+    CHECK_EQ((int)v[2].count, 1);
+
+    // The user's own heavy entry is their configuration and is not reported a second time as
+    // something the sweep chose - by name or written as a path.
+    std::vector<std::wstring> listed;
+    listed.push_back(L"C:\\Program Files\\Chrome\\CHROME.EXE");
+    std::vector<cd::SweptExe> v2 = cd::ExtremeSweptExes(st, listed);
+    CHECK_EQ((int)v2.size(), 2);
+    CHECK_EQ(v2[0].name, L"svchost.exe");
+    CHECK_EQ(v2[1].name, L"notepad.exe");
+
+    // Nothing swept is an empty list, never one blank row.
+    cd::EngineStatus quiet;
+    quiet.governed.push_back(Gov(201, L"Overwatch.exe", false));
+    CHECK_EQ((int)cd::ExtremeSweptExes(quiet, none).size(), 0);
+}
+
+void Test_AC2_SweptProcessCountCountsProcessesNotApps() {
+    // CATCHES: the total being summed from the GROUPED list, which silently drops every
+    // process whose name could not be read - the app would then under-report what it did, on
+    // exactly the protected processes the sweep is most likely to meet.
+    Case("AC2 the process total counts processes, including the ones with no readable name");
+    cd::EngineStatus st;
+    st.governed.push_back(Swept(101, L"svchost.exe"));
+    st.governed.push_back(Swept(102, L"svchost.exe"));
+    st.governed.push_back(Swept(103, L""));                  // no name; still moved
+    st.governed.push_back(Gov(104, L"claude.exe", true));    // rule 4, not the sweep
+    CHECK_EQ((int)cd::ExtremeSweptProcessCount(st), 3);
+
+    std::vector<std::wstring> none;
+    CHECK_EQ((int)cd::ExtremeSweptExes(st, none).size(), 1);   // one APP, three PROCESSES
+}
+
+void Test_AC3_SweepLineReportsBothCountsAndTheMask() {
+    // CATCHES: the sentence reporting one number twice (apps as processes or the reverse),
+    // and the mask being dropped - "moved 5 processes" without saying where is not an answer.
+    Case("AC3 the sweep sentence names the process count, the app count and the mask");
+    std::vector<cd::SweptExe> exes;
+    cd::SweptExe a; a.name = L"chrome.exe";  a.count = 3; exes.push_back(a);
+    cd::SweptExe b; b.name = L"svchost.exe"; b.count = 2; exes.push_back(b);
+    CHECK_EQ(cd::FormatExtremeSweptLine(exes, 5, L"Freq", 0, 0),
+             L"Extreme game mode also moved 5 processes in 2 apps to Freq: "
+             L"chrome.exe x3, svchost.exe x2.");
+
+    Case("AC3b one process of one app reads as singular in both places");
+    std::vector<cd::SweptExe> one;
+    cd::SweptExe c; c.name = L"a.exe"; c.count = 1; one.push_back(c);
+    CHECK_EQ(cd::FormatExtremeSweptLine(one, 1, L"Freq", 0, 0),
+             L"Extreme game mode also moved 1 process in 1 app to Freq: a.exe x1.");
+
+    Case("AC3c an unnamed mask is described rather than left blank");
+    CHECK(cd::FormatExtremeSweptLine(one, 1, L"", 0, 0)
+              .find(L"the background mask") != std::wstring::npos);
+}
+
+void Test_AC4_SweepLineCapsByCountAndByLength() {
+    // CATCHES THE CLIPPING DEFECT this whole feature had to avoid: a fixed-height STATIC and
+    // an unbounded list. A cap on the NUMBER of names is not enough on its own - six names of
+    // forty characters overflows exactly as sixty short ones do - so both caps are asserted,
+    // and so is the "and N more apps" tail without which the cap would be a silent omission.
+    Case("AC4 the count cap names the biggest apps and says how many it did not name");
+    std::vector<cd::SweptExe> lots;
+    for (int i = 0; i < 30; ++i) {
+        wchar_t nm[32];
+        swprintf_s(nm, 32, L"app%02d.exe", i);
+        cd::SweptExe e;
+        e.name = nm;
+        e.count = static_cast<size_t>(30 - i);   // strictly descending, so the order is fixed
+        lots.push_back(e);
+    }
+    const std::wstring capped = cd::FormatExtremeSweptLine(lots, 465, L"Freq", 4, 114);
+    CHECK(capped.find(L"465 processes in 30 apps") != std::wstring::npos);
+    CHECK(capped.find(L"app00.exe x30") != std::wstring::npos);
+    CHECK(capped.find(L"app03.exe x27") != std::wstring::npos);
+    CHECK(capped.find(L"app04.exe") == std::wstring::npos);
+    CHECK(capped.find(L"and 26 more apps") != std::wstring::npos);
+
+    Case("AC4b THE LENGTH CAP - four long names are cut before four short ones would be");
+    std::vector<cd::SweptExe> longNames;
+    for (int i = 0; i < 4; ++i) {
+        wchar_t nm[64];
+        swprintf_s(nm, 64, L"averyveryverylongexecutablename%02d.exe", i);
+        cd::SweptExe e;
+        e.name = nm;
+        e.count = static_cast<size_t>(9 - i);
+        longNames.push_back(e);
+    }
+    // Same maxNamed as above, so anything that fails here failed on LENGTH alone.
+    const std::wstring cut = cd::FormatExtremeSweptLine(longNames, 30, L"Freq", 4, 114);
+    CHECK(cut.find(L"averyveryverylongexecutablename00.exe x9") != std::wstring::npos);
+    CHECK(cut.find(L"averyveryverylongexecutablename01.exe x8") != std::wstring::npos);
+    CHECK(cut.find(L"averyveryverylongexecutablename02.exe") == std::wstring::npos);
+    CHECK(cut.find(L"and 2 more apps") != std::wstring::npos);
+
+    Case("AC4c ONE name is always shown, even when it alone exceeds the budget");
+    std::vector<cd::SweptExe> huge;
+    cd::SweptExe big;
+    big.name = std::wstring(200, L'x') + L".exe";
+    big.count = 4;
+    huge.push_back(big);
+    cd::SweptExe small; small.name = L"b.exe"; small.count = 1; huge.push_back(small);
+    const std::wstring forced = cd::FormatExtremeSweptLine(huge, 5, L"Freq", 4, 114);
+    CHECK(forced.find(big.name) != std::wstring::npos);
+    CHECK(forced.find(L"b.exe") == std::wstring::npos);
+    CHECK(forced.find(L"and 1 more app") != std::wstring::npos);
+
+    Case("AC4d a cap of 0 on either axis means no cap");
+    CHECK(cd::FormatExtremeSweptLine(lots, 465, L"Freq", 0, 0).find(L"app29.exe x1") !=
+          std::wstring::npos);
+}
+
+void Test_AC5_SweepLineIsSilentWithNothingToSay() {
+    // CATCHES: a blank row reserving height on every profile that has extreme mode off, and
+    // the opposite mistake - a sentence claiming "0 apps" while the sweep is plainly working
+    // because every process it moved was one the user had already named.
+    Case("AC5 nothing swept produces NO sentence at all, so the row takes no height");
+    std::vector<cd::SweptExe> none;
+    CHECK_EQ(cd::FormatExtremeSweptLine(none, 0, L"Freq", 4, 114), L"");
+
+    Case("AC5b processes swept but every app already listed still reports the count");
+    const std::wstring all = cd::FormatExtremeSweptLine(none, 12, L"Freq", 4, 114);
+    CHECK(all.find(L"12 processes") != std::wstring::npos);
+    CHECK(all.find(L"already listed above") != std::wstring::npos);
+    CHECK(all.find(L"0 apps") == std::wstring::npos);
+}
+
+// ===========================================================================
+// AD. THE PROFILES PANEL FOLLOWS THE PROFILE THAT IS ACTUALLY GOVERNING.
+//
+// Operator request: "The screen of profile should always show which profile currently using
+// ... if I'm playing Overwatch it should show Overwatch Profile Panel. Then I swap to
+// Palworld, then it should auto swap to Palworld profile panel."
+//
+// Written from the header comment on ShouldFollowGoverningProfile in
+// src\settings_warning.h. The rule is a pure predicate precisely so it can be driven here:
+// the alternative - proving it by clicking a live window - is the thing this project has
+// repeatedly found it cannot check.
+// ===========================================================================
+
+cd::ProfileFollowInputs Following(int governing, int selected) {
+    cd::ProfileFollowInputs in;
+    in.haveGoverning = governing >= 0;
+    in.governingIndex = governing;
+    in.selectedIndex = selected;
+    return in;
+}
+
+void Test_AD1_ThePanelFollowsTheGameInFront() {
+    // CATCHES: the follow never firing at all, which is the bug being fixed, and the follow
+    // firing when the panel is ALREADY on the governing profile - which would re-load the
+    // editor once a second and reset the heavy list's scroll position under the operator.
+    Case("AD1 a governing profile that is not the one on screen is followed");
+    CHECK(cd::ShouldFollowGoverningProfile(Following(2, 0)));
+
+    Case("AD1b the panel already showing it does nothing at all");
+    CHECK(!cd::ShouldFollowGoverningProfile(Following(2, 2)));
+}
+
+void Test_AD2_FollowNeverStealsAnEditInProgress() {
+    // CATCHES the failure that would be WORSE than the bug: the panel swapping itself out
+    // from under a half-typed executable name, an open mask dropdown, or a rename prompt.
+    // Each blocker is asserted on its own, so removing any one of them fails here rather than
+    // being masked by the other two.
+    Case("AD2 typing in a field on this page suppresses the follow");
+    cd::ProfileFollowInputs typing = Following(2, 0);
+    typing.editingFocus = true;
+    CHECK(!cd::ShouldFollowGoverningProfile(typing));
+
+    Case("AD2b an open combo dropdown suppresses it");
+    cd::ProfileFollowInputs dropped = Following(2, 0);
+    dropped.dropdownOpen = true;
+    CHECK(!cd::ShouldFollowGoverningProfile(dropped));
+
+    Case("AD2c a modal prompt over the window suppresses it");
+    cd::ProfileFollowInputs modal = Following(2, 0);
+    modal.modalUp = true;
+    CHECK(!cd::ShouldFollowGoverningProfile(modal));
+
+    Case("AD2d and every one of them resumes the moment it clears");
+    CHECK(cd::ShouldFollowGoverningProfile(Following(2, 0)));
+}
+
+void Test_AD3_TheOperatorsOwnChoiceIsHonoured() {
+    // CATCHES: the panel yanking itself back to the governing profile a second after the
+    // operator deliberately clicked a different one to look at it. The latch is released by
+    // the engine changing which profile it governs - the operator swapping games, which is
+    // the event they asked to be followed - and NOT by a timer, so the release is asserted
+    // as a separate case rather than assumed.
+    Case("AD3 a selection the operator made themselves is not taken away");
+    cd::ProfileFollowInputs chosen = Following(2, 0);
+    chosen.userChoseSelection = true;
+    CHECK(!cd::ShouldFollowGoverningProfile(chosen));
+
+    Case("AD3b once the governing profile changes the latch is released and it follows");
+    cd::ProfileFollowInputs released = Following(2, 0);
+    released.userChoseSelection = false;   // what the window does on a change of profileName
+    CHECK(cd::ShouldFollowGoverningProfile(released));
+}
+
+void Test_AD4_NothingGoverningNeverMovesTheSelection() {
+    // CATCHES: an idle or paused engine dragging the panel onto profile 0, or a -1 index
+    // reaching the selection and indexing the profile vector out of range.
+    Case("AD4 no game running means the panel stays exactly where the operator left it");
+    CHECK(!cd::ShouldFollowGoverningProfile(Following(-1, 0)));
+
+    Case("AD4b a haveGoverning flag with no index is refused too");
+    cd::ProfileFollowInputs half = Following(-1, 0);
+    half.haveGoverning = true;             // inconsistent input, refused rather than trusted
+    CHECK(!cd::ShouldFollowGoverningProfile(half));
+}
+
+// ===========================================================================
+// AA. Rule 1 - the game mask follows the game that is actually being played.
+//
+// THE DEFECT, in the operator's words: "I usually have 2 games open at once. For example, I
+// play Overwatch, it swap Overwatch as default. Then I open another game, the another game
+// probably was pinned to heavy mask at the background during Overwatch."
+//
+// Every fixture below puts the WRONG game first in config order, because that is the shape
+// of the operator's own config.ini (Palworld above Overwatch 2): a test whose two profiles
+// are already in the desired order would pass against the broken implementation.
+// ===========================================================================
+
+// pid 500  explorer.exe
+// pid 1000 Palworld.exe            <- game of the FIRST profile in config order
+// pid 1001 PalworldLauncher.exe    <- descendant of 1000; its window counts as Palworld's
+// pid 2000 Overwatch.exe           <- game of the SECOND profile in config order
+// pid 2001 OverwatchChild.exe      <- descendant of 2000
+// pid 3500 Discord.exe             <- never a candidate; alt-tabbing here must change nothing
+cd::ProcessSnapshot MakeTwoGameSnapshot() {
+    cd::ProcessSnapshot s;
+    AddProc(s, 500, 400, L"explorer.exe", 100, 0, 0.0);
+    AddProc(s, 3500, 500, L"Discord.exe", 150, 0, 0.0);
+    AddProc(s, 1000, 500, L"Palworld.exe", 200, 0, 0.0);
+    AddProc(s, 1001, 1000, L"PalworldLauncher.exe", 300, 0, 0.0);
+    AddProc(s, 2000, 500, L"Overwatch.exe", 400, 0, 0.0);
+    AddProc(s, 2001, 2000, L"OverwatchChild.exe", 500, 0, 0.0);
+    return s;
+}
+
+// Palworld FIRST, exactly as the operator's file has it.
+cd::Config MakeTwoGameConfig(const cd::Topology& t) {
+    cd::Config c;
+    c.version = 1;
+    c.pollMs = 250;
+    c.masks = cd::DeriveMasks(t);
+
+    cd::Profile pal;
+    pal.name = L"Palworld";
+    pal.enabled = true;
+    pal.game = L"Palworld.exe";
+    pal.gameMask = L"Cache no SMT";
+    pal.heavyMask = L"Freq";
+    pal.autoPin = false;
+    c.profiles.push_back(pal);
+
+    cd::Profile ow;
+    ow.name = L"Overwatch 2";
+    ow.enabled = true;
+    ow.game = L"Overwatch.exe";
+    ow.gameMask = L"Cache no SMT";
+    ow.heavyMask = L"Freq";
+    ow.autoPin = false;
+    c.profiles.push_back(ow);
+    return c;
+}
+
+cd::SelectionCandidate Cand(const wchar_t* name, bool fg) {
+    cd::SelectionCandidate c;
+    c.name = name;
+    c.ownsForeground = fg;
+    return c;
+}
+
+// Runs one tick of rule 1 and reports who won. Everything below drives ComputeDesired rather
+// than ChooseProfile alone wherever the point is END TO END: the pure chooser agreeing with
+// itself proves nothing about whether the engine consults it.
+std::wstring TickWinner(const cd::ProcessSnapshot& s, const cd::Config& c, DWORD fg,
+                        cd::ProfileSelection& sel, std::map<DWORD, std::wstring>* out) {
+    std::vector<std::wstring> sticky;
+    const cd::Profile* matched = reinterpret_cast<const cd::Profile*>(0x1);
+    std::map<DWORD, std::wstring> res =
+        cd::ComputeDesired(s, c, fg, sticky, &matched, 0, nullptr, nullptr, &sel);
+    if (out) *out = res;
+    return matched ? matched->name : std::wstring();
+}
+
+void Test_AA1_DwellIsDerivedFromThePollInterval() {
+    Case("AA1 the dwell is DERIVED from poll_ms, never a hardcoded tick count");
+    // 3 s at the shipped default. This is the number the operator was quoted.
+    CHECK_EQ(cd::ForegroundSwitchDwellTicks(250), 12);
+    // Both ends of the clamp config.h enforces on poll_ms.
+    CHECK_EQ(cd::ForegroundSwitchDwellTicks(100), 30);
+    CHECK_EQ(cd::ForegroundSwitchDwellTicks(2000), 2);
+    // Rounds UP, so the dwell is never SHORTER than 3 s.
+    CHECK_EQ(cd::ForegroundSwitchDwellTicks(400), 8);
+    CHECK_EQ(cd::ForegroundSwitchDwellTicks(3000), 1);
+    // Absurd input still yields a real dwell: a zero-tick dwell is not a dwell.
+    CHECK_EQ(cd::ForegroundSwitchDwellTicks(0), 1);
+    CHECK_EQ(cd::ForegroundSwitchDwellTicks(-5), 1);
+}
+
+void Test_AA2_ChooseProfileWithNothingToChoose() {
+    Case("AA2 no candidates clears the state, and says so exactly once");
+    std::vector<cd::SelectionCandidate> none;
+    cd::ProfileSelection sel;
+    CHECK_EQ(cd::ChooseProfile(none, 12, sel), -1);
+    CHECK_EQ(sel.reason, cd::SelectReason::Unchanged);   // nothing was governing to clear
+
+    sel.selected = L"Overwatch 2";
+    CHECK_EQ(cd::ChooseProfile(none, 12, sel), -1);
+    CHECK_EQ(sel.reason, cd::SelectReason::Cleared);
+    CHECK(sel.selected.empty());
+    CHECK_EQ(sel.challengerTicks, 0);
+    // ...and it does not keep announcing it.
+    CHECK_EQ(cd::ChooseProfile(none, 12, sel), -1);
+    CHECK_EQ(sel.reason, cd::SelectReason::Unchanged);
+}
+
+void Test_AA3_FirstSelectionIsImmediateAndPrefersTheForeground() {
+    Case("AA3 with nothing selected the FOREGROUND candidate wins at once - no dwell");
+    std::vector<cd::SelectionCandidate> v;
+    v.push_back(Cand(L"Palworld", false));
+    v.push_back(Cand(L"Overwatch 2", true));
+
+    cd::ProfileSelection sel;
+    CHECK_EQ(cd::ChooseProfile(v, 12, sel), 1);
+    CHECK_EQ(sel.reason, cd::SelectReason::First);
+    CHECK_EQ(sel.selected, std::wstring(L"Overwatch 2"));
+
+    Case("AA3b with nothing selected and no foreground, the first candidate wins at once");
+    std::vector<cd::SelectionCandidate> w;
+    w.push_back(Cand(L"Palworld", false));
+    w.push_back(Cand(L"Overwatch 2", false));
+    cd::ProfileSelection sel2;
+    CHECK_EQ(cd::ChooseProfile(w, 12, sel2), 0);
+    CHECK_EQ(sel2.reason, cd::SelectReason::First);
+}
+
+void Test_AA4_AnInterruptedDwellNeverSwitches() {
+    Case("AA4 the dwell is CONTINUOUS: one tick away from the challenger resets the count");
+    std::vector<cd::SelectionCandidate> chal;      // Palworld in front, Overwatch governing
+    chal.push_back(Cand(L"Palworld", true));
+    chal.push_back(Cand(L"Overwatch 2", false));
+    std::vector<cd::SelectionCandidate> quiet;     // nobody in front
+    quiet.push_back(Cand(L"Palworld", false));
+    quiet.push_back(Cand(L"Overwatch 2", false));
+
+    cd::ProfileSelection sel;
+    sel.selected = L"Overwatch 2";
+
+    // Eleven ticks of challenge - one short - then a single tick away.
+    for (int i = 0; i < 11; ++i) CHECK_EQ(cd::ChooseProfile(chal, 12, sel), 1);
+    CHECK_EQ(sel.challengerTicks, 11);
+    CHECK_EQ(cd::ChooseProfile(quiet, 12, sel), 1);
+    CHECK_EQ(sel.challengerTicks, 0);
+
+    // Eleven more must STILL not be enough: the count restarted from zero.
+    for (int i = 0; i < 11; ++i) CHECK_EQ(cd::ChooseProfile(chal, 12, sel), 1);
+    CHECK_EQ(sel.selected, std::wstring(L"Overwatch 2"));
+    CHECK_EQ(sel.reason, cd::SelectReason::Unchanged);
+    // The twelfth consecutive one is.
+    CHECK_EQ(cd::ChooseProfile(chal, 12, sel), 0);
+    CHECK_EQ(sel.reason, cd::SelectReason::Foreground);
+
+    Case("AA4b a DIFFERENT challenger restarts the count rather than inheriting it");
+    std::vector<cd::SelectionCandidate> three;
+    three.push_back(Cand(L"Palworld", false));
+    three.push_back(Cand(L"Overwatch 2", false));
+    three.push_back(Cand(L"StarRail", true));
+    cd::ProfileSelection s2;
+    s2.selected = L"Overwatch 2";
+    for (int i = 0; i < 11; ++i) CHECK_EQ(cd::ChooseProfile(chal, 12, s2), 1);
+    CHECK_EQ(s2.challengerTicks, 11);
+    CHECK_EQ(cd::ChooseProfile(three, 12, s2), 1);      // StarRail takes over the challenge
+    CHECK_EQ(s2.challengerTicks, 1);
+    CHECK_EQ(s2.challenger, std::wstring(L"StarRail"));
+}
+
+void Test_AA5_TwoLiveGamesTheForegroundOneWins() {
+    Case("AA5 two live games, foreground on the SECOND: the second one is governed");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeTwoGameConfig(t);
+    cd::ProcessSnapshot s = MakeTwoGameSnapshot();
+
+    // Fixture sanity: config order really does put the wrong game first, so a pass here
+    // cannot be the old "first enabled profile" rule getting lucky.
+    CHECK_EQ(c.profiles[0].name, std::wstring(L"Palworld"));
+
+    cd::ProfileSelection sel;
+    std::map<DWORD, std::wstring> res;
+    CHECK_EQ(TickWinner(s, c, 2000, sel, &res), std::wstring(L"Overwatch 2"));
+    CHECK_EQ(sel.reason, cd::SelectReason::First);
+
+    // The masks followed. Overwatch and its child are on the game mask...
+    CHECK_EQ(MaskOf(res, 2000), std::wstring(L"Cache no SMT"));
+    CHECK_EQ(MaskOf(res, 2001), std::wstring(L"Cache no SMT"));
+    // ...and the background game is simply NOT GOVERNED. It is deliberately not forced onto
+    // the heavy mask: the operator asked for the right game to be pinned, not for the other
+    // one to be punished.
+    CHECK(!Has(res, 1000));
+    CHECK(!Has(res, 1001));
+
+    Case("AA5b and the same tick with the foreground on the FIRST game picks the first");
+    cd::ProfileSelection sel2;
+    CHECK_EQ(TickWinner(s, c, 1000, sel2, nullptr), std::wstring(L"Palworld"));
+}
+
+void Test_AA6_ForegroundOnADescendantStillCounts() {
+    Case("AA6 the foreground window may belong to a DESCENDANT - launcher, child, shim");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeTwoGameConfig(t);
+    cd::ProcessSnapshot s = MakeTwoGameSnapshot();
+
+    cd::ProfileSelection sel;
+    CHECK_EQ(TickWinner(s, c, 2001, sel, nullptr), std::wstring(L"Overwatch 2"));
+
+    // And the mirror image, so this is not passing because Overwatch always wins.
+    cd::ProfileSelection sel2;
+    CHECK_EQ(TickWinner(s, c, 1001, sel2, nullptr), std::wstring(L"Palworld"));
+}
+
+void Test_AA7_AltTabbingToSomethingElseNeverUnpinsTheGame() {
+    Case("AA7 THE MOST IMPORTANT RULE: a foreground that is no game holds the selection");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeTwoGameConfig(t);
+    cd::ProcessSnapshot s = MakeTwoGameSnapshot();
+
+    cd::ProfileSelection sel;
+    CHECK_EQ(TickWinner(s, c, 2000, sel, nullptr), std::wstring(L"Overwatch 2"));
+
+    // Discord, a browser, this app's own settings window, or a foreground we could not read
+    // at all. NONE of them may hand the mask back to the game further up config.ini.
+    const DWORD notAGame[] = { 3500, 500, 0, 987654 };
+    for (size_t i = 0; i < sizeof(notAGame) / sizeof(notAGame[0]); ++i) {
+        std::map<DWORD, std::wstring> res;
+        CHECK_EQ(TickWinner(s, c, notAGame[i], sel, &res), std::wstring(L"Overwatch 2"));
+        CHECK_EQ(sel.reason, cd::SelectReason::Unchanged);
+        CHECK(!Has(res, 1000));
+    }
+    // Thirty ticks of it - far past any dwell - still nothing.
+    for (int i = 0; i < 30; ++i)
+        CHECK_EQ(TickWinner(s, c, 3500, sel, nullptr), std::wstring(L"Overwatch 2"));
+}
+
+void Test_AA8_TheDwellThroughComputeDesired() {
+    Case("AA8 a challenger holds the foreground: 11 ticks change nothing, the 12th switches");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeTwoGameConfig(t);
+    cd::ProcessSnapshot s = MakeTwoGameSnapshot();
+    const int dwell = cd::ForegroundSwitchDwellTicks(c.pollMs);
+    CHECK_EQ(dwell, 12);
+
+    cd::ProfileSelection sel;
+    CHECK_EQ(TickWinner(s, c, 2000, sel, nullptr), std::wstring(L"Overwatch 2"));
+
+    // Alt-tab to Palworld and hold it. Every tick short of the dwell keeps Overwatch, and
+    // keeps Overwatch's family on the game mask - this is what stops a rapid alt-tab from
+    // re-pinning ~150 processes twice a second under extreme game mode.
+    for (int i = 1; i < dwell; ++i) {
+        std::map<DWORD, std::wstring> res;
+        CHECK_EQ(TickWinner(s, c, 1000, sel, &res), std::wstring(L"Overwatch 2"));
+        CHECK_EQ(MaskOf(res, 2000), std::wstring(L"Cache no SMT"));
+        CHECK(!Has(res, 1000));
+    }
+
+    Case("AA8b the dwell elapses and the mask moves with it");
+    std::map<DWORD, std::wstring> res;
+    CHECK_EQ(TickWinner(s, c, 1000, sel, &res), std::wstring(L"Palworld"));
+    CHECK_EQ(sel.reason, cd::SelectReason::Foreground);
+    CHECK_EQ(MaskOf(res, 1000), std::wstring(L"Cache no SMT"));
+    CHECK_EQ(MaskOf(res, 1001), std::wstring(L"Cache no SMT"));
+    CHECK(!Has(res, 2000));
+    CHECK(!Has(res, 2001));
+
+    Case("AA8c and the switch is announced ONCE, not on every tick afterwards");
+    CHECK_EQ(TickWinner(s, c, 1000, sel, nullptr), std::wstring(L"Palworld"));
+    CHECK_EQ(sel.reason, cd::SelectReason::Unchanged);
+}
+
+void Test_AA9_TheSelectedGameExitingReleasesAtOnce() {
+    Case("AA9 the governing game exits: the survivor takes over IMMEDIATELY, no dwell");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeTwoGameConfig(t);
+    cd::ProcessSnapshot both = MakeTwoGameSnapshot();
+
+    cd::ProfileSelection sel;
+    CHECK_EQ(TickWinner(both, c, 2000, sel, nullptr), std::wstring(L"Overwatch 2"));
+
+    // Overwatch closes. Palworld is still running and nothing is in the foreground that we
+    // recognise - the desktop, say. One tick, not twelve.
+    cd::ProcessSnapshot alone;
+    AddProc(alone, 500, 400, L"explorer.exe", 100, 0, 0.0);
+    AddProc(alone, 1000, 500, L"Palworld.exe", 200, 0, 0.0);
+    AddProc(alone, 1001, 1000, L"PalworldLauncher.exe", 300, 0, 0.0);
+
+    std::map<DWORD, std::wstring> res;
+    CHECK_EQ(TickWinner(alone, c, 500, sel, &res), std::wstring(L"Palworld"));
+    CHECK_EQ(sel.reason, cd::SelectReason::Released);
+    CHECK_EQ(MaskOf(res, 1000), std::wstring(L"Cache no SMT"));
+
+    Case("AA9b every game exits: nothing is governed and the state is wiped");
+    cd::ProcessSnapshot empty;
+    AddProc(empty, 500, 400, L"explorer.exe", 100, 0, 0.0);
+    std::map<DWORD, std::wstring> res2;
+    CHECK_EQ(TickWinner(empty, c, 500, sel, &res2), std::wstring());
+    CHECK_EQ((int)res2.size(), 0);
+    CHECK(sel.selected.empty());
+
+    Case("AA9c so the NEXT game to appear is pinned at once rather than after a dwell");
+    std::map<DWORD, std::wstring> res3;
+    CHECK_EQ(TickWinner(alone, c, 500, sel, &res3), std::wstring(L"Palworld"));
+    CHECK_EQ(sel.reason, cd::SelectReason::First);
+    CHECK_EQ(MaskOf(res3, 1000), std::wstring(L"Cache no SMT"));
+}
+
+void Test_AA10_OneGameRunningIsByteIdenticalToBefore() {
+    Case("AA10 with ONE game running the answer does not depend on the new state at all");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = MakeTwoGameConfig(t);
+
+    // Only the SECOND profile's game is live, so the old first-match rule and the new one
+    // must agree - and they must agree whatever the foreground is, including a foreground
+    // that belongs to nothing.
+    cd::ProcessSnapshot s;
+    AddProc(s, 500, 400, L"explorer.exe", 100, 0, 0.0);
+    AddProc(s, 3500, 500, L"Discord.exe", 150, 0, 0.0);
+    AddProc(s, 2000, 500, L"Overwatch.exe", 400, 0, 0.0);
+    AddProc(s, 2001, 2000, L"OverwatchChild.exe", 500, 0, 0.0);
+
+    const DWORD fgs[] = { 2000, 2001, 3500, 500, 0 };
+    // ONE state object across all five, so this is a session and not five first ticks.
+    cd::ProfileSelection sel;
+    for (size_t i = 0; i < sizeof(fgs) / sizeof(fgs[0]); ++i) {
+        // The stateless call - exactly what every caller that predates this feature makes.
+        std::vector<std::wstring> stickyA;
+        const cd::Profile* matchedA = nullptr;
+        std::map<DWORD, std::wstring> a =
+            cd::ComputeDesired(s, c, fgs[i], stickyA, &matchedA);
+
+        // The stateful one.
+        std::map<DWORD, std::wstring> b;
+        const std::wstring nameB = TickWinner(s, c, fgs[i], sel, &b);
+
+        CHECK(matchedA != nullptr);
+        CHECK_EQ(matchedA->name, std::wstring(L"Overwatch 2"));
+        CHECK_EQ(nameB, std::wstring(L"Overwatch 2"));
+        CHECK(a == b);      // the whole desired map, not just the winner
+    }
+}
+
+void Test_AA11_ASpecificProfileStillBeatsAllGamesAtOnce() {
+    Case("AA11 an All Games incumbent yields to a specific profile IMMEDIATELY");
+    cd::Topology t = MakeReference(false);
+    cd::Config c;
+    c.version = 1;
+    c.pollMs = 250;
+    c.masks = cd::DeriveMasks(t);
+
+    cd::Profile ow;
+    ow.name = L"Overwatch 2";
+    ow.enabled = true;
+    ow.game = L"Overwatch.exe";
+    ow.gameMask = L"Cache no SMT";
+    ow.heavyMask = L"Freq";
+    c.profiles.push_back(ow);
+
+    cd::Profile all;
+    all.name = L"All Games";
+    all.enabled = true;
+    all.isAllGames = true;
+    // The watcher fills this pipe-separated list in; a test simply sets it. See Rule 1b.
+    all.game = L"Palworld.exe";
+    all.gameMask = L"Cache no SMT";
+    all.heavyMask = L"Freq";
+    c.profiles.push_back(all);
+    CHECK(c.AllGamesProfile() != nullptr);
+
+    // Only Palworld is up, so nothing specific matches and All Games governs it.
+    cd::ProcessSnapshot pal;
+    AddProc(pal, 500, 400, L"explorer.exe", 100, 0, 0.0);
+    AddProc(pal, 1000, 500, L"Palworld.exe", 200, 0, 0.0);
+    cd::ProfileSelection sel;
+    CHECK_EQ(TickWinner(pal, c, 1000, sel, nullptr), std::wstring(L"All Games"));
+    CHECK_EQ(sel.reason, cd::SelectReason::First);
+
+    // Overwatch starts. A specific profile outranks All Games however long the All Games
+    // profile has been governing, and it must NOT have to serve a dwell to do it.
+    cd::ProcessSnapshot both = MakeTwoGameSnapshot();
+    std::map<DWORD, std::wstring> res;
+    CHECK_EQ(TickWinner(both, c, 1000, sel, &res), std::wstring(L"Overwatch 2"));
+    CHECK_EQ(sel.reason, cd::SelectReason::Released);
+    CHECK_EQ(MaskOf(res, 2000), std::wstring(L"Cache no SMT"));
+}
+
+void Test_AA12_EveryReasonHasItsOwnWords() {
+    Case("AA12 every reason prints a distinct, non-empty phrase for the log line");
+    const cd::SelectReason all[] = {
+        cd::SelectReason::Unchanged, cd::SelectReason::First, cd::SelectReason::Foreground,
+        cd::SelectReason::Released, cd::SelectReason::Cleared,
+    };
+    std::set<std::wstring> seen;
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); ++i) {
+        const std::wstring w = cd::SelectReasonText(all[i]);
+        CHECK(!w.empty());
+        seen.insert(w);
+    }
+    CHECK_EQ((int)seen.size(), (int)(sizeof(all) / sizeof(all[0])));
+}
+
+// ===========================================================================
+// AB. The version label in the corner of the settings window.
+//
+// Only the PURE half is testable here, and it is the half that can be wrong in a way nobody
+// notices: the Win32 half either reads the resource or does not, and its failure mode is an
+// absent label. See src\version_label.h. The number itself is checked against the BUILT
+// BINARY in the gate, not here - a test that reads the .rc would be checking the input.
+// ===========================================================================
+
+void Test_AA13_OneCandidateIgnoresTheForegroundEntirely() {
+    Case("AA13 with ONE candidate the foreground flag cannot change the answer");
+    // This is not a curiosity. ComputeDesired SKIPS the whole descendant walk below two
+    // candidates on the strength of exactly this invariant, so if it ever stopped holding,
+    // the single-game path would silently start ignoring a foreground that mattered.
+    const bool fgs[] = { false, true };
+    for (size_t i = 0; i < 2; ++i) {
+        std::vector<cd::SelectionCandidate> one;
+        one.push_back(Cand(L"Overwatch 2", fgs[i]));
+
+        cd::ProfileSelection fresh;                       // no incumbent
+        CHECK_EQ(cd::ChooseProfile(one, 12, fresh), 0);
+        CHECK_EQ(fresh.reason, cd::SelectReason::First);
+
+        cd::ProfileSelection sitting;                     // it IS the incumbent
+        sitting.selected = L"Overwatch 2";
+        CHECK_EQ(cd::ChooseProfile(one, 12, sitting), 0);
+        CHECK_EQ(sitting.reason, cd::SelectReason::Unchanged);
+
+        cd::ProfileSelection other;                       // someone else was, and has gone
+        other.selected = L"Palworld";
+        CHECK_EQ(cd::ChooseProfile(one, 12, other), 0);
+        CHECK_EQ(other.reason, cd::SelectReason::Released);
+    }
+}
+
+void Test_AB1_TheShippedVersionFormatsAsTheOperatorNamesIt() {
+    Case("AB1 0,4,3,0 in the resource reads 'v0.4.3' on screen");
+    // ms = (major<<16)|minor, ls = (patch<<16)|build - the VS_FIXEDFILEINFO packing.
+    CHECK_EQ(cd::FormatVersionLabel(0x00000004u, 0x00030000u), std::wstring(L"v0.4.3"));
+}
+
+void Test_AB2_AFourthFieldIsShownOnlyWhenItSaysSomething() {
+    Case("AB2 the build field appears only when it is non-zero");
+    CHECK_EQ(cd::FormatVersionLabel(0x00000004u, 0x00030007u), std::wstring(L"v0.4.3.7"));
+    CHECK_EQ(cd::FormatVersionLabel(0x00010014u, 0x012C0000u), std::wstring(L"v1.20.300"));
+}
+
+void Test_AB3_AnUnreadableVersionDrawsNothing() {
+    Case("AB3 0.0.0.0 is as useless as a failed read, so it hides the label");
+    CHECK(cd::FormatVersionLabel(0u, 0u).empty());
+    // ...but a genuine 0.0.0.1 is not nothing.
+    CHECK_EQ(cd::FormatVersionLabel(0u, 1u), std::wstring(L"v0.0.0.1"));
+}
+
+void Test_AB4_TheLabelIsNeverSomethingElse() {
+    Case("AB4 tripwire: the label starts with 'v', carries no spaces and no stray suffix");
+    const std::wstring v = cd::FormatVersionLabel(0x00000004u, 0x00030000u);
+    CHECK(!v.empty() && v[0] == L'v');
+    CHECK(v.find(L' ') == std::wstring::npos);
+    CHECK(v.find(L"..") == std::wstring::npos);
+    CHECK(v.size() < 32);   // it shares a row with the OK button; it is not a paragraph
+}
 }  // namespace
 
 // ===========================================================================
@@ -4220,6 +6338,97 @@ int main() {
     Test_S3_ServiceRunningButAgentNotRunningShowsNotActive();
     Test_S4_ServiceStoppedButAgentRunningShowsActive();
     Test_S5_NotInstalledAlwaysShowsNotInstalled();
+
+    std::printf("\n== W. Interrupt readout - mask arithmetic and machine scope ==\n");
+    Test_W1_IrqGoldenVector();
+    Test_W2_IrqTranspositionIsAFailureInTheSuite();
+    Test_W3_IrqDecoderLengths();
+    Test_W4_IrqFormatCpuList();
+    Test_W13_IrqRegistryReadGuards();
+    Test_W5_IrqTemporalTargetSetDecode();
+    Test_W6_IrqReferenceMachineIsInScope();
+    Test_W7_IrqTwoGroupsRefused();
+    Test_W8_IrqTooManyProcessorsRefused();
+    Test_W9_IrqUnexpectedNumberingRefused();
+    Test_W10_IrqBuildMaskWholeChain();
+    Test_W11_IrqBuildMaskRefuses();
+    Test_W12_IrqRefusalReasonsAreDistinct();
+
+    std::printf("\n== X. Interrupt readout - the honesty of the readout ==\n");
+    Test_X1_IrqTooFewSamplesIsNeverMeasuredAndNeverHot();
+    Test_X2_IrqHotIsInterruptPlusDpc();
+    Test_X3_IrqGroupMembershipIsExact();
+    Test_X4_IrqHottestInGroupIgnoresTheRestOfTheMachine();
+    Test_X5_IrqNothingMeasuredInTheGroup();
+    Test_X6_IrqQuietCount();
+    Test_X7_IrqReferenceMachineWarningFires();
+    Test_X8_IrqAgreementCoversEveryState();
+    Test_X9_IrqSwitchCompleteness();
+    Test_X10_IrqWordingTripwire();
+    Test_X11_IrqEveryStringIsNonEmpty();
+    Test_X12_IrqPresentButUndecodablePolicyIsNeverAbsent();
+    Test_X13_IrqUnmeasuredGroupMemberIsStillInTheGroup();
+
+    std::printf("\n== Y. Interrupt readout - the sentences that carry numbers ==\n");
+    Test_Y1_IrqHotCoreSentenceIsExact();
+    Test_Y2_IrqNoHotCoreSentenceIsExact();
+    Test_Y3_IrqOutsideGroupSentenceIsExact();
+    Test_Y4_IrqNothingMeasuredSentencesAreExact();
+    Test_Y5_IrqGameGroupSentenceIsExact();
+    Test_Y6_IrqReproductionCommandIsExact();
+    Test_Y7_IrqPolicyStateTextIsExact();
+    Test_Y8_IrqDisagreementSentenceIsExact();
+    Test_Y9_IrqNoSentenceHardcodesAGroupName();
+    Test_Y10_IrqPercentFormatting();
+    Test_Y11_IrqCardLineIsExact();
+
+    std::printf("\n== Z. Extreme game mode - the blanket sweep ==\n");
+    Test_Z1_DefaultIsOff();
+    Test_Z2_RoundTripAndOldConfigs();
+    Test_Z3_SweepActiveNeedsAMaskToSweepOnto();
+    Test_Z4_EligibilityIsSevenHardGates();
+    Test_Z5_TheRuleThroughComputeDesired();
+    Test_Z6_NothingIsSweptWithoutAGoverningProfile();
+    Test_Z7_AnEmptyHeavyMaskSweepsNothing();
+    Test_Z8_AutoPinKeepsItsOwnLabel();
+    Test_Z9_AutoPinGreysUnderExtremeMode();
+    Test_Z10_BlockedLineGroupsAndCaps();
+    Test_Z11_VCacheActiveRow();
+    Test_Z12_InfoIconTooltipWording();
+
+    std::printf("\n== AA. Rule 1 - the mask follows the game being played ==\n");
+    Test_AA1_DwellIsDerivedFromThePollInterval();
+    Test_AA2_ChooseProfileWithNothingToChoose();
+    Test_AA3_FirstSelectionIsImmediateAndPrefersTheForeground();
+    Test_AA4_AnInterruptedDwellNeverSwitches();
+    Test_AA5_TwoLiveGamesTheForegroundOneWins();
+    Test_AA6_ForegroundOnADescendantStillCounts();
+    Test_AA7_AltTabbingToSomethingElseNeverUnpinsTheGame();
+    Test_AA8_TheDwellThroughComputeDesired();
+    Test_AA9_TheSelectedGameExitingReleasesAtOnce();
+    Test_AA10_OneGameRunningIsByteIdenticalToBefore();
+    Test_AA11_ASpecificProfileStillBeatsAllGamesAtOnce();
+    Test_AA12_EveryReasonHasItsOwnWords();
+    Test_AA13_OneCandidateIgnoresTheForegroundEntirely();
+
+    std::printf("\n== AC. Extreme game mode's readout ==\n");
+    Test_AC1_SweptExesGroupCountAndSortByCount();
+    Test_AC2_SweptProcessCountCountsProcessesNotApps();
+    Test_AC3_SweepLineReportsBothCountsAndTheMask();
+    Test_AC4_SweepLineCapsByCountAndByLength();
+    Test_AC5_SweepLineIsSilentWithNothingToSay();
+
+    std::printf("\n== AD. The panel follows the governing profile ==\n");
+    Test_AD1_ThePanelFollowsTheGameInFront();
+    Test_AD2_FollowNeverStealsAnEditInProgress();
+    Test_AD3_TheOperatorsOwnChoiceIsHonoured();
+    Test_AD4_NothingGoverningNeverMovesTheSelection();
+
+    std::printf("\n== AB. The version label in the settings window ==\n");
+    Test_AB1_TheShippedVersionFormatsAsTheOperatorNamesIt();
+    Test_AB2_AFourthFieldIsShownOnlyWhenItSaysSomething();
+    Test_AB3_AnUnreadableVersionDrawsNothing();
+    Test_AB4_TheLabelIsNeverSomethingElse();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

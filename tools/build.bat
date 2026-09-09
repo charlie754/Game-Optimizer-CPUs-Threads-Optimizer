@@ -24,7 +24,7 @@ pushd "%ROOT%\build"
 cl /nologo /EHsc /O2 /std:c++17 /W3 /permissive- /DUNICODE /D_UNICODE /MT ^
    /I"%ROOT%\src" /Fo"obj\\" /Fe"GameOptimizer.exe" !SRCS! "%ROOT%\build\GameOptimizer.res" ^
    /link /SUBSYSTEM:WINDOWS /MANIFEST:EMBED /MANIFESTINPUT:"%ROOT%\src\GameOptimizer.manifest" ^
-   user32.lib shell32.lib gdi32.lib advapi32.lib comctl32.lib ole32.lib shlwapi.lib psapi.lib comdlg32.lib msimg32.lib
+   user32.lib shell32.lib gdi32.lib advapi32.lib comctl32.lib ole32.lib shlwapi.lib psapi.lib comdlg32.lib msimg32.lib cfgmgr32.lib pdh.lib version.lib
 set RC=%ERRORLEVEL%
 popd
 

@@ -78,6 +78,23 @@ HWND SettingsWindow();
 bool LaunchVCacheSetElevated(bool disable, DWORD& outError);
 bool LaunchVCacheRunElevated(bool run, DWORD& outError);
 
+// The interrupt and DPC readout, opened from one card on the Settings General page.
+//
+// MODAL over Settings: it runs its own message loop and does not return until its window is
+// destroyed, so `cfg` and `topo` are BORROWED LIVE rather than copied - sound only because
+// the call is modal, exactly as envwarning.h documents for the same shape.
+//
+// IT IS READ-ONLY, AND THAT IS THE WHOLE CONTRACT. It samples two per-processor PDH counters
+// and reads three registry subkeys under each present PCI device's Device Parameters key,
+// with KEY_QUERY_VALUE and nothing wider. It writes no registry value, asks for no elevation,
+// restarts no device and changes nothing about scheduling - which is why `cfg` is const and
+// why there is no Apply, no journal and no undo: there is nothing to undo.
+//
+// `engine` may be null. When it is non-null and a profile's game is actually running, the
+// group the readout is measured against is that profile's own game mask; otherwise it is the
+// machine's default game mask, and the page says which of the two it used.
+void ShowInterruptBench(HWND owner, const Config& cfg, const Topology& topo, Engine* engine);
+
 // Three pages: topology confirmation, the Game Mode advisory, first profile.
 // Returns false only if the user closed it outright; `cfg.firstRunDone` is set either way
 // so it does not reappear every launch.

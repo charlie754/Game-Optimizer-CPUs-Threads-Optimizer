@@ -14,6 +14,8 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
+// WIN32_LEAN_AND_MEAN keeps windows.h from pulling this in, and the version label needs it.
+#include <winver.h>
 
 #include <algorithm>
 #include <chrono>
@@ -26,6 +28,7 @@
 #include "applier.h"
 #include "config.h"
 #include "engine.h"
+#include "irq_policy.h"
 #include "mask_edit.h"
 #include "procwatch.h"
 #include "settings_environment.h"
@@ -35,6 +38,7 @@
 #include "sponsor.h"
 #include "theme.h"
 #include "topology.h"
+#include "version_label.h"
 #include "webview_host.h"
 
 namespace cd {
@@ -50,7 +54,10 @@ void EnsureCommonControls() {
     if (done) return;
     INITCOMMONCONTROLSEX icc;
     icc.dwSize = sizeof(icc);
-    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES;
+    // ICC_TAB_CLASSES is what registers TOOLTIPS_CLASS - the two (i) icons on the Profiles
+    // page hang their hover text off one. Comctl32 v6 registers it on load anyway; asking
+    // for it explicitly costs nothing and does not depend on that staying true.
+    icc.dwICC = ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES | ICC_TAB_CLASSES;
     InitCommonControlsEx(&icc);
     done = true;
 }
@@ -60,6 +67,43 @@ int DpiOf(HWND h) {
     if (d == 0) d = GetDpiForSystem();
     if (d == 0) d = 96;
     return static_cast<int>(d);
+}
+
+// THE VERSION IN THE CORNER OF THE SETTINGS WINDOW, read from THIS binary's own resource.
+//
+// GetModuleFileNameW(nullptr) is the running .exe, so the label reports what the process
+// actually is - not what a header said it was when some translation unit was compiled.
+// src\GameOptimizer.rc stays the one place the number is written down, and there is no
+// second representation of it anywhere in the C++ to drift out of step.
+//
+// EVERY FAILURE PATH RETURNS AN EMPTY STRING, and the caller draws nothing for an empty
+// string. A stripped resource, a truncated buffer, a VerQueryValue that hands back the wrong
+// length, a signature that is not VS_FFI_SIGNATURE: none of them are worth a message box and
+// none of them may produce a guess. A missing version is harmless; a wrong one is not.
+std::wstring ReadOwnVersionLabel() {
+    wchar_t path[MAX_PATH * 2];
+    const DWORD n = GetModuleFileNameW(nullptr, path, static_cast<DWORD>(
+                                           sizeof(path) / sizeof(path[0])));
+    // n == capacity means the name was TRUNCATED (and on older Windows is not even
+    // terminated), so this is a failure and not a long path we can still use.
+    if (n == 0 || n >= sizeof(path) / sizeof(path[0])) return std::wstring();
+
+    DWORD ignored = 0;
+    const DWORD size = GetFileVersionInfoSizeW(path, &ignored);
+    if (size == 0) return std::wstring();
+
+    std::vector<BYTE> buf(size);
+    if (!GetFileVersionInfoW(path, 0, size, buf.data())) return std::wstring();
+
+    void* fixed = nullptr;
+    UINT len = 0;
+    if (!VerQueryValueW(buf.data(), L"\\", &fixed, &len)) return std::wstring();
+    if (fixed == nullptr || len < sizeof(VS_FIXEDFILEINFO)) return std::wstring();
+
+    const VS_FIXEDFILEINFO* ffi = static_cast<const VS_FIXEDFILEINFO*>(fixed);
+    if (ffi->dwSignature != 0xFEEF04BDu) return std::wstring();   // VS_FFI_SIGNATURE
+
+    return FormatVersionLabel(ffi->dwFileVersionMS, ffi->dwFileVersionLS);
 }
 
 HFONT MakeUiFont(int dpi, bool bold) {
@@ -835,6 +879,31 @@ enum : int { IDC_VCACHE_MANAGE = 1600, IDC_VCACHE_RESTORE = 1601, IDC_VCACHE_WAR
 // id that WM_COMMAND already dispatches on, so nothing existing shifts.
 enum : int { IDC_MAPADD = 1700, IDC_MAPREMOVE = 1701 };
 
+// The Setting page's interrupt-and-DPC readout. Its own block, above every id WM_COMMAND
+// already dispatches on, so nothing existing shifts. NO NEW PAGE GOES WITH IT: no PAGE_*
+// entry, no TabBarAddItem and no widening of the IDC_NAV range tests below, whose documented
+// failure mode is a new tab that silently does nothing.
+enum : int { IDC_IRQ_OPEN = 1800 };
+
+// Extreme game mode's checkbox. Its own block above every id WM_COMMAND already dispatches
+// on, so nothing existing shifts. NO NEW PAGE GOES WITH IT either: the rule is PER PROFILE
+// and belongs beside the other per-profile rule, so there is no PAGE_* entry, no
+// TabBarAddItem and no widening of the IDC_NAV range tests.
+enum : int { IDC_EXTREME = 1900 };
+
+// The two (i) icons that carry the explanatory text on hover. They are SS_OWNERDRAW |
+// SS_NOTIFY statics: SS_OWNERDRAW because the glyph is drawn from the palette like every
+// other mark on this page, and SS_NOTIFY because a plain STATIC answers WM_NCHITTEST with
+// HTTRANSPARENT and would never see the mouse the tooltip needs. They receive clicks
+// (STN_CLICKED) which WM_COMMAND deliberately ignores - the icon is not a button.
+enum : int { IDC_AUTOINFO = 1901, IDC_EXTREMEINFO = 1902 };
+
+// The extreme-mode sweep's live readout line. Its own value in the same block, above
+// every id WM_COMMAND dispatches on. A STATIC needs no id to work - hAutoStatus and
+// hVCacheActive both use -1 - but this one is given a real one so a UI probe can find
+// it by id rather than by walking the children and guessing from their text.
+enum : int { IDC_EXTREME_STATUS = 1903 };
+
 enum : int { PAGE_PROFILES = 0, PAGE_COREMAP, PAGE_GENERAL, PAGE_COUNT };
 
 const wchar_t kSettingsClass[] = L"GameOptimizerSettings";
@@ -915,6 +984,14 @@ struct SettingsState {
     int dpi = 96;
     bool loading = false;
 
+    // WINDOW CHROME, not page content: the running binary's own version, drawn in the
+    // bottom-left corner on EVERY tab. Read once in WM_CREATE - a version resource does not
+    // change while the process lives, and re-reading it from a paint handler would put a
+    // file read on the redraw path. EMPTY MEANS DRAW NOTHING: if the resource could not be
+    // read the label is simply absent, because a missing version is harmless and a wrong one
+    // is not. See ReadOwnVersionLabel below and version_label.h for the format.
+    std::wstring versionText;
+
     // The page switcher and the page it currently shows. There is no scroll offset any more:
     // one page is visible at a time and each page is laid out to fit the content area.
     //
@@ -979,9 +1056,47 @@ struct SettingsState {
     // THEY ARE NOT THE USER'S CONFIG AND MUST NEVER BECOME IT. Profile::heavy is written from
     // HeavyItems(), which reads back only rows stamped kHeavyRowManual; see the enum there.
     std::vector<std::wstring> autoRows;
+    // WHICH KIND each of those rows is, one entry per autoRows entry, in the same order.
+    // Carried beside the texts rather than recomputed because the tail is no longer one kind:
+    // it is the auto-pin readback, then its caption, then the extreme-mode readback, then
+    // ITS caption. Compared along with the texts, so a row that changed only its kind - an
+    // executable the sweep took over from the auto-pin rule - still rebuilds the list.
+    std::vector<LPARAM> autoRowKinds;
     // Distinct auto-pinned executables BEFORE the display cap, for the "+N more" row and for
     // the status sentence's count.
     size_t autoTotal = 0;
+
+    // ---- What EXTREME GAME MODE moved, which is the other half of the same defect --------
+    // The operator's words: "Extreme Mode should show what other application had been pinned
+    // into heavy mask. Now, it's 0 show." Rule 4b sweeps ~150 processes and none of them
+    // appeared anywhere in this window. These two counts are the sweep AS PUBLISHED BY THE
+    // ENGINE (GovernedProcess::extremeSwept), never re-derived here - a second implementation
+    // of rule 4b in the window would be free to disagree with the first, and the disagreement
+    // would look exactly like the bug this exists to rule out.
+    // The sweep, grouped by executable and sorted count-descending, BEFORE any display cap,
+    // together with the process total it was grouped from.
+    //
+    // CACHED RATHER THAN RECOMPUTED BY THE SENTENCE, and that is a correctness requirement
+    // rather than a saving. SyncAutoPinRows takes one EngineStatus and builds the listbox
+    // rows from it; a sentence that took its own GetStatus a few instructions later could be
+    // reading a NEWER status - the watcher publishes four times a second - and would then
+    // name an executable the rows beside it do not show. One snapshot, one answer.
+    std::vector<SweptExe> sweptExes;
+    size_t extremeProcTotal = 0;   // processes, which is the bigger and more honest number
+
+    // ---- Which profile the ENGINE is actually governing ---------------------------------
+    // Index into work.profiles, or -1. Cached on the same 1 s beat as everything else because
+    // BOTH the profile list's owner-draw (the NOW pill, once per visible row) and the follow
+    // rule below read it, and asking the engine once per row would take its mutex nine times
+    // a paint.
+    int governingProfile = -1;
+    // The last EngineStatus::profileName seen. The follow latch is released when THIS changes
+    // - i.e. when the operator swaps games - which is the event they asked to be followed.
+    std::wstring governingName;
+    // The operator moved the selection themselves since that last change. See
+    // ShouldFollowGoverningProfile in settings_warning.h for why the latch exists and what
+    // releases it.
+    bool followPinned = false;
 
     // Owned. Returned from WM_CTLCOLOR* so a static/checkbox erases to the card it sits on
     // and an edit/listbox to the input surface. Deleted in WM_NCDESTROY.
@@ -1011,9 +1126,44 @@ struct SettingsState {
     // after every settled selection on a real mask. One field, because only one of the two
     // combos can have the focus that any of those three routes requires.
     std::wstring maskComboBeforeChange;
-    HWND hAutoPin = nullptr, hAutoDesc = nullptr;
+    // hAutoDesc IS GONE: the paragraph it carried is now the tooltip on hAutoInfo, the
+    // small circled (i) that sits immediately after the check box caption. Operator request,
+    // 2026-09-09.
+    HWND hAutoPin = nullptr, hAutoInfo = nullptr;
     // The live "why is nothing happening" line under the percent field. See AutoPinState.
+    // IT DID NOT MOVE BEHIND AN ICON and must not: it is the only thing on the page that
+    // says why the rule is not firing, and a live answer is not an explanation.
     HWND hAutoStatus = nullptr;
+    // THE AMD V-CACHE ROW: a SIBLING of hAutoStatus, never a replacement for it. Both can be
+    // up at once and they answer different questions - "why is this rule not firing" and
+    // "is something else steering this machine". It takes vertical space only while it has
+    // something to say, exactly as the two parked-mask warnings do, so a machine with no AMD
+    // optimizer on it never pays a blank row for the feature. See
+    // ShowAmdVCacheActiveWarning / AmdVCacheActiveWarningText in settings_warning.h.
+    HWND hVCacheActive = nullptr;
+    // EXTREME GAME MODE: the checkbox and the (i) icon carrying its sentence on hover.
+    //
+    // IT USED TO HAVE THREE CONTROLS. The fixed sentence became ExtremeModeInfoTipText on
+    // hExtremeInfo, and the LIVE parked-status line (hExtremeStatus) was DELETED outright on
+    // the operator's instruction, 2026-09-09 - not hidden, not moved behind the icon. The
+    // fact it reported is the effect; the AMD V-Cache warning row a few rows above reports
+    // the CAUSE - the optimizer agent that parks the mask - and it is still on the page in
+    // plain sight. Two rows for one fact is what was removed.
+    HWND hExtreme = nullptr, hExtremeInfo = nullptr;
+    // THE SWEEP'S LIVE READOUT, and it is NOT the parked-status line that was deleted on
+    // 2026-09-09. That one reported whether the processors of a mask were parked - the effect
+    // of AMD's optimizer, told a second time by the V-Cache row above. This one reports what
+    // THIS APP DID: how many processes rule 4b moved, into how many apps they group, and the
+    // busiest of those apps by name. Nothing else on this page carries that fact, which is
+    // precisely the complaint.
+    //
+    // It takes height only while it has something to say, exactly as hVCacheActive does, so a
+    // profile with extreme mode off never pays a blank row for it.
+    HWND hExtremeStatus = nullptr;
+    // ONE tooltip control for the whole window, shared by both icons. Created in WM_CREATE,
+    // owned by the settings window, so it is destroyed with it. TTF_SUBCLASS makes each icon
+    // relay its own mouse messages: no timer, no polling, no per-frame cost.
+    HWND hTip = nullptr;
     // The seconds field and its two captions are DELETED, not hidden - see Profile::
     // autoPinSeconds in config.h for why the model keeps the value the UI no longer edits.
     HWND hPctLbl = nullptr, hPct = nullptr;
@@ -1034,6 +1184,10 @@ struct SettingsState {
     HWND hGameModeStatus = nullptr, hVCacheStatus = nullptr, hVCacheRestoreHint = nullptr;
     HWND hVCacheEffect = nullptr;
     HWND hBlocked = nullptr, hInspect = nullptr;
+    // The interrupt-and-DPC readout card. The line is fixed text set once at creation - it
+    // reports nothing about the live machine, so it costs the status timer nothing and no
+    // second timer is introduced for it.
+    HWND hIrqLine = nullptr, hIrqOpen = nullptr;
     // The sponsor strip. It belongs to the WINDOW, not to a page - it sits directly above the
     // footer on every page - so it is deliberately absent from PageControls.
     HWND hSponsor = nullptr;
@@ -1155,8 +1309,24 @@ void OverdrawSearchChrome(SettingsState* st, HWND hwnd);
 bool PromptName(HWND owner, const wchar_t* prompt, std::wstring& io);
 // Returns true when the state or the sentence changed, i.e. the caller must repaint.
 bool RefreshAutoPinStatus(SettingsState* st);
+// Returns true when the row APPEARED or DISAPPEARED, i.e. the caller must re-lay out. Its
+// text never changes, so there is no repaint-only case to report.
+bool RefreshVCacheActiveWarning(SettingsState* st);
 // Returns true when the auto-pin rows in the heavy list were rebuilt.
 bool SyncAutoPinRows(SettingsState* st);
+// Returns true when the extreme-mode sweep line APPEARED, DISAPPEARED or changed its text.
+// Unlike hVCacheActive its wording is live (the counts move every tick), so the caller has to
+// treat a text-only change as a repaint even when the row's height did not move.
+bool RefreshExtremeSweptStatus(SettingsState* st);
+// Recomputes which profile the engine is governing and, when the rule allows, moves the
+// editor onto it. Returns true when the selection actually moved.
+bool RefreshGoverningProfile(SettingsState* st, HWND hwnd);
+// THE (i) ICONS' GEOMETRY. Defined further down with the rest of the icon's code - the
+// painter and the tooltip that belong with it - but SettingsLayout, which sits above that
+// block, is what places them. Declared rather than moved so the icon stays one story in
+// one place.
+int InfoIconSide(int dpi);
+int CheckBoxContentWidth(HWND box, HDC dc, int dpi, int maxW);
 
 // The owner-draw button kind, parked on the control itself. GWLP_USERDATA is zero for a
 // control nobody stamped, so the stored value is kind+1 and 0 reads back as Secondary -
@@ -1526,7 +1696,13 @@ std::wstring SelectedMaskName(HWND combo) {
 enum : LPARAM {
     kHeavyRowManual = 0,   // the user's entry; the ONLY kind that reaches Profile::heavy
     kHeavyRowAuto   = 1,   // auto-pin moved this executable; never saved
-    kHeavyRowMore   = 2    // the "+N more" caption; a sentence, not a process
+    kHeavyRowMore   = 2,   // the "+N more" caption; a sentence, not a process
+    // EXTREME GAME MODE (rule 4b) swept this executable; never saved, and a DIFFERENT claim
+    // from kHeavyRowAuto. Rule 4 picked its rows on measured CPU%; rule 4b took everything
+    // that was not the game. Folding the two into one tag would credit the blanket sweep with
+    // a decision the auto-pin rule made, and vice versa - see the note on extremeSweptOut in
+    // engine.h for why the engine keeps the two sets apart in the first place.
+    kHeavyRowExtreme = 3
 };
 
 // Row texts. manualOnly is the guard described above, not an optimisation.
@@ -1593,10 +1769,13 @@ void SetHeavyItems(SettingsState* st, const std::vector<std::wstring>& v) {
             SendMessageW(st->hHeavy, LB_SETITEMDATA, static_cast<WPARAM>(row),
                          kHeavyRowManual);
     }
-    // The reset took the auto rows with it, so the cache no longer describes the control.
-    // Left stale, the next sync would compare equal and never put them back.
+    // The reset took the readback rows with it, so the cache no longer describes the
+    // control. Left stale, the next sync would compare equal and never put them back.
     st->autoRows.clear();
+    st->autoRowKinds.clear();
     st->autoTotal = 0;
+    st->sweptExes.clear();
+    st->extremeProcTotal = 0;
 }
 
 // Appends one entry, case-insensitively de-duplicated, and selects it.
@@ -1709,15 +1888,43 @@ bool IsAutoPinLabel(const SettingsState* st, HWND ctl) {
     return ctl == st->hPctLbl;
 }
 
+// Is a profile selected at all? Every per-profile control is dead without one, and three
+// places needed the same three-line test.
+bool HasSelectedProfile(const SettingsState* st) {
+    return st && st->selProfile >= 0 &&
+           st->selProfile < static_cast<int>(st->work.profiles.size());
+}
+
+// THE ONE PLACE THAT DECIDES WHETHER THE AUTO-PIN GROUP IS LIVE, so the check box, the
+// icon, the caption, the percent field and the status line cannot disagree with each other.
+// Two independent reasons switch it off, and neither is a stored setting being changed:
+//   * no profile is selected - nothing to configure;
+//   * extreme game mode is ticked - see AutoPinControlsEnabled in settings_warning.h for
+//     why the rule is then a strict subset of a sweep that already ran.
+bool AutoPinGroupLive(const SettingsState* st) {
+    return HasSelectedProfile(st) && AutoPinControlsEnabled(IsChecked(st->hExtreme));
+}
+
 // True while the auto-pin rule is off, i.e. while that caption describes a field that has no
-// effect. Derived from the check box itself so the colour cannot drift out of step with the
-// enabled state of the EDIT field.
+// effect. Derived from the check box and from the group's own live test, so the colour cannot
+// drift out of step with the enabled state of the EDIT field.
 bool AutoPinLabelsAreDim(const SettingsState* st) {
-    return st && !IsChecked(st->hAutoPin);
+    return !(st && AutoPinGroupLive(st) && IsChecked(st->hAutoPin));
 }
 
 void SyncAutoPinEnable(SettingsState* st) {
-    bool on = IsChecked(st->hAutoPin);
+    // THE WHOLE GROUP GREYS TOGETHER WHEN EXTREME MODE IS ON, AND NOTHING IS UNCHECKED.
+    // BM_GETCHECK still answers on a disabled check box, so StoreUiToProfile keeps writing
+    // the operator's own Profile::autoPin back out and turning extreme mode on and off again
+    // leaves their setting exactly as it was. Unchecking here would have been one line
+    // shorter and would silently destroy a saved preference.
+    const bool group = AutoPinGroupLive(st);
+    EnableWindow(st->hAutoPin, group ? TRUE : FALSE);
+    // The icon is part of the group and dims with it - but it is NOT disabled, because a
+    // disabled window receives no mouse messages and its tooltip would never appear. See
+    // DrawInfoIcon: it reads hAutoPin's enabled state, so all this needs is the repaint.
+    if (st->hAutoInfo) InvalidateRect(st->hAutoInfo, nullptr, TRUE);
+    bool on = group && IsChecked(st->hAutoPin);
     // The EDIT field stays genuinely disabled: refusing keystrokes into a field that has no
     // effect is real interaction semantics, not decoration.
     EnableWindow(st->hPct, on);
@@ -1743,8 +1950,7 @@ void SyncAutoPinEnable(SettingsState* st) {
 
 void LoadProfileToUi(SettingsState* st) {
     st->loading = true;
-    const bool has = st->selProfile >= 0 &&
-                     st->selProfile < static_cast<int>(st->work.profiles.size());
+    const bool has = HasSelectedProfile(st);
     Profile empty;
     const Profile& p = has ? st->work.profiles[static_cast<size_t>(st->selProfile)] : empty;
 
@@ -1761,18 +1967,25 @@ void LoadProfileToUi(SettingsState* st) {
     // misreading this feature exists to prevent.
     SyncAutoPinRows(st);
     SetChecked(st->hAutoPin, p.autoPin);
+    SetChecked(st->hExtreme, p.extremeMode);
     SetWindowTextW(st->hPct, std::to_wstring(p.autoPinPercent).c_str());
     // p.autoPinSeconds is deliberately NOT loaded: the seconds control is gone and this UI
     // neither reads nor writes that field any more.
 
     HWND editable[] = { st->hEnabled, st->hGame, st->hGamePick, st->hGameBrowse,
                         st->hGameMask, st->hHeavy, st->hHeavyPick, st->hHeavyAdd,
-                        st->hHeavyRem, st->hHeavyMask, st->hAutoPin, st->hDup, st->hRem,
-                        st->hRen };
+                        st->hHeavyRem, st->hHeavyMask, st->hAutoPin, st->hExtreme,
+                        st->hDup, st->hRem, st->hRen };
     for (HWND h : editable) EnableWindow(h, has ? TRUE : FALSE);
+    // The (i) icons are NOT in that list - see DrawInfoIcon for why they are never disabled.
+    // They take their ink from the check box beside them, which just moved, so they need the
+    // repaint an EnableWindow would not have given an owner-drawn STATIC anyway.
+    if (st->hExtremeInfo) InvalidateRect(st->hExtremeInfo, nullptr, TRUE);
+    if (st->hAutoInfo) InvalidateRect(st->hAutoInfo, nullptr, TRUE);
     st->loading = false;
-    SyncAutoPinEnable(st);
-    if (!has) EnableWindow(st->hPct, FALSE);
+    // SyncAutoPinEnable owns the percent field in every state now, the no-profile one
+    // included, so the extra EnableWindow(hPct, FALSE) that used to sit here is gone rather
+    // than left as a second opinion on the same control.
     // The readback belongs to the profile that was on screen a moment ago. Dropped rather
     // than left to expire on the next tick: a stage label sitting under a DIFFERENT game for
     // up to a second is a wrong answer, and this feature exists precisely so the user does
@@ -1780,6 +1993,11 @@ void LoadProfileToUi(SettingsState* st) {
     st->stageByHeavy.clear();
     st->targetStage = CpuSetStageInfo();
     st->targetStageText.clear();
+    // SyncAutoPinEnable is called AFTER SetChecked(hExtreme, ...) above, which is what makes
+    // the grey-out correct on the very first paint of a profile rather than only after the
+    // user clicks something. The extreme-mode live line that used to be refreshed here no
+    // longer exists.
+    SyncAutoPinEnable(st);
     // Switching profile switches both mask selections, so the parked warnings belong to a
     // different pair of masks now.
     RelayoutIfWarningsChanged(st);
@@ -1806,6 +2024,7 @@ void StoreUiToProfile(SettingsState* st) {
     std::wstring hm = SelectedMaskName(st->hHeavyMask);
     if (!hm.empty()) p.heavyMask = hm;
     p.autoPin = IsChecked(st->hAutoPin);
+    p.extremeMode = IsChecked(st->hExtreme);
     int v = 0;
     if (ParseIntW(Trim(GetText(st->hPct)), v)) p.autoPinPercent = v;
     // p.autoPinSeconds is left exactly as it was. ValidateAndRepair owns that field now.
@@ -2072,6 +2291,18 @@ std::wstring AutoPinTargetMask(const SettingsState* st, const Profile& p) {
 // so a cap that hides the normal case would report the feature as busier than it is.
 const size_t kAutoRowsShown = 8;
 
+// HOW MANY EXTREME-MODE ROWS ARE SHOWN AT ONCE, and why it is SMALLER than the auto-pin cap
+// rather than larger.
+//
+// The set is genuinely unbounded here rather than only in principle: [M] this machine's own
+// log shows rule 4b refusing "44 processes in 38 apps" in a single tick, and the refusals are
+// a SUBSET of what it moved. Six is what is left of the list once the user's own entries and
+// the auto-pin readback have had their rows - the editable rows are the ones this control
+// exists for, and a readback that pushes them behind a scrollbar breaks the control it was
+// added to explain. The COUNT is not capped: the sentence under the check box carries the
+// whole of it, which is the split the auto-pin feature already uses.
+const size_t kExtremeRowsShown = 6;
+
 // Rebuilds the auto-pin rows at the END of the heavy list from what the ENGINE published.
 // Returns true when the rows actually moved.
 //
@@ -2085,8 +2316,11 @@ bool SyncAutoPinRows(SettingsState* st) {
     if (!st || !st->hHeavy) return false;
 
     std::vector<std::wstring> rows;
+    std::vector<LPARAM> kinds;
+    std::vector<SweptExe> swept;
     st->autoApplyByExe.clear();
     size_t total = 0;
+    size_t procTotal = 0;
     bool haveMore = false;
 
     const bool has = st->selProfile >= 0 &&
@@ -2117,23 +2351,52 @@ bool SyncAutoPinRows(SettingsState* st) {
             // engine.h. Nothing about rule 4 is re-decided here: a second implementation in
             // the window would be free to disagree with the first, and the disagreement
             // would look exactly like the bug this feature exists to rule out.
-            std::vector<std::wstring> names = AutoPinnedExeNames(s, HeavyItems(st));
+            const std::vector<std::wstring> manual = HeavyItems(st);
+            std::vector<std::wstring> names = AutoPinnedExeNames(s, manual);
             total = names.size();
             if (names.size() > kAutoRowsShown) {
                 haveMore = true;
                 names.resize(kAutoRowsShown);
             }
-            rows.swap(names);
+            for (size_t i = 0; i < names.size(); ++i) {
+                rows.push_back(names[i]);
+                kinds.push_back(kHeavyRowAuto);
+            }
             if (haveMore) {
                 rows.push_back(L"+" + std::to_wstring(total - kAutoRowsShown) +
                                L" more auto-pinned");
+                kinds.push_back(kHeavyRowMore);
+            }
+
+            // ---- and the extreme-mode sweep, on the same terms --------------------------
+            // Same source, same collapse-to-executables, same cap-plus-caption. The rows
+            // carry ONLY the executable name and nothing else, deliberately: the row text is
+            // what RefreshCpuSetStages hands to FindBySpec and what CpuForExe looks the
+            // meter up by, so appending a count here would silently blank both columns on
+            // exactly the rows this feature added. The per-executable counts live in the
+            // sentence under the check box, which has room for them.
+            swept = ExtremeSweptExes(s, manual);
+            procTotal = ExtremeSweptProcessCount(s);
+            const size_t sweptShown =
+                swept.size() > kExtremeRowsShown ? kExtremeRowsShown : swept.size();
+            for (size_t i = 0; i < sweptShown; ++i) {
+                rows.push_back(swept[i].name);
+                kinds.push_back(kHeavyRowExtreme);
+            }
+            if (swept.size() > sweptShown) {
+                rows.push_back(L"+" + std::to_wstring(swept.size() - sweptShown) +
+                               L" more swept by extreme mode");
+                kinds.push_back(kHeavyRowMore);
             }
         }
     }
 
     st->autoTotal = total;
-    if (rows == st->autoRows) return false;
+    st->sweptExes = swept;
+    st->extremeProcTotal = procTotal;
+    if (rows == st->autoRows && kinds == st->autoRowKinds) return false;
     st->autoRows = rows;
+    st->autoRowKinds = kinds;
 
     const int sel = static_cast<int>(SendMessageW(st->hHeavy, LB_GETCURSEL, 0, 0));
     const int top = static_cast<int>(SendMessageW(st->hHeavy, LB_GETTOPINDEX, 0, 0));
@@ -2155,8 +2418,11 @@ bool SyncAutoPinRows(SettingsState* st) {
         const LRESULT row = SendMessageW(st->hHeavy, LB_ADDSTRING, 0,
                                          reinterpret_cast<LPARAM>(rows[i].c_str()));
         if (row < 0) continue;                       // LB_ERR / LB_ERRSPACE
+        // From the parallel vector, never re-derived from the position: the tail now holds
+        // four kinds in a fixed order, and "the last row is the caption" - which is what this
+        // said while there was one caption - is false the moment there are two.
         SendMessageW(st->hHeavy, LB_SETITEMDATA, static_cast<WPARAM>(row),
-                     (haveMore && i + 1 == rows.size()) ? kHeavyRowMore : kHeavyRowAuto);
+                     i < kinds.size() ? kinds[i] : kHeavyRowAuto);
     }
 
     // A selection on one of the user's rows is exactly where they left it. A selection that
@@ -2177,8 +2443,7 @@ bool RefreshAutoPinStatus(SettingsState* st) {
     AutoPinState want = AutoPinState::Hidden;
     std::wstring line;
 
-    const bool has = st->selProfile >= 0 &&
-                     st->selProfile < static_cast<int>(st->work.profiles.size());
+    const bool has = HasSelectedProfile(st);
     if (has) {
         const Profile& p = st->work.profiles[static_cast<size_t>(st->selProfile)];
         const std::wstring game = AutoPinGameLabel(p);
@@ -2187,7 +2452,18 @@ bool RefreshAutoPinStatus(SettingsState* st) {
 
         // The check box, not the stored field: the sentence has to describe what the user is
         // looking at, and the box is what they just clicked.
-        if (!IsChecked(st->hAutoPin)) {
+        //
+        // EXTREME MODE IS TESTED FIRST, AND IT DOES NOT REPORT "off". The setting is not off
+        // - it is stored, untouched, and simply cannot add anything to a sweep that already
+        // moved everything (see AutoPinControlsEnabled). Leaving this branch out would have
+        // left a greyed-out line still reading "Active - 3 apps above 8% moved to Freq",
+        // which is a second answer to the question the grey is already answering. Reusing
+        // AutoPinState::Off is what dims the sentence and the dot: WM_CTLCOLORSTATIC and
+        // AutoPinDotColour both key on that state, so no new dimming path was introduced.
+        if (!AutoPinControlsEnabled(IsChecked(st->hExtreme))) {
+            want = AutoPinState::Off;
+            line = AutoPinSupersededByExtremeText();
+        } else if (!IsChecked(st->hAutoPin)) {
             want = AutoPinState::Off;
             line = L"Auto-pin is off for this profile, so nothing is moved automatically.";
         } else if (!IsChecked(st->hEnabled)) {
@@ -2248,6 +2524,150 @@ bool RefreshAutoPinStatus(SettingsState* st) {
     ShowWindow(st->hAutoStatus,
                (!line.empty() && st->page == PAGE_PROFILES) ? SW_SHOW : SW_HIDE);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// The extreme-mode sweep line
+// ---------------------------------------------------------------------------
+
+// HOW MANY EXECUTABLES THE SENTENCE MAY NAME, and the character budget that backs it up.
+//
+// The control is a STATIC of a FIXED height (kExtremeStatusDp below), so the promise "you can
+// see which ones" is kept only if the string cannot outrun that height. Two caps, because
+// neither is sufficient alone: a cap on the NUMBER of names says nothing about their length,
+// and a cap on LENGTH alone would let one pathological name eat the budget.
+//
+// [M] The budget is derived, not guessed. At 96 dpi and the window's own minimum width this
+// row's text width is iw - indent - Dp(18) = 487 - 20 - 18 = 449 px; Font::UiSmall averages
+// about 7 px per character there, so a line holds roughly 64 characters and three lines hold
+// about 192. The fixed head of the sentence ("Extreme game mode also moved 147 processes in
+// 62 apps to Freq: ") is about 60, and the tail (" and 58 more apps.") about 18, which leaves
+// 114 for the list. Four names of a typical 22 characters ("msedgewebview2.exe x12") is 94.
+const size_t kExtremeNamesShown = 4;
+const size_t kExtremeListChars = 114;
+
+// Rebuilds the sweep sentence from the set SyncAutoPinRows cached. Returns true when the
+// text changed - which INCLUDES appearing and disappearing, because an empty string is how
+// this row gives its height back.
+//
+// CALL IT AFTER SyncAutoPinRows, ALWAYS. That function is what decides whether the engine is
+// running THIS profile at all (rule 1 picks one profile and the rest are inert) and leaves
+// the cache empty when it is not, so this sentence cannot attribute another profile's sweep
+// to the one being edited. It is also what pins the two to a single EngineStatus.
+bool RefreshExtremeSweptStatus(SettingsState* st) {
+    if (!st || !st->hExtremeStatus) return false;
+
+    std::wstring line;
+    if (HasSelectedProfile(st)) {
+        const Profile& p = st->work.profiles[static_cast<size_t>(st->selProfile)];
+        // The mask name comes from the same helper the auto-pin sentence uses, so the two
+        // sentences on this card cannot name different masks for the same profile.
+        line = FormatExtremeSweptLine(st->sweptExes, st->extremeProcTotal,
+                                      AutoPinTargetMask(st, p),
+                                      kExtremeNamesShown, kExtremeListChars);
+    }
+
+    if (GetText(st->hExtremeStatus) == line) return false;
+    SetWindowTextW(st->hExtremeStatus, line.c_str());
+    // Same rule as every other conditional row here: a Profiles-page control may only become
+    // visible while that page is the one on screen, or it floats over whatever page is.
+    ShowWindow(st->hExtremeStatus,
+               (!line.empty() && st->page == PAGE_PROFILES) ? SW_SHOW : SW_HIDE);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Following the profile the engine is actually governing
+// ---------------------------------------------------------------------------
+
+// Is the keyboard focus in a control the operator could be mid-edit in?
+//
+// EDIT, LISTBOX and COMBOBOX only. A button or the tab bar holding focus is not an edit in
+// progress, and treating it as one would suppress the follow for the whole time the Settings
+// window is simply open - which is most of the time the operator would be watching for it.
+//
+// GetFocus is THREAD-RELATIVE and that is a feature here, not a caveat: while the game is in
+// the foreground this thread has no focus window at all, so it answers null and the follow is
+// free to run, which is exactly the case the operator described.
+bool ProfilePageEditFocused(const SettingsState* st) {
+    const HWND f = GetFocus();
+    if (f == nullptr) return false;
+    const HWND edits[] = { st->hSearch, st->hGame, st->hPct, st->hProfList, st->hHeavy,
+                           st->hGameMask, st->hHeavyMask };
+    for (HWND h : edits)
+        if (h != nullptr && f == h) return true;
+    return false;
+}
+
+// Is either mask combo's list dropped open? A combo with its list down is a choice in
+// progress, and CB_GETDROPPEDSTATE is the only thing that can see it - the combo's own window
+// still looks idle.
+bool ProfilePageDropdownOpen(const SettingsState* st) {
+    const HWND combos[] = { st->hGameMask, st->hHeavyMask };
+    for (HWND h : combos)
+        if (h != nullptr && SendMessageW(h, CB_GETDROPPEDSTATE, 0, 0) != 0) return true;
+    return false;
+}
+
+// Which profile in the WORKING config the engine's status describes, or -1.
+//
+// StatusDescribesProfile is the existing answer to "is this profile the active one" and is
+// used unchanged: it keys on the published profile NAME first and falls back to the game
+// executable, so a profile the operator has renamed but not yet applied is still recognised.
+// Re-deriving the match here would be a second implementation of rule 1.
+int GoverningProfileIndex(const SettingsState* st, const EngineStatus& s) {
+    if (s.paused) return -1;
+    for (size_t i = 0; i < st->work.profiles.size(); ++i)
+        if (StatusDescribesProfile(s, st->work.profiles[i])) return static_cast<int>(i);
+    return -1;
+}
+
+bool RefreshGoverningProfile(SettingsState* st, HWND hwnd) {
+    if (!st || !st->engine) return false;
+    const EngineStatus s = st->engine->GetStatus();
+    const int idx = GoverningProfileIndex(st, s);
+
+    // THE LATCH IS RELEASED BY THE ENGINE, NOT BY A TIMER. A change in the published profile
+    // name is the operator swapping games, which is the one event they explicitly asked to be
+    // followed - so whatever selection they made while the previous game was in front stops
+    // suppressing it. Released on the way OUT of a profile too (name -> empty), because
+    // "the game exited" is just as much a change of what is governing.
+    const std::wstring nameNow = s.paused ? std::wstring() : s.profileName;
+    if (nameNow != st->governingName) {
+        st->governingName = nameNow;
+        st->followPinned = false;
+    }
+
+    bool moved = false;
+    if (idx != st->governingProfile) {
+        st->governingProfile = idx;
+        // The NOW pill just moved to a different row, and the list only repaints when told.
+        if (st->hProfList) InvalidateRect(st->hProfList, nullptr, TRUE);
+    }
+
+    ProfileFollowInputs in;
+    in.haveGoverning = (idx >= 0);
+    in.governingIndex = idx;
+    in.selectedIndex = st->selProfile;
+    in.editingFocus = ProfilePageEditFocused(st);
+    in.dropdownOpen = ProfilePageDropdownOpen(st);
+    // A modal prompt disables this window - see RunModalLoop - and its own message pump keeps
+    // this window's 1 s timer running behind it. Re-loading the editor under a rename box
+    // would change the profile the name is about to be written to.
+    in.modalUp = (hwnd != nullptr && IsWindowEnabled(hwnd) == FALSE);
+    in.userChoseSelection = st->followPinned;
+
+    if (!ShouldFollowGoverningProfile(in)) return false;
+
+    // EXACTLY WHAT A MANUAL CLICK ON THE LIST DOES, in the same order, so an unsaved edit is
+    // written back into the working config before the new profile is loaded over it. The edit
+    // is not lost; it is where it always was, waiting for Apply.
+    StoreUiToProfile(st);
+    st->selProfile = idx;
+    RefreshProfileList(st);
+    LoadProfileToUi(st);
+    moved = true;
+    return moved;
 }
 
 // The colour of the status dot beside that sentence. Display only, derived from the same
@@ -2576,6 +2996,35 @@ std::wstring MaskParkedWarning(const SettingsState* st, const std::wstring& mask
     return std::wstring();
 }
 
+// THE AMD V-CACHE ROW ON THE PROFILES PAGE. Returns true when the row appeared or
+// disappeared, which is the caller's cue to RE-LAY OUT - it takes no vertical space when it
+// has nothing to say, so its arrival moves everything under it. Its text is a constant, so
+// unlike RefreshAutoPinStatus there is no repaint-only case.
+//
+// TWO LIVE SOURCES, NEITHER OF THEM THE CHECKBOX, and the predicate that combines them is in
+// settings_warning.h with the argument for why it is an OR. st->env is re-probed on this same
+// timer beat by RefreshEnvironmentStatus (one process snapshot, already paid for), and the
+// engine's own flag is read from the published status the watcher rebuilds each tick.
+bool RefreshVCacheActiveWarning(SettingsState* st) {
+    if (!st || !st->hVCacheActive) return false;
+
+    bool engineSaw = false;
+    if (st->engine) engineSaw = st->engine->GetStatus().amdVCacheAgentActive;
+
+    const std::wstring want =
+        ShowAmdVCacheActiveWarning(st->env.amdVCacheAgentRunning, engineSaw)
+            ? AmdVCacheActiveWarningText()
+            : std::wstring();
+
+    if (GetText(st->hVCacheActive) == want) return false;
+    SetWindowTextW(st->hVCacheActive, want.c_str());
+    // Same rule as the parked warnings and the auto-pin line: a Profiles-page control may only
+    // become visible while that page is the one on screen, or it floats over whatever page is.
+    ShowWindow(st->hVCacheActive,
+               (!want.empty() && st->page == PAGE_PROFILES) ? SW_SHOW : SW_HIDE);
+    return true;
+}
+
 // Recomputes both labels. Returns true when either label's text changed, which is the
 // caller's cue to re-run the layout: these rows take no vertical space when empty.
 bool UpdateMaskWarnings(SettingsState* st) {
@@ -2605,19 +3054,17 @@ bool RefreshBlockedLine(SettingsState* st) {
     for (size_t i = 0; i < s.governed.size(); ++i) {
         if (s.governed[i].blocked) names.push_back(s.governed[i].name);
     }
-    std::wstring line;
-    if (names.empty()) {
-        line = L"No processes are currently blocked. Game Optimizer runs unelevated on "
-               L"purpose; anything it cannot touch will be named here rather than skipped "
-               L"silently.";
-    } else {
-        line = L"Blocked (access denied), " + std::to_wstring(names.size()) + L": ";
-        for (size_t i = 0; i < names.size(); ++i) {
-            if (i) line += L", ";
-            line += names[i];
-        }
-        line += L". These are elevated or protected processes; no mask was applied to them.";
-    }
+    // GROUPED AND CAPPED, and extreme game mode is why. This used to paste every blocked
+    // process name into one string, which is a short honest sentence at the handful of
+    // processes rules 2-4 govern and a hundred names in a fixed Dp(52) control once rule 4b
+    // sweeps the whole desktop - i.e. the promise in the empty-case sentence, that anything
+    // this app cannot touch is named here "rather than skipped silently", broken by CLIPPING
+    // while still reading as though it were kept. See FormatBlockedProcessesLine.
+    //
+    // TEN NAMES, and the figure is measured rather than picked: at the minimum client width
+    // this window allows, the line has 806 logical px and three lines of Font::UiSmall to
+    // fill, and the worst case of ten names plus the counts and both sentences wraps to two.
+    std::wstring line = FormatBlockedProcessesLine(names, 10);
     // EngineStatus::staleTopology - the watcher saw an apply refused as an invalid CPU Set
     // Id. It deliberately does not re-detect on its own, so this is the only place the user
     // finds out that the stored ids stopped describing this machine.
@@ -2636,7 +3083,7 @@ bool RefreshBlockedLine(SettingsState* st) {
     return changed;
 }
 
-// Updates the General page's environment card from the already-probed running state and the
+// Updates the Setting page's environment card from the already-probed running state and the
 // current configured Start values. Returns true when either optional explanation appears or
 // disappears, because those are the changes that alter the card's height and require layout.
 bool UpdateEnvironmentSection(SettingsState* st) {
@@ -2781,16 +3228,29 @@ struct TextItem {
     UINT fmt;
 };
 struct DotItem { int x, y, r; COLORREF col; };
+// The Profiles page can now show FOUR at once - the auto-pin state, the AMD V-Cache row and
+// both parked-mask warnings - which is exactly what the old literal 4 allowed. The guard at
+// every call site drops a dot SILENTLY when the array is full, so the next row added to any
+// page would have lost its dot with nothing on screen to say so. Named and given headroom
+// for that reason.
+const int kMaxDots = 6;
 struct PillItem { RECT rc; std::wstring s; COLORREF bg, fg; };
 
 struct Geom {
     // `sidebar` KEEPS ITS NAME and now holds the top tab bar's strip. Nothing paints it - the
     // bar is its own window - so it is geometry the two consumers agree on, nothing more.
     RECT sidebar, content, footer;
+    // The version label's rectangle, bottom-left. EMPTY means "nothing to draw".
+    //
+    // IT IS NOT A `txt` ENTRY, and that is deliberate. `Say` silently drops anything past the
+    // 28th item, and a page is free to use all 28 - a piece of WINDOW CHROME that appears on
+    // every tab must not be able to fall off the end of a per-page array. It gets its own
+    // field and its own draw call, which also keeps it out of every page's `nTxt` budget.
+    RECT version;
     int  nCard;   RECT card[8];
     int  nStat;   RECT stat[3];
     int  nTxt;    TextItem txt[28];
-    int  nDot;    DotItem  dot[4];
+    int  nDot;    DotItem  dot[kMaxDots];
     int  nPill;   PillItem pill[4];
     bool hasGauge;
     RECT gauge;
@@ -2800,6 +3260,7 @@ struct Geom {
         SetRectEmpty(&sidebar);
         SetRectEmpty(&content);
         SetRectEmpty(&footer);
+        SetRectEmpty(&version);
         SetRectEmpty(&gauge);
     }
 };
@@ -3062,6 +3523,33 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hApply,  right - BW,              by, BW, BH);
         Put(st->hCancel, right - 2 * BW - GT,     by, BW, BH);
         Put(st->hOk,     right - 3 * BW - 2 * GT, by, BW, BH);
+
+        // ---- the version, bottom-left ---------------------------------------------------
+        //
+        // IT LIVES IN THE FOOTER ROW, AND THAT IS THE WHOLE OF ITS CLIPPING ARGUMENT.
+        //
+        // The last thing this project shipped near the bottom of this window was a button
+        // sliced flat by the sponsor strip, on a build that was 2136/2136 green with two
+        // vendor code reviews passed - so the placement is argued rather than eyeballed:
+        //
+        //   * the footer is anchored to the client BOTTOM (g.footer.top = ch - footerH) and
+        //     footerH is a constant BH + 2*GAP, so this row exists at every window height,
+        //     including the enforced minimum.
+        //   * the sponsor band is clipped to `avail`, which ENDS at ch - footerH - GAP. Its
+        //     lowest possible pixel is therefore one full GAP above g.footer.top, and this
+        //     label starts a further GAP below that. Nothing can reach it from above.
+        //   * the page content stops at `bottom`, which is at or above the same line.
+        //   * NO HEIGHT IS ADDED. The label occupies part of a row that already exists and
+        //     was already empty on its left-hand side, so neither WM_GETMINMAXINFO's needH
+        //     nor ShowSettings' wantH changes - see the note in wiki\carried-context.md
+        //     about this window being sized twice.
+        //
+        // Horizontally it stops a tight gap short of the OK button and draws with
+        // DT_END_ELLIPSIS, so even an absurd version string can only ever shorten itself.
+        if (!st->versionText.empty()) {
+            const int stop = right - 3 * BW - 2 * GT - GT;
+            if (stop > x0) SetRect(&g.version, x0, by, stop, by + BH);
+        }
     }
 
     if (st->page == PAGE_PROFILES) {
@@ -3118,16 +3606,112 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         // ---- right column: the selected profile ------------------------------
         int ry = y;
         {
-            const int descH = theme::Dp(34, dpi);
+            // EXTREME GAME MODE USED TO COST THREE ROWS, and the record of what they were
+            // measured at is kept because it is what the arithmetic below is checked
+            // against. At this page's narrowest column (467 logical px of text) the fixed
+            // sentence wrapped to three lines of Font::UiSmall = 45 px and the longest live
+            // sentence - every processor parked, a 32-character mask name - wrapped to two
+            // = 30. Dp(48) and Dp(34) were those with a line's slack each.
+            //
+            // THE WINDOW MINIMUM AND THE CREATION HEIGHT ARE DELIBERATELY NOT CHANGED, and
+            // that is a decision rather than the omission this project has already shipped
+            // once. The arithmetic, at 96 dpi and the minimum window size: the card has
+            // 736 px to fill, the worst case before this block needed 398 (fixedR) + 52 (the
+            // list's floor) + 122 (two parked warnings and their gap) = 572, and this block
+            // costs GT + ROW + GT + 48 + GT + 34 = 130. 34 px are left over, so the list
+            // simply gets 130 fewer of the pixels it was absorbing and NOTHING is clipped.
+            // Growing the minimum instead would have cost ~1101 px of window height on a
+            // machine whose work area is 1032, which is a worse bug than the one it prevents.
+            //
+            // AMENDED 2026-09-08, AND THE DECISION ABOVE DID NOT SURVIVE THE NEXT ROW. The
+            // AMD V-Cache row below consumes kGapTight + Dp(34) = 40 of those 34 leftover
+            // px, so this time the minimum and the creation height WERE both grown, by that
+            // same 40, and the leftover is 34 again. The reasoning above is kept because it
+            // is still the right test - measure what is left before spending it - and
+            // because it records that 34 px was the whole budget this row was checked
+            // against. It is not still the outcome.
+            //
+            // AMENDED AGAIN 2026-09-09, AND THIS TIME THE PAGE GOT SHORTER. Three text
+            // blocks left this card: the auto-pin paragraph (descH, Dp 34) and the
+            // extreme-mode sentence (extremeDescH, Dp 48) became hover text on an (i), and
+            // the extreme-mode live parked line (extremeStatusH, Dp 34) was deleted. With
+            // their three kGapTight gaps that is 134 device px at 96 dpi off fixedR, so the
+            // worst case now spends 608 of the card's 776 and THE SLACK IS 168 PX, not 34.
+            // Nothing is clipped and nothing can be: the heavy list is the sink for slack.
+            //
+            // 🔴 AND NEITHER WM_GETMINMAXINFO's needH NOR ShowSettings' wantH MOVES, WHICH
+            // IS A DECISION AND NOT THE OMISSION THIS PROJECT HAS SHIPPED ONCE. The rule
+            // that caught that defect is "content grew, so both sizers must learn it"; the
+            // hazard is a window too SHORT. Here content shrank, so no sizer can be too
+            // short, and handing those 134 px back would be actively wrong for two measured
+            // reasons:
+            //   [M] THE PROFILES PAGE IS NO LONGER THE TALLEST PAGE. At 96 dpi and the
+            //       minimum client width the Setting page's four cards need about 750 px of
+            //       content against this page's new 620, and needH is currently about 14 px
+            //       above what the Setting page requires. Cutting 134 would clip the
+            //       interrupt card's button behind the sponsor band - the exact defect of
+            //       2026-09-08, reintroduced from the other side.
+            //   [M] wantH IS ONLY ~28 px ABOVE needH BY CONSTRUCTION ("the default should
+            //       clear the minimum rather than open ON it"). Cutting it by 134 would put
+            //       the request below the floor, where it is silently clamped and the
+            //       deliberate clearance is gone.
+            // Both figures therefore carry a comment saying they were re-examined and left
+            // alone. Left alone WITHOUT that note is what the rule is really guarding
+            // against.
             // The live status line. Two lines of UiSmall at the narrowest column this page
             // allows, because the longest sentence names an executable and a mask name.
             const int statusH = theme::Dp(34, dpi);
+            // THE AMD V-CACHE ROW COSTS HEIGHT ONLY WHILE IT IS UP, unlike the three rows
+            // above it. Reserving it unconditionally would open a permanent blank band
+            // between the auto-pin sentence and the extreme-mode checkbox on every machine
+            // with no AMD optimizer on it - the majority - to hold a row they will never see.
+            // The parked-mask warnings below already work this way, and the card's total
+            // height does not move either way: the heavy list absorbs the difference.
+            //
+            // Dp(34) IS THE SAME NUMBER ITS TWO SIBLINGS USE AND IT IS MEASURED, not copied.
+            // [M] 2026-09-08, DrawTextW(DT_CALCRECT | DT_WORDBREAK) against Font::UiSmall at
+            // 96 dpi: this row's text width at the minimum window size is
+            // iw - indent - Dp(18) = 487 - 20 - 18 = 449 px, and the sentence wraps there to
+            // exactly 30 px - two lines of a 15 px face. The same probe reproduced the two
+            // figures already recorded above (extremeDescH 45, extremeStatusH 30) from the
+            // same font, which is the positive control that says the measurement is real.
+            // Dp(34) is that 30 with a margin, and unlike its siblings this sentence
+            // INTERPOLATES NOTHING, so 30 is a constant rather than a worst case.
+            const int vcacheStatusH = theme::Dp(34, dpi);
+            const bool showVCacheRow =
+                st->hVCacheActive != nullptr && GetWindowTextLengthW(st->hVCacheActive) > 0;
+            // THE EXTREME-MODE SWEEP LINE, and it costs height only while it has something
+            // to say - the same terms as the AMD V-Cache row above, and for the same reason:
+            // a profile with extreme mode switched off, or whose game is not the one being
+            // governed, would otherwise pay a permanent blank band for a row it never shows.
+            //
+            // Dp(48) IS THREE LINES OF Font::UiSmall AT 96 DPI, AND IT IS THE BUDGET THE
+            // FORMATTER'S CHARACTER CAP WAS DERIVED FROM - see kExtremeListChars, which
+            // computes 114 characters of list from this row's 449 px text width at the
+            // minimum window size. Its two siblings use Dp(34) for two lines; this sentence
+            // carries a list rather than a fixed clause, so it gets one line more and a cap
+            // that keeps it inside it. Every other row on this page reserves height for a
+            // sentence and then hopes; this one reserves height and then TRUNCATES TO FIT,
+            // which is the difference between a promise and a clipped promise.
+            const int extremeStatusH = theme::Dp(48, dpi);
+            const bool showExtremeRow =
+                st->hExtremeStatus != nullptr &&
+                GetWindowTextLengthW(st->hExtremeStatus) > 0;
             const int minHeavy = theme::Dp(52, dpi);
             // header, enabled, game, game mask, heavy label, [heavy], heavy mask,
-            // auto-pin, description, percent row, status row.
+            // auto-pin, percent row, status row, [V-Cache row], extreme mode,
+            // [extreme sweep row].
             const int fixedR = 2 * PAD + HH + GT + ROW + GT + ROW + GT + ROW + GT +
-                               ROW + GT + GT + ROW + GT + GT + ROW + GT + descH + GT + ROW +
-                               GT + statusH;
+                               ROW + GT + GT + ROW + GT + GT + ROW + GT + ROW +
+                               GT + statusH +
+                               // the AMD V-Cache row, only while it is up
+                               (showVCacheRow ? GT + vcacheStatusH : 0) +
+                               // extreme game mode: separator and check box. Its sentence is
+                               // hover text on an (i) now and its live parked line is
+                               // deleted, so neither reserves a row here any more - but the
+                               // SWEEP READOUT below the box does, while it is up.
+                               GT + ROW +
+                               (showExtremeRow ? GT + extremeStatusH : 0);
             int heavyH = minHeavy;
             int slack = bottom - ry - fixedR - minHeavy -
                         (warnRows > 0 ? warnCardH + GAP : 0);
@@ -3202,11 +3786,25 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
 
             // ---- the auto-pin rule, which is PER PROFILE and so lives here now ----
             iy += GT;
-            Put(st->hAutoPin, ix, iy, iw, ROW);
+            {
+                // THE CHECK BOX IS SIZED TO ITS OWN CONTENT so the (i) lands immediately
+                // after the caption, which is where the operator asked for it. It used to
+                // take the full column width, which put the only place the icon could go at
+                // the far right of the card - visually attached to nothing.
+                //
+                // Shrinking the control also shrinks its CLICK TARGET to the box plus the
+                // words, which is the behaviour a user expects from a check box and not a
+                // regression: clicking 200 px of empty card to the right of a label and
+                // having a setting change is the surprising version.
+                const int side = InfoIconSide(dpi);
+                const int lead = theme::Dp(4, dpi);
+                const int capW =
+                    CheckBoxContentWidth(st->hAutoPin, measureDc, dpi, iw - side - lead);
+                Put(st->hAutoPin, ix, iy, capW, ROW);
+                Put(st->hAutoInfo, ix + capW + lead, iy + (ROW - side) / 2, side, side);
+            }
             iy += ROW + GT;
             const int indent = theme::Dp(20, dpi);
-            Put(st->hAutoDesc, ix + indent, iy, iw - indent, descH);
-            iy += descH + GT;
             {
                 int x = ix + indent;
                 const int w1 = theme::Dp(120, dpi), w2 = theme::Dp(58, dpi);
@@ -3226,17 +3824,69 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
             // The two preconditions in ComputeDesired rule 4 are invisible from this window
             // otherwise, and a user who cannot see them reasonably concludes the feature is
             // broken. The dot is drawn by the parent, exactly like the blocked-processes dot
-            // on the General page, so its colour comes from the cached state rather than from
+            // on the Setting page, so its colour comes from the cached state rather than from
             // a second evaluation of the rule.
             {
                 const int dotR = theme::Dp(4, dpi);
                 const int sx = ix + indent;
                 DotItem d = { sx + dotR, iy + theme::Dp(9, dpi), dotR, AutoPinDotColour(st) };
-                if (g.nDot < 4) g.dot[g.nDot++] = d;
+                if (g.nDot < kMaxDots) g.dot[g.nDot++] = d;
                 const int tx = sx + theme::Dp(18, dpi);
                 int tw = ix + iw - tx;
                 if (tw < 0) tw = 0;
                 Put(st->hAutoStatus, tx, iy, tw, statusH);
+            }
+            iy += statusH + GT;
+
+            // ---- AMD's V-Cache optimizer is running RIGHT NOW ----------------------------
+            // A SIBLING of the line above, not a replacement: that one says why this profile's
+            // rule is or is not firing, this one says something else is steering the machine.
+            // Same indent, same dot geometry, same text width, so the two read as one status
+            // area rather than as two unrelated designs. Warn-coloured - it is the same class
+            // of fact as a parked mask, and it uses the palette's warn rather than a new
+            // colour invented for it.
+            if (showVCacheRow) {
+                const int dotR = theme::Dp(4, dpi);
+                const int sx = ix + indent;
+                DotItem d = { sx + dotR, iy + theme::Dp(9, dpi), dotR, pal.warn };
+                if (g.nDot < kMaxDots) g.dot[g.nDot++] = d;
+                const int tx = sx + theme::Dp(18, dpi);
+                int tw = ix + iw - tx;
+                if (tw < 0) tw = 0;
+                Put(st->hVCacheActive, tx, iy, tw, vcacheStatusH);
+                iy += vcacheStatusH + GT;
+            }
+
+            // ---- extreme game mode, the other PER-PROFILE rule, so it lives here too ----
+            // ONE ROW NOW: check box plus its (i). The sentence under it is hover text and
+            // the live parked line beneath that is deleted - see the block above fixedR for
+            // what those 134 px were spent on instead.
+            {
+                const int side = InfoIconSide(dpi);
+                const int lead = theme::Dp(4, dpi);
+                const int capW =
+                    CheckBoxContentWidth(st->hExtreme, measureDc, dpi, iw - side - lead);
+                Put(st->hExtreme, ix, iy, capW, ROW);
+                Put(st->hExtremeInfo, ix + capW + lead, iy + (ROW - side) / 2, side, side);
+            }
+            iy += ROW;
+
+            // ---- what the sweep actually moved -------------------------------------------
+            // Under the check box it belongs to, at the SAME indent, dot geometry and text
+            // width as the auto-pin sentence higher up the card, so the two readouts read as
+            // one status area rather than as two designs. good-coloured: it reports a rule
+            // doing its job, which is the same class of fact the auto-pin dot calls good.
+            if (showExtremeRow) {
+                iy += GT;
+                const int dotR = theme::Dp(4, dpi);
+                const int sx = ix + indent;
+                DotItem d = { sx + dotR, iy + theme::Dp(9, dpi), dotR, pal.good };
+                if (g.nDot < kMaxDots) g.dot[g.nDot++] = d;
+                const int tx = sx + theme::Dp(18, dpi);
+                int tw = ix + iw - tx;
+                if (tw < 0) tw = 0;
+                Put(st->hExtremeStatus, tx, iy, tw, extremeStatusH);
+                iy += extremeStatusH;
             }
             ry = c.bottom + GAP;
         }
@@ -3251,13 +3901,13 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
             int wy = wc.top + PAD;
             if (warnGame) {
                 DotItem d = { wc.left + PAD + dotR, wy + theme::Dp(9, dpi), dotR, pal.warn };
-                if (g.nDot < 4) g.dot[g.nDot++] = d;
+                if (g.nDot < kMaxDots) g.dot[g.nDot++] = d;
                 Put(st->hGameMaskWarn, tx, wy, warning.textW, warning.gameH);
                 wy += warning.gameH + GT;
             }
             if (warnHeavy) {
                 DotItem d = { wc.left + PAD + dotR, wy + theme::Dp(9, dpi), dotR, pal.warn };
-                if (g.nDot < 4) g.dot[g.nDot++] = d;
+                if (g.nDot < kMaxDots) g.dot[g.nDot++] = d;
                 Put(st->hHeavyMaskWarn, tx, wy, warning.textW, warning.heavyH);
             }
             ry = wc.bottom + GAP;
@@ -3457,10 +4107,26 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
             const COLORREF dc = st->blockedBad ? pal.danger
                                                : (st->blockedTall ? pal.warn : pal.good);
             DotItem d = { ix + dotR, iy + theme::Dp(9, dpi), dotR, dc };
-            if (g.nDot < 4) g.dot[g.nDot++] = d;
+            if (g.nDot < kMaxDots) g.dot[g.nDot++] = d;
         }
         Put(st->hBlocked, ix + theme::Dp(18, dpi), iy, iw - theme::Dp(18, dpi), blockedH);
         y = c2.bottom + GAP;
+
+        // The interrupt-and-DPC readout. ONE CARD, on this existing page - the page uses 3 of
+        // 8 Geom cards, 2 of 28 Say() items and 1 of 4 dots before this, so a fourth card fits
+        // with room to spare and nothing here needs a new page.
+        iw = W - 2 * PAD;
+        const int irqLineH =
+            MeasureWrappedStaticHeight(st->hIrqLine, measureDc, iw, dpi);
+        RECT c3 = AddCard(y, 2 * PAD + HH + GT + irqLineH + GT + BH, x0, W);
+        ix = c3.left + PAD; iy = c3.top + PAD;
+        Say(ix, iy, ix + iw, iy + HH, cd::IrqCardHeadingText(),
+            theme::Font::UiHeading, pal.textPrimary, kL);
+        iy += HH + GT;
+        Put(st->hIrqLine, ix, iy, iw, irqLineH);
+        iy += irqLineH + GT;
+        Put(st->hIrqOpen, ix, iy, theme::Dp(190, dpi), BH);
+        y = c3.bottom + GAP;
     }
     (void)y;
 }
@@ -3496,6 +4162,28 @@ void PaintSettings(SettingsState* st, HWND hwnd, HDC dc) {
     if (g.hasGauge)
         theme::DrawRingGauge(dc, g.gauge, g.pct, dpi, pal.accent, pal.cardBgAlt,
                              g.gaugeCentre, g.gaugeUnit);
+
+    // The version, last and on its own. UiSmall on purpose: it is a fact about the build, not
+    // a thing the user acts on, and the palette entry keeps it theme-aware with everything
+    // else rather than freezing a colour here.
+    //
+    // textSecondary, NOT textDim, and the difference was MEASURED rather than judged by eye.
+    // [M] 2026-09-09, sampled off a PrintWindow capture: textDim RGB(0x5D,0x66,0x75) on the
+    // window ground RGB(15,17,21) is a contrast ratio of 3.26:1 - under WCAG AA's 4.5:1 for
+    // body text, and identical to the colour this app uses for DISABLED text, so the version
+    // read as greyed-out rather than merely incidental. textSecondary RGB(0x8A,0x93,0xA3)
+    // measures 5.91:1 against the same ground, which is what every other ordinary label on
+    // this page already uses.
+    //
+    // The point of putting a version on screen is that the operator can READ it. Three vision
+    // seats all called the old colour "fully visible" and none of them checked legibility;
+    // the number is what caught it.
+    if (!IsRectEmpty(&g.version) && !st->versionText.empty()) {
+        theme::DrawText(dc, g.version, st->versionText, theme::Font::UiSmall, dpi,
+                        pal.textSecondary,
+                        DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX |
+                            DT_END_ELLIPSIS);
+    }
 }
 
 // Re-frames every combo that is on the current page. Called from the parent's WM_PAINT,
@@ -3581,6 +4269,38 @@ BOOL DrawProfileItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
     if (data >= 0 && static_cast<size_t>(data) < st->work.profiles.size())
         p = &st->work.profiles[static_cast<size_t>(data)];
 
+    // WHICH PROFILE THE ENGINE IS ACTUALLY GOVERNING, marked in the list itself.
+    //
+    // Operator request: the panel should follow the game in front. It does now - but only
+    // while the follow rule allows it, and the operator may have deliberately clicked another
+    // profile to look at it. This tag is what keeps the answer visible in that state, and it
+    // is the reason the follow can be suppressed without the feature disappearing.
+    //
+    // DRAWN FIRST, so it takes the rightmost slot and the ALL tag - which a governing All
+    // Games profile also carries - sits to its left rather than fighting it for the same
+    // pixels. `good` rather than `accent`: accent is this window's "selected / chosen by the
+    // app" colour and would read as a second selection bar on a row that may not be selected
+    // at all.
+    if (p && st->governingProfile >= 0 &&
+        data == static_cast<LRESULT>(st->governingProfile)) {
+        // MEASURED, NOT A CONSTANT. [M] Dp(40) - one more than the ALL tag beside it - drew
+        // "NO..." on the reference machine: "NOW" is a wider word than "ALL" in this face and
+        // a fixed width cannot know that. The AUTO pill in the heavy list already measures;
+        // this is the same expression, so the two tags cannot drift into different sizes.
+        // DrawPill consumes Dp(8) per side, and Dp(20) covers that Dp(16) plus slack.
+        const int pw =
+            theme::MeasureText(di->hDC, L"NOW", theme::Font::UiSmall, dpi).cx +
+            theme::Dp(20, dpi);
+        const int ph = theme::Dp(15, dpi);
+        const int mid = (di->rcItem.top + di->rcItem.bottom) / 2;
+        RECT pill;
+        SetRect(&pill, t.right - pw, mid - ph / 2, t.right, mid - ph / 2 + ph);
+        if (pill.left > t.left) {
+            theme::DrawPill(di->hDC, pill, L"NOW", dpi, pal.good, pal.textOnAccent);
+            t.right = pill.left - theme::Dp(6, dpi);
+        }
+    }
+
     // The All Games profile matches ANY game rather than one executable, so it must not read
     // as just another row in the list. A small accent tag on the right says so at a glance.
     if (p && p->isAllGames) {
@@ -3646,7 +4366,14 @@ BOOL DrawHeavyItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
     // and an empty meter beside a caption reads as "that process is idle".
     if (origin == kHeavyRowMore) {
         if (t.right > t.left && !name.empty()) {
-            theme::DrawText(di->hDC, t, name, theme::Font::UiSmall, dpi, pal.textDim,
+            // textSecondary, NOT textDim, AND THAT IS A FIX RATHER THAN A STYLE CHOICE. This
+            // caption is the honest half of the display cap - "+83 more swept by extreme
+            // mode" is the only thing on screen saying the list is not the whole list - so it
+            // is text the operator must READ. [M] textDim measures 3.26:1 on this ground,
+            // under WCAG AA's 4.5, and is the colour this app uses for DISABLED controls;
+            // textSecondary measures 5.91:1. The row is still visibly quieter than a process
+            // row: it carries no meter, no readback and no percentage.
+            theme::DrawText(di->hDC, t, name, theme::Font::UiSmall, dpi, pal.textSecondary,
                             DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX |
                                 DT_END_ELLIPSIS);
         }
@@ -3794,6 +4521,31 @@ BOOL DrawHeavyItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
         }
     }
 
+    // EXTREME GAME MODE'S OWN TAG, and it is a different claim from AUTO. AUTO means "this
+    // app measured this process over your threshold and moved it"; SWEPT means "extreme game
+    // mode took everything that was not the game, and this was one of them". A user who reads
+    // the second as the first would conclude their threshold is far too low.
+    //
+    // warn-coloured rather than accent, for the same reason the two tags are separate words:
+    // the accent pill is this window's idiom for "the app chose this one on purpose", and a
+    // blanket sweep chose nothing about this row in particular. It is drawn in the same place
+    // and the same shape as AUTO so the column still lines up.
+    if (origin == kHeavyRowExtreme) {
+        const std::wstring pillText = L"SWEPT";
+        const SIZE pillTextSize =
+            theme::MeasureText(di->hDC, pillText, theme::Font::UiSmall, dpi);
+        const int pw = pillTextSize.cx + theme::Dp(20, dpi);
+        const int ph = theme::Dp(15, dpi);
+        const int mid2 = (di->rcItem.top + di->rcItem.bottom) / 2;
+        RECT pill;
+        SetRect(&pill, t.right - pw, mid2 - ph / 2, t.right, mid2 - ph / 2 + ph);
+        if (pill.left > t.left + theme::Dp(56, dpi)) {
+            theme::DrawPill(di->hDC, pill, pillText, dpi, pal.warn, pal.textOnAccent);
+            t.right = pill.left - theme::Dp(6, dpi);
+            if (t.right < t.left) t.right = t.left;
+        }
+    }
+
     if (t.right > t.left && !name.empty()) {
         theme::DrawText(di->hDC, t, name, theme::Font::MonoBody, dpi,
                         running ? pal.textPrimary : pal.textDim,
@@ -3801,6 +4553,190 @@ BOOL DrawHeavyItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
                             DT_END_ELLIPSIS);
     }
     return TRUE;
+}
+
+// ---------------------------------------------------------------------------
+// The (i) icons and the one tooltip control behind them
+//
+// Operator request, 2026-09-09: the two explanatory paragraphs on the Profiles page became
+// hover text on a small circled "i" beside each check box. NOTHING ELSE MOVED - the live
+// status lines and the AMD V-Cache warning row are still on the page, because a warning
+// behind an icon is a warning that does not work.
+//
+// IT IS THE OS TOOLTIP AND IT IS ENTIRELY EVENT-DRIVEN. TTF_SUBCLASS makes the tooltip
+// control subclass each icon and relay that icon's own mouse messages, so there is no timer,
+// no polling and no per-frame cost; the show and hide delays are the user's own settings.
+// ---------------------------------------------------------------------------
+
+// The icon's side, in device pixels. ONE number, read by the layout and by the painter, so
+// the rectangle the tooltip is anchored to and the circle drawn inside it cannot disagree.
+int InfoIconSide(int dpi) { return theme::Dp(14, dpi); }
+
+// Where a check box's own content ENDS, so the (i) can sit immediately after the caption
+// rather than at the far edge of the card. The operator asked for "beside the label", and a
+// full-width check box has no idea where its label stops.
+//
+// THE TWO CONSTANTS ARE A LOCAL COPY OF theme::DrawCheckBox's GEOMETRY - a Dp(15) box then a
+// Dp(8) gap before the caption - for the same reason DrawCpuMeterDim keeps a local copy of
+// the meter's: it is a measurement of a drawing routine, not an interface, and widening
+// theme.h for two integers costs more than it saves. If that box or gap ever moves, the icon
+// drifts by those pixels and nothing else breaks.
+//
+// [M] 2026-09-09, both captions on this page measured against Font::UiBody at 96/120/144/
+// 168/192 dpi and at the MINIMUM window width, where the right column's inner width is 487
+// device px at 96 dpi: the wider caption ("Extreme game mode - move every other process to
+// the background mask") plus the icon needs 426 px and has 61 px to spare, and that margin
+// GROWS with DPI. So the icon does not push either caption into an ellipsis at any size this
+// window can be dragged to; maxW is the guard for a case that is not shipped, and for the
+// null-DC path where nothing can be measured at all.
+int CheckBoxContentWidth(HWND box, HDC dc, int dpi, int maxW) {
+    if (maxW < 0) maxW = 0;
+    if (!box || !dc) return maxW;
+    const SIZE sz = theme::MeasureText(dc, GetText(box), theme::Font::UiBody, dpi);
+    int w = theme::Dp(15, dpi) + theme::Dp(8, dpi) + static_cast<int>(sz.cx) +
+            theme::Dp(2, dpi);
+    if (w > maxW) w = maxW;
+    return w;
+}
+
+// Dp-scaled and palette-coloured like every other mark on this page. The glyph is STROKED
+// rather than typed: a font would have to be chosen, measured and centred inside a 14dp
+// circle, and at 96 dpi there is no point size at which a real "i" is both legible and
+// inside it. Two filled rectangles are exact at every DPI.
+//
+// 🔴 IT DIMS WITH ITS CHECK BOX BUT IS NEVER DISABLED, AND THAT IS A DELIBERATE READING OF
+// "grey out the auto-pin group". Two of the five controls in that group - hPctLbl and
+// hAutoStatus - already cannot be disabled here: a disabled STATIC paints its caption twice
+// and embosses on a dark card (see SyncAutoPinEnable), so "disabled" on this page has always
+// meant "left enabled and dimmed by the painter". The icon takes the same route for a
+// stronger reason: WINDOWS DOES NOT DELIVER MOUSE MESSAGES TO A DISABLED CONTROL, so
+// EnableWindow(FALSE) here would kill the tooltip - the icon's only function - and leave a
+// grey circle that does nothing at all. Dim and hoverable says "this rule is inert" and
+// still answers "what is this rule?", which is exactly what a user greys-out-first asks.
+//
+// The state comes from the OWNER check box rather than from a second copy of the rule, so
+// the icon cannot drift out of step with the control it belongs to.
+void DrawInfoIcon(const SettingsState* st, const DRAWITEMSTRUCT* di) {
+    if (!st || !di || !di->hDC) return;
+    const RECT rc = di->rcItem;
+    const int w = rc.right - rc.left;
+    const int h = rc.bottom - rc.top;
+    const int side = w < h ? w : h;
+    if (side <= 3) return;
+    const theme::Palette& pal = theme::P();
+    const int dpi = st->dpi;
+
+    // The icon sits ON a card, and GDI cannot sample what is behind a child window, so the
+    // surface is named rather than guessed - exactly as theme::DrawCheckBox leaves to its
+    // caller. cardBrush is the same brush WM_CTLCOLORSTATIC hands every other static here.
+    if (st->cardBrush) {
+        RECT all = rc;
+        FillRect(di->hDC, &all, st->cardBrush);
+    }
+
+    HWND owner = nullptr;
+    if (di->hwndItem == st->hAutoInfo)         owner = st->hAutoPin;
+    else if (di->hwndItem == st->hExtremeInfo) owner = st->hExtreme;
+    const bool on = owner != nullptr && IsWindowEnabled(owner) != FALSE;
+    const COLORREF ink = on ? pal.textSecondary : pal.textDim;
+
+    RECT circle;
+    circle.left   = rc.left;
+    circle.top    = rc.top + (h - side) / 2;
+    circle.right  = circle.left + side;
+    circle.bottom = circle.top + side;
+
+    int stroke = theme::Dp(1, dpi);
+    if (stroke < 1) stroke = 1;
+    HPEN pen = CreatePen(PS_SOLID, stroke, ink);
+    if (pen) {
+        HGDIOBJ oldPen = SelectObject(di->hDC, pen);
+        HGDIOBJ oldBrush = SelectObject(di->hDC, GetStockObject(NULL_BRUSH));
+        Ellipse(di->hDC, circle.left, circle.top, circle.right, circle.bottom);
+        SelectObject(di->hDC, oldBrush);
+        SelectObject(di->hDC, oldPen);
+        DeleteObject(pen);
+    }
+
+    // The dot and the stem, as fractions of the circle so they scale WITH it rather than
+    // with a second set of Dp() constants that could drift away from InfoIconSide.
+    HBRUSH mark = CreateSolidBrush(ink);
+    if (mark) {
+        int mw = side * 2 / 14;
+        if (mw < 1) mw = 1;
+        const int cx = circle.left + side / 2;
+        RECT dot;
+        dot.left   = cx - mw / 2;
+        dot.right  = dot.left + mw;
+        dot.top    = circle.top + side * 3 / 14;
+        dot.bottom = dot.top + mw;
+        FillRect(di->hDC, &dot, mark);
+        RECT stem;
+        stem.left   = dot.left;
+        stem.right  = dot.right;
+        stem.top    = circle.top + side * 6 / 14;
+        stem.bottom = circle.top + side * 11 / 14;
+        if (stem.bottom <= stem.top) stem.bottom = stem.top + 1;
+        FillRect(di->hDC, &stem, mark);
+        DeleteObject(mark);
+    }
+}
+
+// The two things about the tooltip that are DPI-dependent, in one place so WM_DPICHANGED and
+// creation share it rather than each carrying its own copy.
+void SyncInfoTipMetrics(SettingsState* st) {
+    if (!st || !st->hTip) return;
+    // WITHOUT THIS THE TIP IS ONE LINE, however long the sentence is: a ribbon of text
+    // running off the side of the window. TTM_SETMAXTIPWIDTH is what turns wrapping ON at
+    // all - it is not merely a cap on a tooltip that would otherwise wrap.
+    SendMessageW(st->hTip, TTM_SETMAXTIPWIDTH, 0,
+                 static_cast<LPARAM>(theme::Dp(320, st->dpi)));
+    SendMessageW(st->hTip, WM_SETFONT,
+                 reinterpret_cast<WPARAM>(theme::GetFont(theme::Font::UiSmall, st->dpi)),
+                 TRUE);
+}
+
+// One tooltip control for the window, two tools on it. Called once, from WM_CREATE, after
+// the icons exist.
+//
+// A FAILURE HERE IS DEGRADED, NEVER BROKEN: no tip means the icons are silent, and every
+// control on the page still works. Nothing else in this file depends on st->hTip.
+void CreateInfoTips(SettingsState* st, HWND hwnd) {
+    if (!st || st->hTip) return;
+    st->hTip = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, nullptr,
+                               WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+                               CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+                               hwnd, nullptr,
+                               reinterpret_cast<HINSTANCE>(
+                                   GetWindowLongPtrW(hwnd, GWLP_HINSTANCE)),
+                               nullptr);
+    if (!st->hTip) return;
+
+    // STATIC STORAGE, DELIBERATELY. TTTOOLINFOW::lpszText is a POINTER the tooltip control
+    // keeps; handing it the c_str() of a temporary std::wstring leaves it reading freed
+    // memory the first time the user hovers. These two are constants, so one copy each for
+    // the life of the process is the whole cost.
+    static const std::wstring kAutoTip = AutoPinInfoTipText();
+    static const std::wstring kExtremeTip = ExtremeModeInfoTipText();
+
+    HWND ctl[2] = { st->hAutoInfo, st->hExtremeInfo };
+    const std::wstring* text[2] = { &kAutoTip, &kExtremeTip };
+    for (int i = 0; i < 2; ++i) {
+        if (!ctl[i]) continue;
+        TTTOOLINFOW ti;
+        ZeroMemory(&ti, sizeof(ti));
+        ti.cbSize = sizeof(ti);
+        // TTF_IDISHWND, not a rectangle: the tool IS the icon window, so the tip follows it
+        // through every relayout with no TTM_NEWTOOLRECT to keep in step, and it goes quiet
+        // by itself when ApplyPageVisibility hides the icon with its page. A rect tool would
+        // still fire over whatever page happened to be showing at those coordinates.
+        ti.uFlags = TTF_IDISHWND | TTF_SUBCLASS;
+        ti.hwnd = hwnd;
+        ti.uId = reinterpret_cast<UINT_PTR>(ctl[i]);
+        ti.lpszText = const_cast<wchar_t*>(text[i]->c_str());
+        SendMessageW(st->hTip, TTM_ADDTOOLW, 0, reinterpret_cast<LPARAM>(&ti));
+    }
+    SyncInfoTipMetrics(st);
 }
 
 // The controls that belong to one page. nullptr entries are skipped by the caller, so a
@@ -3815,15 +4751,17 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
                         st->hGameMaskLbl, st->hGameMask, st->hGameMaskWarn, st->hHeavyLbl,
                         st->hHeavy, st->hHeavyPick, st->hHeavyAdd, st->hHeavyRem,
                         st->hHeavyMaskLbl, st->hHeavyMask, st->hHeavyMaskWarn,
-                        st->hAutoPin, st->hAutoDesc, st->hPctLbl, st->hPct,
-                        st->hAutoStatus };
+                        st->hAutoPin, st->hAutoInfo, st->hPctLbl, st->hPct,
+                        st->hAutoStatus, st->hVCacheActive,
+                        st->hExtreme, st->hExtremeInfo, st->hExtremeStatus };
     HWND coremap[]  = { st->hMapHdr, st->hTopoText, st->hMapMaskLbl, st->hMapMask,
                         st->hMapReset, st->hMapAdd, st->hMapRemove, st->hMap, st->hMapFail };
     HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify,
                         st->hVCacheManage, st->hVCacheWarn, st->hPollLbl, st->hPoll,
                         st->hGameModeStatus, st->hVCacheStatus, st->hVCacheRestoreHint,
                         st->hVCacheEffect,
-                        st->hBlocked, st->hInspect };
+                        st->hBlocked, st->hInspect,
+                        st->hIrqLine, st->hIrqOpen };
 
     const HWND* src = nullptr;
     int count = 0;
@@ -3848,7 +4786,9 @@ void ApplyPageVisibility(SettingsState* st) {
             // The two parked warnings and the auto-pin status line take part in the page's
             // visibility, but only when they actually have something to say.
             if (h == st->hGameMaskWarn || h == st->hHeavyMaskWarn ||
-                h == st->hAutoStatus || h == st->hVCacheEffect ||
+                h == st->hAutoStatus || h == st->hVCacheActive ||
+                h == st->hExtremeStatus ||
+                h == st->hVCacheEffect ||
                 h == st->hVCacheRestoreHint)
                 show = on && GetWindowTextLengthW(h) > 0;
             ShowWindow(h, show ? SW_SHOW : SW_HIDE);
@@ -3876,12 +4816,21 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
     for (HWND h : heads)
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(head), TRUE);
 
+    // EnumChildWindows above sets the body font on every child, so a control left out of
+    // this list silently gets the taller one - which is a CLIPPED control rather than a
+    // style preference wherever the layout reserved a measured height.
+    //
+    // THE TWO EXTREME-MODE LINES USED TO BE THE WORKED EXAMPLE OF THAT and are no longer
+    // in this list: the fixed sentence is now hover text on hExtremeInfo and the live
+    // parked line is deleted. The tooltip takes its font from SyncInfoTipMetrics below,
+    // not from EnumChildWindows - it is an owned popup, not a child.
     HWND smalls[] = { st->hGameLbl, st->hGameMaskLbl, st->hHeavyLbl, st->hHeavyMaskLbl,
-                      st->hGameMaskWarn, st->hHeavyMaskWarn, st->hAutoDesc, st->hPctLbl,
-                      st->hAutoStatus, st->hTopoText, st->hMapMaskLbl,
+                      st->hGameMaskWarn, st->hHeavyMaskWarn, st->hPctLbl,
+                      st->hAutoStatus, st->hVCacheActive, st->hExtremeStatus,
+                      st->hTopoText, st->hMapMaskLbl,
                       st->hPollLbl, st->hVCacheRestoreHint,
                       st->hVCacheEffect,
-                      st->hBlocked, st->hMapFail };
+                      st->hBlocked, st->hMapFail, st->hIrqLine };
     for (HWND h : smalls)
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(small), TRUE);
 
@@ -3895,6 +4844,12 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
     HWND lists[] = { st->hProfList, st->hHeavy };
     for (HWND h : lists)
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(monoSmall), TRUE);
+
+    // The tooltip is an OWNED POPUP, so EnumChildWindows never reaches it and it would
+    // keep the system font and the old wrap width across a DPI change. This is the one
+    // call site both WM_CREATE and WM_DPICHANGED already share. No-op before the tip
+    // exists, which is the state on the first call of all.
+    SyncInfoTipMetrics(st);
 }
 
 void SwitchPage(SettingsState* st, HWND hwnd, int page) {
@@ -4327,6 +5282,11 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             st->cardBrush = CreateSolidBrush(theme::P().cardBg);
             st->inputBrush = CreateSolidBrush(theme::P().inputBg);
 
+            // Read ONCE, here, and never again: a module's version resource cannot change
+            // while the process is alive, and the alternative is a file read on the repaint
+            // path. An empty result means the bottom-left label is simply not drawn.
+            st->versionText = ReadOwnVersionLabel();
+
             // The tab bar across the TOP - operator decision, menu on top, no side panel.
             // Same contract as the rail it replaced apart from the notification code, so the
             // page switching below is unchanged.
@@ -4337,7 +5297,14 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             if (st->hNav) {
                 theme::TabBarAddItem(st->hNav, IDC_NAV_PROFILES, L"Profiles");
                 theme::TabBarAddItem(st->hNav, IDC_NAV_COREMAP, L"Core map");
-                theme::TabBarAddItem(st->hNav, IDC_NAV_GENERAL, L"General");
+                // THE LABEL IS "Setting", THE IDENTIFIER IS STILL IDC_NAV_GENERAL, and the
+                // split is deliberate. Operator instruction 2026-09-08 renamed the tab; the
+                // ids, PAGE_GENERAL and the IDC_NAV range checks below are load-bearing
+                // wiring that no user ever reads, and renaming them would touch five call
+                // sites to change nothing on screen. Every USER-FACING "General" moved with
+                // this one - the fallback button row below, the page's own heading, and the
+                // extreme-mode sentence that sends the user there.
+                theme::TabBarAddItem(st->hNav, IDC_NAV_GENERAL, L"Setting");
                 theme::TabBarSetSelected(st->hNav, IDC_NAV_PROFILES);
             } else {
                 // Read GetLastError before anything else can overwrite it. Without a
@@ -4346,7 +5313,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 const DWORD gle = GetLastError();
                 LogLine(L"[settings] the tab bar could not be created "
                         L"(class %s), gle=%lu", theme::kTabBarClass, gle);
-                const wchar_t* names[PAGE_COUNT] = { L"Profiles", L"Core map", L"General" };
+                const wchar_t* names[PAGE_COUNT] = { L"Profiles", L"Core map", L"Setting" };
                 for (int i = 0; i < PAGE_COUNT; ++i) {
                     st->hNavBtn[i] = Mk(hwnd, L"BUTTON", names[i],
                                         BS_OWNERDRAW | WS_TABSTOP, IDC_NAV_PROFILES + i);
@@ -4428,19 +5395,16 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
             st->hAutoPin = Mk(hwnd, L"BUTTON", L"Auto-pin busy background processes",
                               BS_AUTOCHECKBOX | WS_TABSTOP, IDC_AUTOPIN);
-            // The sentence no longer mentions a seconds figure, because there is no longer a
-            // seconds field for the user to set. The debounce still exists - it is fixed at
-            // kAutoPinDebounceTicks and is not a setting - so the wording does not promise
-            // that the rule fires on a single sample either.
-            // The legend for the AUTO tag lives HERE rather than in the list's caption or in
-            // a fourth static, and the sentence was tightened to pay for it in the same two
-            // lines: descH is a fixed Dp(34) and the right-hand card has no slack to give -
-            // see fixedR in SettingsLayout, which already competes with the list's own floor.
-            st->hAutoDesc = Mk(hwnd, L"STATIC",
-                               L"While this game is in front, processes that stay above the "
-                               L"threshold move to the background mask until the game exits. "
-                               L"The list above tags them AUTO.",
-                               SS_LEFT, -1);
+            // THE PARAGRAPH IS NOW A TOOLTIP. It said the same three things it always said -
+            // see AutoPinInfoTipText - but it no longer costs the card two permanent lines
+            // next to a rule most users set once. The legend for the AUTO tag went with it,
+            // which is why the tooltip and not the caption carries the word.
+            //
+            // SS_NOTIFY IS LOAD-BEARING, not decoration: a plain STATIC answers WM_NCHITTEST
+            // with HTTRANSPARENT, the mouse goes to the parent instead, and the tooltip's
+            // TTF_SUBCLASS hook never sees a WM_MOUSEMOVE. The tip would simply never appear.
+            st->hAutoInfo = Mk(hwnd, L"STATIC", L"",
+                               SS_OWNERDRAW | SS_NOTIFY, IDC_AUTOINFO);
             st->hPctLbl = Mk(hwnd, L"STATIC", L"Pin a process above", SS_LEFT, -1);
             st->hPct = Mk(hwnd, L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
                           IDC_PCT);
@@ -4448,6 +5412,43 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // in and shows it, on the same beat as everything else on this window.
             st->hAutoStatus = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
             if (st->hAutoStatus) ShowWindow(st->hAutoStatus, SW_HIDE);
+            // Empty and hidden until RefreshVCacheActiveWarning has read the live state -
+            // an empty row takes no height, so a machine with no AMD agent never shows it.
+            st->hVCacheActive = Mk(hwnd, L"STATIC", L"", SS_LEFT, -1);
+            if (st->hVCacheActive) ShowWindow(st->hVCacheActive, SW_HIDE);
+
+            // ---- EXTREME GAME MODE ------------------------------------------------------
+            // OFF unless the user switches it on, per profile, and the wording has to earn
+            // that click rather than sell it. Two rules the strings below keep:
+            //   * it says what the mode DOES, in the caption, without an adjective.
+            //   * it promises NOTHING about frame rate. This project has never measured a
+            //     frame rate and no string in it may imply otherwise.
+            //
+            // THE THIRD RULE WAS DROPPED WITH THE CONTROLS IT DESCRIBED, 2026-09-09. The
+            // caption used to point at "Stop AMD's 3D V-Cache optimizer" on the Setting page
+            // and a live line underneath used to report the mask's park state. Both are gone
+            // on the operator's instruction: the AMD V-Cache warning row a few rows up this
+            // same card already names the optimizer and what to do about it, and it is the
+            // CAUSE rather than the effect. What was removed is one fact told three times.
+            st->hExtreme = Mk(hwnd, L"BUTTON",
+                              L"Extreme game mode - move every other process to the "
+                              L"background mask",
+                              BS_AUTOCHECKBOX | WS_TABSTOP, IDC_EXTREME);
+            st->hExtremeInfo = Mk(hwnd, L"STATIC", L"",
+                                  SS_OWNERDRAW | SS_NOTIFY, IDC_EXTREMEINFO);
+            // Created empty and hidden. RefreshExtremeSweptStatus fills it on the same beat
+            // as every other live element here; an empty row takes no height, so a profile
+            // without extreme mode never shows it.
+            //
+            // SS_LEFT AND NOTHING ELSE, AND SS_ENDELLIPSIS IS DELIBERATELY ABSENT.
+            // [M] Measured on this row's first build: with SS_ENDELLIPSIS the control stops
+            // wrapping and lays the whole sentence out on ONE line, ellipsised - inside a
+            // rectangle three lines tall. It was added as a backstop and it defeated the
+            // thing it was backing up. The formatter's own character cap
+            // (kExtremeListChars) is the guard; this control simply wraps, exactly as
+            // hAutoStatus and hVCacheActive beside it do.
+            st->hExtremeStatus = Mk(hwnd, L"STATIC", L"", SS_LEFT, IDC_EXTREME_STATUS);
+            if (st->hExtremeStatus) ShowWindow(st->hExtremeStatus, SW_HIDE);
 
             st->hMapHdr = Mk(hwnd, L"STATIC", L"Core map", SS_LEFT, -1);
             st->hTopoText = Mk(hwnd, L"STATIC", TopologyBlock(*st->topo).c_str(),
@@ -4492,7 +5493,11 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                                   SS_LEFT, -1);
             }
 
-            st->hGenHdr = Mk(hwnd, L"STATIC", L"General", SS_LEFT, -1);
+            // Matches the tab above character for character, as hProfHdr and hMapHdr do.
+            // A heading that still said "General" under a tab that says "Setting" is the
+            // same class of defect as a control whose label and action name different
+            // objects - the user cannot tell whether they are on the page they clicked.
+            st->hGenHdr = Mk(hwnd, L"STATIC", L"Setting", SS_LEFT, -1);
             st->hStartup = Mk(hwnd, L"BUTTON", L"Start with Windows",
                               BS_AUTOCHECKBOX | WS_TABSTOP, IDC_STARTUP);
             st->hNotify = Mk(hwnd, L"BUTTON", L"Show notifications",
@@ -4530,6 +5535,13 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             st->hInspect = Mk(hwnd, L"BUTTON", L"Inspect processes...",
                               BS_OWNERDRAW | WS_TABSTOP, IDC_INSPECT);
             SetButtonKind(st->hInspect, theme::ButtonKind::Secondary);
+            // The readout card. Its two strings live in irq_policy.h, not here, because the
+            // wording gate in the unit suite pins the strings in that file and a sentence
+            // written at this call site would sit outside the gate.
+            st->hIrqLine = Mk(hwnd, L"STATIC", cd::IrqCardLineText(), SS_LEFT, -1);
+            st->hIrqOpen = Mk(hwnd, L"BUTTON", cd::IrqCardButtonCaption(),
+                              BS_OWNERDRAW | WS_TABSTOP, IDC_IRQ_OPEN);
+            SetButtonKind(st->hIrqOpen, theme::ButtonKind::Secondary);
 
             // The sponsor strip, directly above the footer on every page. It owns its own
             // painting, its own hit test and its own URLs - this window neither handles its
@@ -4604,13 +5616,16 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetButtonKind(st->hApply, theme::ButtonKind::Secondary);
 
             ApplySettingsFonts(st, hwnd);
+            // AFTER the controls exist and BEFORE the first layout: TTF_IDISHWND tools are
+            // keyed on the icon HWNDs, so this cannot run any earlier.
+            CreateInfoTips(st, hwnd);
             {
                 // UseClassicChrome stays: it keeps the control off the themed hot-track path
                 // so it stops asking to repaint on every mouse move. The pixels themselves
                 // are now ours - see CheckBoxProc for why this is a subclass and not
                 // BS_OWNERDRAW, which would destroy BM_GETCHECK on these controls.
-                HWND checks[] = { st->hEnabled, st->hAutoPin, st->hStartup, st->hNotify,
-                                  st->hVCacheManage, st->hVCacheWarn };
+                HWND checks[] = { st->hEnabled, st->hAutoPin, st->hExtreme, st->hStartup,
+                                  st->hNotify, st->hVCacheManage, st->hVCacheWarn };
                 for (HWND h : checks) {
                     UseClassicChrome(h);
                     if (h) SetWindowSubclass(h, CheckBoxProc, kCheckSubclassId, 0);
@@ -4644,7 +5659,18 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             RefreshBlockedLine(st);
             UpdateEnvironmentSection(st);
             UpdateMaskWarnings(st);
+            // st->env was probed in ShowSettings, so this has live state to read on the very
+            // first layout - the row must not appear one second late, on the first tick.
+            RefreshVCacheActiveWarning(st);
+            // BEFORE the two sentences below, which describe whichever profile is selected:
+            // opening Settings while a game is running should show THAT game's panel, and
+            // the follow rule is what puts it there. Nothing is suppressing it yet - no
+            // control has focus, no modal is up, the operator has chosen nothing - so this is
+            // the one call that is expected to move the selection on the very first paint.
+            RefreshGoverningProfile(st, hwnd);
             RefreshAutoPinStatus(st);
+            SyncAutoPinRows(st);
+            RefreshExtremeSweptStatus(st);
             ApplyPageVisibility(st);
             SettingsLayout(st, hwnd);
             SetTimer(hwnd, kStatusTimer, 1000, nullptr);
@@ -4711,13 +5737,66 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             HDC measureDc = st ? GetDC(hwnd) : nullptr;
             const WarningLayout warning =
                 MeasureWarningLayout(st, measureDc, minColumns.rightW, dpi);
-            if (measureDc) ReleaseDC(hwnd, measureDc);
             const int legacyWarningCardH =
                 2 * theme::Dp(theme::metric::kCardPad, dpi) + 2 * theme::Dp(36, dpi) +
                 theme::Dp(theme::metric::kGapTight, dpi);
             int needH = theme::Dp(700, dpi);
             if (warning.cardH > legacyWarningCardH)
                 needH += warning.cardH - legacyWarningCardH;
+            // THE AMD V-CACHE ROW, AND THIS IS ONE OF THE TWO PLACES THAT HAD TO LEARN IT.
+            // The other is ShowSettings' wantH; forgetting that one is the defect this
+            // project has already shipped once, so both were changed in the same edit and
+            // by the same expression.
+            //
+            // RESERVED UNCONDITIONALLY EVEN THOUGH THE LAYOUT ONLY SPENDS IT WHEN THE ROW IS
+            // UP, and that is the safe direction rather than an inconsistency: this is a
+            // floor for RESIZING, so it has to hold for the state the window may be dragged
+            // into, which is the state where the row is showing. A minimum that shrank when
+            // the agent stopped would let the user drag the window to a height that clips the
+            // moment the agent comes back - and the agent coming back is the whole point.
+            //
+            // [M] The arithmetic at 96 dpi and the minimum window size, continuing the block
+            // in SettingsLayout: the right-hand card had 736 px to fill and the worst case
+            // spent 702 of them, leaving 34. This row costs kGapTight + Dp(34) = 40, which is
+            // 6 more than that slack - so without this line the card would overrun the
+            // sponsor band by 6 px whenever the row was up. With it the card has 776 px, the
+            // worst case spends 742, and THE SLACK IS 34 PX AGAIN - unchanged, deliberately.
+            needH += theme::Dp(theme::metric::kGapTight, dpi) + theme::Dp(34, dpi);
+            // 🔴 RE-EXAMINED 2026-09-09 AND DELIBERATELY NOT REDUCED. The Profiles page lost
+            // 134 device px that day - two explanatory paragraphs became hover text on an (i)
+            // and the extreme-mode live parked line was deleted - and the standing rule that
+            // "both sizers must learn a content change" was applied by CHECKING both rather
+            // than by editing both. It is a floor, so the hazard it guards is a window too
+            // SHORT, and content shrinking cannot cause that.
+            //
+            // [M] It must not shrink either, because THE PROFILES PAGE IS NO LONGER THE
+            // TALLEST PAGE. At 96 dpi and this minimum client width the Setting page's four
+            // cards need about 750 px of content (198 + 232 + 152 + 132, with their kGap
+            // separators) against the Profiles page's new 620, and the figure this function
+            // returns clears the Setting page by only about 14 px. Handing the Profiles
+            // page's 134 px back to the user would clip the interrupt card's button behind
+            // the sponsor band: the defect of 2026-09-08 reintroduced from the other side.
+            // The base Dp(700) below is now the SETTING page's floor, not this page's.
+            // THE INTERRUPT READOUT CARD IS NEW ON THE GENERAL PAGE, so this floor - chosen
+            // when the Profiles page was the tallest - has to grow by exactly what that card
+            // takes. Measured against the control's own font at the minimum client width, the
+            // same way the warning card above is, rather than reserved as a line count.
+            {
+                const int irqTextW =
+                    minClientW - 2 * theme::Dp(theme::metric::kGap, dpi) -
+                    2 * theme::Dp(theme::metric::kCardPad, dpi);
+                const int irqCardH =
+                    2 * theme::Dp(theme::metric::kCardPad, dpi) + theme::Dp(22, dpi) +
+                    2 * theme::Dp(theme::metric::kGapTight, dpi) +
+                    MeasureWrappedStaticHeight(st ? st->hIrqLine : nullptr, measureDc,
+                                               irqTextW, dpi) +
+                    theme::Dp(theme::metric::kButtonH, dpi);
+                needH += irqCardH + theme::Dp(theme::metric::kGap, dpi);
+            }
+            // RELEASED HERE AND NOT EARLIER: both measurements above need it, and one of them
+            // was added after the release used to sit. A measurement against a released DC
+            // silently returns the floor rather than the height the text wants.
+            if (measureDc) ReleaseDC(hwnd, measureDc);
             {
                 const SIZE band = SponsorBandSize(st, dpi);
                 if (band.cx > 0 && band.cy > 0)
@@ -4821,6 +5900,14 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (di->hwndItem == st->hHeavy)    return DrawHeavyItem(st, di);
                 return theme::DrawListBoxItem(di, st->dpi);
             }
+            // The only SS_OWNERDRAW statics in this window are the two (i) icons. Matched on
+            // HWND rather than on control id: an id is a number two controls could one day
+            // share, an HWND cannot be.
+            if (di->CtlType == ODT_STATIC &&
+                (di->hwndItem == st->hAutoInfo || di->hwndItem == st->hExtremeInfo)) {
+                DrawInfoIcon(st, di);
+                return TRUE;
+            }
             break;
         }
         case WM_TIMER:
@@ -4851,12 +5938,26 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // beat as the core map's own parked refresh rather than only at selection.
                 RefreshLiveTopology(st);
                 if (UpdateMaskWarnings(st)) relayout = true;
+                // AFTER RefreshEnvironmentStatus above, which is what re-reads the agent
+                // process. A relayout, never a repaint: the row takes no height when it has
+                // nothing to say, so its arrival and departure move the rows under it.
+                if (RefreshVCacheActiveWarning(st)) relayout = true;
                 // BEFORE the status sentence, which reports the count this sets. Same timer,
                 // no second one: see kAutoRowsShown for what this costs and why it is not
                 // behind the visibility guard the CPU sampling is - it opens no process and
                 // enumerates nothing, so gating it would save nothing and let the rows go
                 // stale for a second every time the page came back.
+                // FIRST, because everything below describes the SELECTED profile and the
+                // follow may change which one that is. Running it after would leave the
+                // sentences and the readback rows describing the profile that was on screen a
+                // moment ago, for a whole second - the same wrong-answer-for-a-beat this
+                // window already refuses elsewhere (see LoadProfileToUi's stage clear).
+                if (RefreshGoverningProfile(st, hwnd)) relayout = true;
                 bool autoRowsMoved = SyncAutoPinRows(st);
+                // AFTER SyncAutoPinRows, which is what refreshes the counts this reads. A
+                // relayout rather than a repaint: the row takes no height when the sweep has
+                // nothing to say, so its arrival and departure move the card under it.
+                if (RefreshExtremeSweptStatus(st)) relayout = true;
                 // The auto-pin state is live: the game starts, the user alt-tabs, another
                 // profile takes over. The sentence and the dot both move with it, and so does
                 // the meters' colour ramp - which is why the heavy list is invalidated below
@@ -4917,20 +6018,31 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     ctl == st->hMapHdr || ctl == st->hGenHdr) {
                     fg = pal.textPrimary;
                 } else if (ctl == st->hGameMaskWarn || ctl == st->hHeavyMaskWarn ||
-                           ctl == st->hMapFail) {
+                           ctl == st->hVCacheActive || ctl == st->hMapFail) {
+                    // The SAME pal.warn the parked-mask rows use. This row only exists when
+                    // it has something to warn about, so unlike hAutoStatus it has no quiet
+                    // state to colour differently.
                     fg = pal.warn;
                 } else if (ctl == st->hAutoStatus) {
-                    // The DOT carries the state; the sentence stays readable prose. It only
-                    // dims when the rule itself is switched off, matching the rest of the
-                    // card going quiet.
+                    // The DOT carries the state; the sentence stays readable prose. It dims
+                    // in AutoPinState::Off, which is both "the box is unticked" and "extreme
+                    // game mode has superseded this rule" - the whole group greys together
+                    // in the second case and this line is part of the group.
                     fg = (st->autoState == AutoPinState::Off) ? pal.textDim
                                                               : pal.textSecondary;
+                } else if (ctl == st->hExtremeStatus) {
+                    // textSecondary (5.91:1 on this ground), never textDim (3.26:1, below
+                    // WCAG AA and this app's DISABLED colour). The whole point of this line
+                    // is that the operator can READ which apps moved - see the version-label
+                    // note in PaintSettings for the measurement that made that a rule here.
+                    fg = pal.textSecondary;
                 } else if (ctl == st->hVCacheRestoreHint || ctl == st->hVCacheEffect) {
                     fg = pal.textDim;
                 } else if (IsAutoPinLabel(st, ctl) && AutoPinLabelsAreDim(st)) {
-                    // These three stay enabled on purpose - see SyncAutoPinEnable - so the
+                    // This caption stays ENABLED on purpose - see SyncAutoPinEnable - so the
                     // "off" state has to be carried by the colour rather than by the control's
-                    // own disabled painting, which embosses.
+                    // own disabled painting, which embosses. AutoPinLabelsAreDim covers both
+                    // ways the rule goes quiet: the box unticked, and extreme game mode on.
                     fg = pal.textDim;
                 }
                 SetTextColor(dc, fg);
@@ -5042,7 +6154,18 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         if (pi >= 0) {
                             StoreUiToProfile(st);
                             st->selProfile = pi;
+                            // THE OPERATOR CHOSE THIS ROW, so the panel stops following the
+                            // engine until the governing profile changes again. Set even when
+                            // they picked the governing profile itself: the latch means "this
+                            // selection is theirs", and a later change of game is what
+                            // releases it. See ShouldFollowGoverningProfile.
+                            st->followPinned = true;
                             LoadProfileToUi(st);
+                            // The two live sentences describe the selected profile, so they
+                            // have to move on the click rather than up to a second later.
+                            RefreshExtremeSweptStatus(st);
+                            SettingsLayout(st, hwnd);
+                            RedrawSettings(hwnd);
                         }
                     } else if (code == LBN_DBLCLK && !st->loading) {
                         if (st->selProfile >= 0 &&
@@ -5175,8 +6298,31 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 case IDC_INSPECT:
                     ShowInspectReport(st, hwnd);
                     return 0;
+                case IDC_IRQ_OPEN:
+                    // Modal over this window, and read-only: it writes no config, so nothing
+                    // here has to be saved, reloaded or reconciled afterwards. `work` rather
+                    // than `out` because the masks it names must be the ones on screen.
+                    if (code == BN_CLICKED && st->topo)
+                        ShowInterruptBench(hwnd, st->work, *st->topo, st->engine);
+                    return 0;
                 case IDC_AUTOPIN:
                     SyncAutoPinEnable(st);
+                    return 0;
+                case IDC_EXTREME:
+                    // THIS BOX NOW GREYS THE AUTO-PIN GROUP, and that is the whole of its
+                    // side effect here. The click itself is stored by StoreUiToProfile on
+                    // Apply, like every other per-profile field, and Profile::autoPin is not
+                    // touched: turning extreme mode on and off again leaves the operator's
+                    // auto-pin setting exactly where they left it.
+                    //
+                    // RepaintChrome unconditionally, not on a "did anything change" test: the
+                    // percent field's caption, the "% CPU" unit and the status dot are all
+                    // drawn by the PARENT from the state this just moved.
+                    if (code == BN_CLICKED) {
+                        SyncAutoPinEnable(st);
+                        if (st->hExtremeInfo) InvalidateRect(st->hExtremeInfo, nullptr, TRUE);
+                        RepaintChrome(hwnd);
+                    }
                     return 0;
                 case IDC_MAPMASK:
                     if (code == CBN_SELCHANGE) {
@@ -5779,6 +6925,63 @@ void ShowSettings(HWND owner, Config& cfg, const Topology& topo, Engine& engine)
     // window is a little taller than it needed to be and nothing is hidden. The reverse
     // mistake cannot be repaired the same way.
     int wantH = MulDiv(740, dpi, 96);
+    // 740dip PREDATES THE INTERRUPT READOUT CARD, and nothing here grew when that card was
+    // added to the Setting page. WM_GETMINMAXINFO was taught the card; this was not, so the
+    // window opened ~40dip short of what four cards need and the card's button was cut flat
+    // by the sponsor band with its bottom border hidden behind it. Nothing in this project
+    // could see that: the page does not scroll and the layout deliberately lets content
+    // overrun the band rather than push the footer, so an overflow is silent everywhere
+    // except on screen.
+    //
+    // WHY THE MINIMUM DID NOT CATCH IT EITHER. It is a floor for RESIZING. The first
+    // WM_GETMINMAXINFO arrives before WM_NCCREATE, so `st` is still null there: the sponsor
+    // band measures 0 (SponsorBandSize returns zero for a null state) and the wrapped line
+    // falls back to its floor. [M] That floor came out at 844 device px of client at 96dpi
+    // and the request below was 828, so the created window took the floor - still 40 short.
+    // A minimum computed without the state cannot size the window that is being created.
+    //
+    // RESERVED, NOT MEASURED, and that is forced rather than lazy: no window and no controls
+    // exist yet, so there is nothing to run MeasureWrappedStaticHeight against. This is the
+    // SAME expression WM_GETMINMAXINFO builds for the card - card padding, heading, two tight
+    // gaps, the wrapped line, the button - with the line at MeasureWrappedStaticHeight's own
+    // Dp(36) floor, which is exactly what that call returns at creation time anyway.
+    // ponytail: a constant reservation, not a measure. If the card ever grows a row, the
+    // upgrade path is to measure the page's real extent once the controls exist and resize
+    // from WM_CREATE, rather than to nudge this number again.
+    wantH += 2 * theme::Dp(theme::metric::kCardPad, dpi) + theme::Dp(22, dpi) +
+             2 * theme::Dp(theme::metric::kGapTight, dpi) + theme::Dp(36, dpi) +
+             theme::Dp(theme::metric::kButtonH, dpi) + theme::Dp(theme::metric::kGap, dpi);
+    // THE AMD V-CACHE ROW ON THE PROFILES PAGE - the SAME expression WM_GETMINMAXINFO adds,
+    // written here because this is the computation that gets forgotten. The default is meant
+    // to clear the minimum rather than open on it, and it kept exactly the 40 px of clearance
+    // it had before only because both numbers moved together.
+    //
+    // [M] At 96 dpi this takes the default CLIENT height from 972 to 1012, and
+    // AdjustWindowRectEx(WS_OVERLAPPEDWINDOW) adds exactly 39 - measured 2026-09-08, not
+    // assumed - so the window asks for 1051. Two cases, and neither clips:
+    //   * work area >= 1051. No clamp. [M] The reference machine's work area measured
+    //     5120 x 1392 this turn, so the 1032 quoted in the comment above is a narrower
+    //     display state, not this one.
+    //   * work area 1032, i.e. a 1080p screen. The clamp below trims the window to 1032,
+    //     leaving 993 px of client against a runtime minimum of 972 - still 21 px of room.
+    // A window that opens at the work-area height is a cosmetic outcome; a card that
+    // overruns the sponsor band is the defect this project is named for.
+    wantH += theme::Dp(theme::metric::kGapTight, dpi) + theme::Dp(34, dpi);
+    // 🔴 RE-EXAMINED 2026-09-09 AND DELIBERATELY NOT REDUCED, the same day and by the same
+    // arithmetic as the minimum above - which is the point: this is the computation that gets
+    // forgotten, so it gets the note even when the answer is "no change".
+    //
+    // The Profiles page shrank by 134 device px at 96 dpi. Two independent reasons this
+    // number stays where it is:
+    //   [M] The minimum did not move (see WM_GETMINMAXINFO), because the SETTING page is now
+    //       the tallest and it did not change. A default below the floor is silently clamped
+    //       to the floor, so subtracting 134 here would change nothing on screen while
+    //       destroying the ~28 px of clearance the paragraph above exists to preserve - "the
+    //       default should clear the minimum rather than open ON it".
+    //   [M] Nothing on the Profiles page is left in dead space by the extra height. The
+    //       right-hand card's heavy list is the sink for slack (see fixedR in
+    //       SettingsLayout) and the core map's is the map, so the freed pixels are spent on
+    //       the two controls that were competing for them, not on a blank band.
     {
         const SIZE sp = WebSponsorMinSize(dpi);
         if (sp.cx > 0 && sp.cy > 0)

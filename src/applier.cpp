@@ -21,6 +21,7 @@
 #include <cstdlib>
 #include <cwchar>
 #include <cstdio>
+#include <set>
 
 namespace cd {
 
@@ -611,6 +612,61 @@ void JournalRemove(DWORD pid) {
     if (!JournalWriteLocked(kept)) {
         LogLine(L"applier: journal remove failed for pid %lu, err=%lu",
                 static_cast<unsigned long>(pid),
+                static_cast<unsigned long>(GetLastError()));
+    }
+}
+
+void JournalAddMany(const std::vector<JournalEntry>& add) {
+    if (add.empty()) return;
+
+    JournalGuard guard;
+    std::vector<JournalEntry> entries = JournalReadLocked();
+
+    // Pids already on disk, so a re-add cannot duplicate a line - the same guarantee
+    // JournalAdd gives, kept across the batch as well as within it.
+    std::set<DWORD> present;
+    for (size_t i = 0; i < entries.size(); ++i) present.insert(entries[i].pid);
+
+    size_t added = 0;
+    for (size_t i = 0; i < add.size(); ++i) {
+        if (add[i].pid == 0) continue;
+        if (!present.insert(add[i].pid).second) continue;
+        entries.push_back(add[i]);
+        ++added;
+    }
+    if (added == 0) return;   // nothing changed; do not spend a rewrite
+
+    if (!JournalWriteLocked(entries)) {
+        LogLine(L"applier: journal add of %d entries failed, err=%lu",
+                static_cast<int>(added),
+                static_cast<unsigned long>(GetLastError()));
+    }
+}
+
+void JournalRemoveMany(const std::vector<DWORD>& pids) {
+    if (pids.empty()) return;
+
+    std::set<DWORD> drop;
+    for (size_t i = 0; i < pids.size(); ++i) {
+        if (pids[i] != 0) drop.insert(pids[i]);
+    }
+    if (drop.empty()) return;
+
+    JournalGuard guard;
+    std::vector<JournalEntry> entries = JournalReadLocked();
+
+    std::vector<JournalEntry> kept;
+    kept.reserve(entries.size());
+    size_t removed = 0;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        if (drop.find(entries[i].pid) != drop.end()) { ++removed; continue; }
+        kept.push_back(entries[i]);
+    }
+    if (removed == 0) return;   // nothing to rewrite
+
+    if (!JournalWriteLocked(kept)) {
+        LogLine(L"applier: journal remove of %d entries failed, err=%lu",
+                static_cast<int>(removed),
                 static_cast<unsigned long>(GetLastError()));
     }
 }

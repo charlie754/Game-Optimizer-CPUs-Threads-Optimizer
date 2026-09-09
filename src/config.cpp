@@ -390,6 +390,11 @@ Config DefaultConfig(const Topology& t) {
     p.autoPin = true;
     p.autoPinPercent = 8;
     p.autoPinSeconds = kAutoPinDebounceTicks;
+    // WRITTEN OUT even though it is the struct's own default. Extreme game mode moving a
+    // process the user never named is the one thing in this program that must not arrive by
+    // accident, so a shipped profile says so in as many words - a future edit that flips the
+    // struct default cannot then flip the shipped profiles with it.
+    p.extremeMode = false;
     c.profiles.push_back(p);
 
     // ALL GAMES, and it must be LAST: config.h states the All Games profile is considered
@@ -406,6 +411,7 @@ Config DefaultConfig(const Topology& t) {
     all.autoPin = true;
     all.autoPinPercent = 8;
     all.autoPinSeconds = kAutoPinDebounceTicks;
+    all.extremeMode = false;   // see the shipped profile above
     c.profiles.push_back(all);
     return c;
 }
@@ -553,6 +559,8 @@ bool ParseConfig(const std::wstring& text, Config& out, std::wstring* error) {
                     // ValidateAndRepair overwrites whatever lands here.
                     int v = p.autoPinSeconds;
                     if (ParseIntW(value, v)) p.autoPinSeconds = v;
+                } else if (IEquals(key, std::wstring(L"extreme_mode"))) {
+                    ParseBoolW(value, p.extremeMode);
                 } else if (IEquals(key, std::wstring(L"all_games"))) {
                     ParseBoolW(value, p.isAllGames);
                 } else if (IEquals(key, std::wstring(L"last_used"))) {
@@ -641,6 +649,7 @@ std::wstring SerializeConfig(const Config& c) {
         AppendKv(out, L"auto_pin_percent", std::to_wstring(p.autoPinPercent));
         // auto_pin_seconds is deliberately NOT written: it is a fixed internal debounce, not
         // a setting, and writing it would invite a hand-edit ValidateAndRepair silently undoes.
+        AppendKv(out, L"extreme_mode", BoolText(p.extremeMode));
         AppendKv(out, L"all_games", BoolText(p.isAllGames));
         AppendKv(out, L"last_used", std::to_wstring(static_cast<unsigned long long>(p.lastUsed)));
         AppendUnknownFor(out, c, std::wstring(kSecProfixLow) + p.name, consumed);

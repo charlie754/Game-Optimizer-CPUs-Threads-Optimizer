@@ -26,6 +26,7 @@
 
 #include "sponsor.h"
 #include "sponsor_html.h"
+#include "theme.h"
 #include "util.h"
 
 namespace cd {
@@ -622,9 +623,69 @@ HRESULT STDMETHODCALLTYPE ControllerHandler::Invoke(HRESULT hr, IWvController* c
     return S_OK;
 }
 
+// THE HOST OWNS ITS OWN PIXELS, AND UNTIL 2026-09-09 IT PAINTED NONE OF THEM. That is the
+// whole of the vertical-resize ghosting bug, so the reasoning is written down rather than
+// left as an unexplained FillRect.
+//
+// [M] MEASURED, not deduced. Grow the Settings window 260 px, shrink it back, capture with
+// PrintWindow(hwnd, dc, PW_RENDERFULLCONTENT) - the window's OWN buffer, so nothing about the
+// result is a screen-compositing artefact. The capture showed the taller layout's
+// "Heavy mask:" label and its "Freq" combo still drawn inside the sponsor band, at the
+// coordinates they had held while the window was tall. Filling THIS window's client area
+// from outside the process, with nothing else changed, removed them and left the rendered
+// sponsor page untouched. That is the artifact that identifies the owner.
+//
+// THE CHAIN, and every link is needed to produce the defect:
+//
+//   1. The Settings window is WS_CLIPCHILDREN, so its own WM_PAINT is clipped OUT of every
+//      child rectangle - this one included. The parent therefore cannot repaint the band,
+//      however hard it asks: RDW_ALLCHILDREN reaches the child, not the parent's ink under it.
+//   2. This window painted nothing at all - hbrBackground was null, WM_ERASEBKGND returned 1
+//      and there was no WM_PAINT case, so DefWindowProc merely validated the region.
+//   3. The page is deliberately TRANSPARENT (put_DefaultBackgroundColor with A = 0, above),
+//      so wherever its own markup does not draw, whatever is underneath shows through.
+//   4. The band is anchored to the client BOTTOM, so shrinking the window moves this host UP
+//      over rows the parent and its GDI children had drawn a moment earlier.
+//
+// So the stale rows had no owner: the parent was clipped out, this window declined, and the
+// page was see-through. Painting the ground colour here gives them one. It cannot flicker the
+// strip: the page is composited over this surface rather than into it, which is exactly what
+// the probe above demonstrated when the fill left the rendered page intact.
+//
+// appBg, because that is the colour the Settings window's own background paints either side
+// of the band - the strip sits on the window ground, not on a card - so a repaint of this
+// rectangle is indistinguishable from the parent having painted it.
+void PaintHostGround(HWND hwnd, HDC dc) {
+    if (dc == nullptr) return;
+    RECT rc;
+    if (!::GetClientRect(hwnd, &rc)) return;
+    // Created per call rather than cached in a static: this runs on a resize, not on a frame,
+    // and a cached HBRUSH would be one more thing to own for the life of the process.
+    HBRUSH br = ::CreateSolidBrush(theme::P().appBg);
+    if (br == nullptr) return;
+    ::FillRect(dc, &rc, br);
+    ::DeleteObject(br);
+}
+
 LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
-    // The webview paints the whole client area, so erasing it first would only flash.
-    if (msg == WM_ERASEBKGND) return 1;
+    // BOTH, and not one or the other. BeginPaint only sends WM_ERASEBKGND when the update
+    // region was invalidated WITH an erase, so an erase-only handler would miss every
+    // RDW_INVALIDATE that did not ask for one; and a paint-only handler would leave the
+    // window flashing its previous contents between the erase and the paint. Each fills the
+    // same rectangle with the same colour, so running both is idempotent.
+    if (msg == WM_ERASEBKGND) {
+        PaintHostGround(hwnd, reinterpret_cast<HDC>(wp));
+        return 1;
+    }
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = ::BeginPaint(hwnd, &ps);
+        if (dc != nullptr) {
+            PaintHostGround(hwnd, dc);
+            ::EndPaint(hwnd, &ps);
+        }
+        return 0;
+    }
     return ::DefWindowProcW(hwnd, msg, wp, lp);
 }
 
@@ -638,6 +699,10 @@ void RegisterHostClass() {
     wc.lpfnWndProc = HostProc;
     wc.hInstance = ::GetModuleHandleW(nullptr);
     wc.hCursor = ::LoadCursorW(nullptr, IDC_ARROW);
+    // NULL ON PURPOSE, AND NO LONGER THE SAME STATEMENT IT USED TO BE: HostProc's
+    // WM_ERASEBKGND fills the client area itself, from the live palette. A class brush is
+    // fixed at registration time and this class is registered once for the life of the
+    // process, so it could not follow a palette change; the handler can.
     wc.hbrBackground = nullptr;
     wc.lpszClassName = kHostClass;
     ::RegisterClassExW(&wc);

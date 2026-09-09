@@ -41,6 +41,21 @@ struct Profile {
     // Config never writes this and ValidateAndRepair forces it back; see kAutoPinDebounceTicks.
     int  autoPinSeconds = 1;
 
+    // EXTREME GAME MODE. OFF BY DEFAULT, and that default is a hard product rule rather than
+    // a preference: this is the only rule in the program that touches a process the user has
+    // never named and that is not busy. When it is on, every live process that is not the
+    // game and not excluded is moved to `heavyMask` while the profile is governing - see
+    // engine.h rule 4b.
+    //
+    // TWO THINGS IT DELIBERATELY DOES NOT DO, both of which a later edit will be tempted to
+    // "fix":
+    //   * it never overrides an exclusion. Rule 3 honours an explicit heavy-list entry even
+    //     when the name is excluded, because that entry is the user naming one process. A
+    //     blanket sweep is not a user naming anything, so it does not inherit that override.
+    //   * it does nothing at all when no profile is governing, and nothing when `heavyMask`
+    //     is empty - a blanket sweep to "clear" is not a thing anybody asked for.
+    bool extremeMode = false;
+
     // ALL GAMES. When true this profile matches ANY process that looks like a game rather than
     // one named executable, and Profile::game is ignored. Exactly one such profile may exist,
     // and it is always considered LAST, so a specific profile always wins over it.
