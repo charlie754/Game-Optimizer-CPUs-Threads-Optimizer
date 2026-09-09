@@ -241,11 +241,25 @@ struct SweptExe {
 std::vector<SweptExe> ExtremeSweptExes(const EngineStatus& st,
                                        const std::vector<std::wstring>& alreadyListed);
 
-// Pure. How many PROCESSES rule 4b moved, i.e. the total the list above is grouped from.
+// Pure. How many PROCESSES rule 4b ASKED FOR, i.e. the total the list above is grouped from.
 // Counted over the same GovernedProcess vector rather than summed from the grouped list,
-// because a process whose name could not be read is dropped from the grouping and still
-// moved - reporting a total that excludes it would under-claim what the app actually did.
+// because a process whose name could not be read is dropped from the grouping and was still
+// requested - reporting a total that excludes it would under-report what the app asked for.
+//
+// IT COUNTS REQUESTS, NOT PLACEMENTS, AND THE NAME OF THE FUNCTION IS THE ONLY PLACE THAT
+// CAN SAY SO. This app runs unelevated on purpose and ~41 processes on this desktop refuse
+// the assignment every time; a sentence built from this number alone therefore over-states,
+// which is exactly what shipped in v0.4.3. Pair it with the refusal count below.
 size_t ExtremeSweptProcessCount(const EngineStatus& st);
+
+// Pure. Of those, how many did NOT get the assignment - `applyResult != Ok`.
+//
+// THREE DIFFERENT FAILURES ARE ONE NUMBER HERE, deliberately: Windows refused it
+// (AccessDenied, the common case), the CPU Set Ids were rejected, or this app held the
+// assignment back because its recovery record could not be written. The user cannot act on
+// the difference and the log already carries it; what they need on this row is how much of
+// the count above did not happen.
+size_t ExtremeSweptNotAppliedCount(const EngineStatus& st);
 
 // Pure. Builds the tooltip, truncated to 127 chars.
 //   idle      "Game Optimizer - idle"

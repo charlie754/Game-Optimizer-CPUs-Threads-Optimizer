@@ -33,15 +33,42 @@ enum class ApplyResult {
 struct ApplyOutcome {
     ApplyResult result = ApplyResult::OtherError;
     DWORD lastError = 0;
+
+    // The handle OPENED and the process behind the pid is not the one the caller named.
+    // `result` is Gone in that case, because the process the caller meant really is gone -
+    // but "it exited" and "its pid now belongs to a stranger" are different things to say
+    // in a log and only this flag can tell them apart. See the identity rule below.
+    bool identityMismatch = false;
 };
 
 const wchar_t* ApplyResultName(ApplyResult r);
 
-// Apply a set of CPU Set Ids to a process. An EMPTY ids vector clears the assignment,
-// which is SetProcessDefaultCpuSets(h, NULL, 0) - the SDK annotates the pointer
-// _In_reads_opt_, so NULL is the documented clear path.
-ApplyOutcome ApplyCpuSets(DWORD pid, const std::vector<ULONG>& ids);
-ApplyOutcome ClearCpuSets(DWORD pid);
+// ---- Identity at the setter boundary ---------------------------------------
+// 🔴 A PID IS NOT AN IDENTITY, AND THIS IS THE ONE MISTAKE THAT CAN MOVE A PROCESS THE
+// USER NEVER AGREED TO MOVE. Windows reuses pids. Every caller here decided what to do
+// from a SNAPSHOT; by the time the setter runs, that process may have exited and its pid
+// may belong to something else entirely - and the decision, including its exclusion
+// result, would then be applied to the replacement.
+//
+// So the creation time the caller OBSERVED travels with the pid, and it is checked
+// ON THE SAME HANDLE the setter uses. Not through a second OpenProcess: that would leave
+// a window in which the pid is recycled between the check and the set, which is the very
+// bug the guard exists to close, reintroduced by the guard. A handle is bound to the
+// process OBJECT, so once it is open the identity behind it cannot change.
+//
+// expectedCreationTime == 0 is NOT "no reuse to worry about". It is "the caller has no
+// identity to check against", and the answer is REFUSAL, not a blind write:
+//   result = OtherError, lastError = ERROR_INVALID_PARAMETER, identityMismatch = true.
+// The refusal happens AFTER OpenProcess, on purpose - see the comment at the check itself:
+// on this machine an unknown creation time nearly always means the caller could not open
+// the process at all, and letting the open answer first keeps AccessDenied - the true and
+// useful result, and the one the blocked list is built from - instead of hiding it.
+//
+// An EMPTY ids vector clears the assignment, which is SetProcessDefaultCpuSets(h, NULL, 0)
+// - the SDK annotates the pointer _In_reads_opt_, so NULL is the documented clear path.
+ApplyOutcome ApplyCpuSets(DWORD pid, const std::vector<ULONG>& ids,
+                          ULONGLONG expectedCreationTime);
+ApplyOutcome ClearCpuSets(DWORD pid, ULONGLONG expectedCreationTime);
 
 // Read back what the OS believes this process's default CPU sets are.
 // Used by Settings' verify action and by Gate B tests: never trust our own bookkeeping
@@ -217,9 +244,23 @@ struct JournalEntry {
     std::wstring name;
 };
 
-void JournalAdd(DWORD pid, ULONGLONG creationTime, const std::wstring& name);
-void JournalRemove(DWORD pid);
-void JournalClearAll();
+// 🔴 EVERY ONE OF THESE RETURNS WHETHER THE ON-DISK STATE NOW MATCHES THE REQUEST, AND
+// THE CALLER MUST NOT APPLY ANYTHING ON A FALSE. They were `void` until v0.4.4 and merely
+// logged a failed write, so a full disk, a denied ACL or a failed flush still let the
+// engine pin the process - with no recovery record. After an unclean exit those processes
+// stay assigned and nothing on disk knows to clear them, which is the exact outcome this
+// journal exists to make impossible.
+//
+// TRUE for a no-op: adding a pid that is already journalled, or removing one that is not
+// present, changes nothing and needs no rewrite. The claim is about the STATE, not about
+// whether a write happened.
+//
+// FALSE when the journal could not be READ either. An unreadable journal must never be
+// rewritten - see FileReadResult in util.h: rewriting over content we never saw destroys
+// every recovery record it held.
+bool JournalAdd(DWORD pid, ULONGLONG creationTime, const std::wstring& name);
+bool JournalRemove(DWORD pid);
+bool JournalClearAll();
 std::vector<JournalEntry> JournalRead();
 
 // ---- the same two operations, ONE file rewrite for the whole batch ---------
@@ -241,13 +282,33 @@ std::vector<JournalEntry> JournalRead();
 //
 // Both are idempotent in the same way the singular forms are: an entry whose pid is already
 // journalled is not duplicated, and a pid that is not present is not an error to remove.
-void JournalAddMany(const std::vector<JournalEntry>& entries);
-void JournalRemoveMany(const std::vector<DWORD>& pids);
+//
+// AND BOTH RETURN A STATUS, for the reason given above the singular forms: a batch that did
+// not reach disk is a batch of processes that must not be pinned.
+bool JournalAddMany(const std::vector<JournalEntry>& entries);
+bool JournalRemoveMany(const std::vector<DWORD>& pids);
 
 // Startup recovery: for every journal entry whose pid is still live AND whose creation
 // time still matches, clear its CPU sets; then truncate the journal. The creation-time
-// match is what stops a RECYCLED pid from having an unrelated process cleared.
+// match is what stops a RECYCLED pid from having an unrelated process cleared, and since
+// v0.4.4 it is made on the SETTER'S OWN HANDLE rather than through a separate probe.
 // Returns how many processes were cleared.
+//
+// TWO ENTRIES SURVIVE THE TRUNCATION, and both are deliberate:
+//   * an entry whose clear FAILED - the assignment is still on the process, so the record
+//     that could undo it must outlive this run;
+//   * every entry, when the journal could not be READ at all - there is nothing to truncate
+//     that we have seen, and writing an empty file over it would destroy the records.
 int RecoverFromJournal();
+
+#ifdef CD_TESTS
+// TEST-ONLY SEAM, compiled out of the shipping binary (only toolsuild-tests.bat defines
+// CD_TESTS). It redirects the journal to `path` so a test can drive the REAL read, parse
+// and atomic-rewrite code against REAL files - including a path whose directory does not
+// exist, and a file too large to read. Those are genuine faults, injected at the filesystem
+// rather than mocked, which is the only way the failure paths above can be exercised at all.
+// An empty string restores the default location.
+void JournalSetPathForTests(const std::wstring& path);
+#endif
 
 }  // namespace cd

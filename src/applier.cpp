@@ -188,15 +188,58 @@ std::vector<JournalEntry> ParseJournal(const std::wstring& text) {
     return out;
 }
 
-// Both of these assume the journal lock is already held.
-std::vector<JournalEntry> JournalReadLocked() {
+// Where the journal lives. Production always answers GetJournalPath(); only a CD_TESTS
+// build can point it somewhere else, and only so the failure paths can be driven against
+// real files rather than mocked. See JournalSetPathForTests in applier.h.
+#ifdef CD_TESTS
+std::wstring& TestJournalPathSlot() {
+    static std::wstring path;
+    return path;
+}
+#endif
+
+std::wstring JournalPath() {
+#ifdef CD_TESTS
+    const std::wstring& over = TestJournalPathSlot();
+    if (!over.empty()) return over;
+#endif
+    return GetJournalPath();
+}
+
+// THE READ NOW CARRIES WHICH SILENCE IT WAS, and the difference decides whether a rewrite
+// is allowed at all. Until v0.4.4 every failure became an EMPTY journal, so one unreadable
+// read followed by an ordinary add rewrote the file with nothing but the new entry - every
+// existing recovery record dropped, silently, by the code that exists to preserve them.
+struct JournalContents {
+    FileReadResult status = FileReadResult::Ok;
+    std::vector<JournalEntry> entries;
+    bool usable() const { return status != FileReadResult::Unreadable; }
+};
+
+// All of these assume the journal lock is already held.
+JournalContents JournalReadLocked() {
+    JournalContents out;
     std::wstring text;
-    if (!ReadFileUtf8(GetJournalPath(), text)) return std::vector<JournalEntry>();
-    return ParseJournal(text);
+    out.status = ReadFileUtf8Checked(JournalPath(), text);
+    if (out.status == FileReadResult::Ok) out.entries = ParseJournal(text);
+    return out;
 }
 
 bool JournalWriteLocked(const std::vector<JournalEntry>& entries) {
-    return WriteFileUtf8Atomic(GetJournalPath(), SerialiseJournal(entries));
+    return WriteFileUtf8Atomic(JournalPath(), SerialiseJournal(entries));
+}
+
+// Defined with the read-back helpers further down, forward-declared here because the
+// SETTER needs it: the identity check has to happen on the setter's own handle, which sits
+// above that block. Moving the definition up instead would separate it from the comment
+// that explains why one handle answers both questions.
+bool CreationTimeOnHandle(HANDLE h, ULONGLONG& out);
+
+// One place to say "the journal could not be read, so nothing may be written over it".
+void LogUnreadable(const wchar_t* what) {
+    LogLine(L"applier: journal is present but UNREADABLE; refusing to rewrite it (%s). "
+            L"Nothing new will be pinned until it can be read - a rewrite here would "
+            L"destroy the recovery records it holds.", what);
 }
 
 }  // namespace
@@ -216,7 +259,8 @@ const wchar_t* ApplyResultName(ApplyResult r) {
 
 // ---- apply / clear ---------------------------------------------------------
 
-ApplyOutcome ApplyCpuSets(DWORD pid, const std::vector<ULONG>& ids) {
+ApplyOutcome ApplyCpuSets(DWORD pid, const std::vector<ULONG>& ids,
+                          ULONGLONG expectedCreationTime) {
     ApplyOutcome outcome;
 
     if (pid == 0) {
@@ -233,6 +277,53 @@ ApplyOutcome ApplyCpuSets(DWORD pid, const std::vector<ULONG>& ids) {
         outcome.lastError = err;
         outcome.result = ClassifyOpenError(err);
         return outcome;
+    }
+
+    // THE IDENTITY CHECK, ON THE HANDLE THE SETTER IS ABOUT TO USE, AND AFTER THE OPEN
+    // RATHER THAN BEFORE IT. Two reasons, and the second one is not obvious:
+    //
+    //   * the handle is held across the check and the set, so nothing can change between
+    //     them - a second OpenProcess here would reopen the race it is meant to close;
+    //   * a caller with NO identity (expectedCreationTime == 0) is, on this machine, almost
+    //     always a caller whose own snapshot could not open the process either. Refusing
+    //     before the open would relabel every one of those from AccessDenied - which is the
+    //     true and useful answer, and the one the Settings blocked list is built from - to a
+    //     vaguer refusal of our own. Letting the open speak first costs one failing syscall
+    //     and keeps the user-visible accounting honest.
+    {
+        ULONGLONG live = 0;
+        const bool haveLive = CreationTimeOnHandle(h, live);
+        const DWORD readErr = haveLive ? ERROR_SUCCESS : GetLastError();
+
+        if (expectedCreationTime == 0) {
+            // NO IDENTITY, NO WRITE. A zero is an absence of evidence, never evidence that
+            // the pid still means what the caller thought - and the process is open, so the
+            // pid may well have been recycled into something we were never asked to touch.
+            CloseHandle(h);
+            outcome.result = ApplyResult::OtherError;
+            outcome.lastError = ERROR_INVALID_PARAMETER;
+            outcome.identityMismatch = true;
+            return outcome;
+        }
+        if (!haveLive) {
+            // We hold a handle and still cannot say who it is. Treated exactly as a
+            // mismatch: the one thing that must not happen is a write on a guess.
+            CloseHandle(h);
+            outcome.result = ApplyResult::OtherError;
+            outcome.lastError = readErr ? readErr : ERROR_INVALID_PARAMETER;
+            outcome.identityMismatch = true;
+            return outcome;
+        }
+        if (live != expectedCreationTime) {
+            CloseHandle(h);
+            // OUR process is gone - the pid has been recycled - so Gone is the truthful
+            // result, and the caller's Gone path (drop the record, drop the journal entry)
+            // is exactly the right one. identityMismatch is what lets a log say WHICH.
+            outcome.result = ApplyResult::Gone;
+            outcome.lastError = ERROR_SUCCESS;
+            outcome.identityMismatch = true;
+            return outcome;
+        }
     }
 
     // An empty set is the documented clear path: the SDK annotates the pointer
@@ -257,9 +348,9 @@ ApplyOutcome ApplyCpuSets(DWORD pid, const std::vector<ULONG>& ids) {
     return outcome;
 }
 
-ApplyOutcome ClearCpuSets(DWORD pid) {
+ApplyOutcome ClearCpuSets(DWORD pid, ULONGLONG expectedCreationTime) {
     std::vector<ULONG> none;
-    return ApplyCpuSets(pid, none);
+    return ApplyCpuSets(pid, none, expectedCreationTime);
 }
 
 // ---- read-back -------------------------------------------------------------
@@ -572,124 +663,164 @@ InspectionResult InspectProcess(DWORD pid, const std::vector<ULONG>& expectedIds
 
 // ---- journal ---------------------------------------------------------------
 
-void JournalAdd(DWORD pid, ULONGLONG creationTime, const std::wstring& name) {
-    if (pid == 0) return;
+bool JournalAdd(DWORD pid, ULONGLONG creationTime, const std::wstring& name) {
+    if (pid == 0) return false;
 
     JournalGuard guard;
-    std::vector<JournalEntry> entries = JournalReadLocked();
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].pid == pid) return;   // idempotent for a pid already present
+    JournalContents on = JournalReadLocked();
+    if (!on.usable()) { LogUnreadable(L"add"); return false; }
+
+    for (size_t i = 0; i < on.entries.size(); ++i) {
+        if (on.entries[i].pid == pid) return true;   // already recorded: the state is right
     }
 
     JournalEntry e;
     e.pid = pid;
     e.creationTime = creationTime;
     e.name = name;
-    entries.push_back(e);
+    on.entries.push_back(e);
 
-    if (!JournalWriteLocked(entries)) {
-        LogLine(L"applier: journal add failed for pid %lu (%s), err=%lu",
+    if (!JournalWriteLocked(on.entries)) {
+        LogLine(L"applier: journal add FAILED for pid %lu (%s), err=%lu - it will NOT be "
+                L"pinned, because an assignment with no recovery record cannot be undone "
+                L"after an unclean exit",
                 static_cast<unsigned long>(pid), name.c_str(),
                 static_cast<unsigned long>(GetLastError()));
+        return false;
     }
+    return true;
 }
 
-void JournalRemove(DWORD pid) {
-    if (pid == 0) return;
+bool JournalRemove(DWORD pid) {
+    if (pid == 0) return false;
 
     JournalGuard guard;
-    std::vector<JournalEntry> entries = JournalReadLocked();
+    JournalContents on = JournalReadLocked();
+    if (!on.usable()) { LogUnreadable(L"remove"); return false; }
 
     std::vector<JournalEntry> kept;
-    kept.reserve(entries.size());
+    kept.reserve(on.entries.size());
     bool found = false;
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (entries[i].pid == pid) { found = true; continue; }
-        kept.push_back(entries[i]);
+    for (size_t i = 0; i < on.entries.size(); ++i) {
+        if (on.entries[i].pid == pid) { found = true; continue; }
+        kept.push_back(on.entries[i]);
     }
-    if (!found) return;   // nothing to rewrite
+    if (!found) return true;   // not present: the state already matches the request
 
     if (!JournalWriteLocked(kept)) {
         LogLine(L"applier: journal remove failed for pid %lu, err=%lu",
                 static_cast<unsigned long>(pid),
                 static_cast<unsigned long>(GetLastError()));
+        return false;
     }
+    return true;
 }
 
-void JournalAddMany(const std::vector<JournalEntry>& add) {
-    if (add.empty()) return;
+bool JournalAddMany(const std::vector<JournalEntry>& add) {
+    if (add.empty()) return true;   // nothing asked for is nothing outstanding
 
     JournalGuard guard;
-    std::vector<JournalEntry> entries = JournalReadLocked();
+    JournalContents on = JournalReadLocked();
+    if (!on.usable()) { LogUnreadable(L"batch add"); return false; }
 
     // Pids already on disk, so a re-add cannot duplicate a line - the same guarantee
     // JournalAdd gives, kept across the batch as well as within it.
     std::set<DWORD> present;
-    for (size_t i = 0; i < entries.size(); ++i) present.insert(entries[i].pid);
+    for (size_t i = 0; i < on.entries.size(); ++i) present.insert(on.entries[i].pid);
 
     size_t added = 0;
+    bool rejected = false;
     for (size_t i = 0; i < add.size(); ++i) {
-        if (add[i].pid == 0) continue;
+        // A pid 0 entry could never be recovered, so accepting the batch would be a lie
+        // about it. No caller should be sending one.
+        if (add[i].pid == 0) { rejected = true; continue; }
         if (!present.insert(add[i].pid).second) continue;
-        entries.push_back(add[i]);
+        on.entries.push_back(add[i]);
         ++added;
     }
-    if (added == 0) return;   // nothing changed; do not spend a rewrite
+    if (added == 0) return !rejected;   // nothing changed; do not spend a rewrite
 
-    if (!JournalWriteLocked(entries)) {
-        LogLine(L"applier: journal add of %d entries failed, err=%lu",
+    if (!JournalWriteLocked(on.entries)) {
+        LogLine(L"applier: journal add of %d entries FAILED, err=%lu - NONE of them will "
+                L"be pinned this tick; they stay on all cores, which is the safe half of "
+                L"this failure",
                 static_cast<int>(added),
                 static_cast<unsigned long>(GetLastError()));
+        return false;
     }
+    return !rejected;
 }
 
-void JournalRemoveMany(const std::vector<DWORD>& pids) {
-    if (pids.empty()) return;
+bool JournalRemoveMany(const std::vector<DWORD>& pids) {
+    if (pids.empty()) return true;
 
     std::set<DWORD> drop;
     for (size_t i = 0; i < pids.size(); ++i) {
         if (pids[i] != 0) drop.insert(pids[i]);
     }
-    if (drop.empty()) return;
+    if (drop.empty()) return true;
 
     JournalGuard guard;
-    std::vector<JournalEntry> entries = JournalReadLocked();
+    JournalContents on = JournalReadLocked();
+    if (!on.usable()) { LogUnreadable(L"batch remove"); return false; }
 
     std::vector<JournalEntry> kept;
-    kept.reserve(entries.size());
+    kept.reserve(on.entries.size());
     size_t removed = 0;
-    for (size_t i = 0; i < entries.size(); ++i) {
-        if (drop.find(entries[i].pid) != drop.end()) { ++removed; continue; }
-        kept.push_back(entries[i]);
+    for (size_t i = 0; i < on.entries.size(); ++i) {
+        if (drop.find(on.entries[i].pid) != drop.end()) { ++removed; continue; }
+        kept.push_back(on.entries[i]);
     }
-    if (removed == 0) return;   // nothing to rewrite
+    if (removed == 0) return true;   // nothing to rewrite; the state already matches
 
     if (!JournalWriteLocked(kept)) {
         LogLine(L"applier: journal remove of %d entries failed, err=%lu",
                 static_cast<int>(removed),
                 static_cast<unsigned long>(GetLastError()));
+        return false;
     }
+    return true;
 }
 
-void JournalClearAll() {
+bool JournalClearAll() {
     JournalGuard guard;
+    // NOT guarded on a readable journal, and that asymmetry is deliberate: truncation does
+    // not need to know what is there, and its callers have already cleared every assignment
+    // they believe in. Refusing here would leave an unreadable file behind after a clean
+    // shutdown with nothing gained.
     std::vector<JournalEntry> empty;
     if (!JournalWriteLocked(empty)) {
         LogLine(L"applier: journal truncate failed, err=%lu",
                 static_cast<unsigned long>(GetLastError()));
+        return false;
     }
+    return true;
 }
 
 std::vector<JournalEntry> JournalRead() {
     JournalGuard guard;
-    return JournalReadLocked();
+    return JournalReadLocked().entries;
 }
+
+#ifdef CD_TESTS
+void JournalSetPathForTests(const std::wstring& path) {
+    JournalGuard guard;
+    TestJournalPathSlot() = path;
+}
+#endif
 
 int RecoverFromJournal() {
     JournalGuard guard;
 
-    std::vector<JournalEntry> entries = JournalReadLocked();
-    if (entries.empty()) {
+    JournalContents on = JournalReadLocked();
+    if (!on.usable()) {
+        // THE ONE CASE WHERE RECOVERY MUST DO NOTHING AT ALL. We have not seen the file, so
+        // we do not know which processes it names - and truncating it would throw those
+        // records away unread. Left exactly as it is, loudly.
+        LogUnreadable(L"recovery");
+        return 0;
+    }
+    if (on.entries.empty()) {
         LogLine(L"applier: recovery - journal empty, nothing to clear");
         // Still truncate: an all-malformed file should not survive to the next launch.
         JournalWriteLocked(std::vector<JournalEntry>());
@@ -701,33 +832,38 @@ int RecoverFromJournal() {
     int skippedRecycled = 0;
     int failed = 0;
 
-    for (size_t i = 0; i < entries.size(); ++i) {
-        const JournalEntry& e = entries[i];
+    // ENTRIES WHOSE CLEAR DID NOT LAND STAY ON DISK. A record is the only thing that can
+    // undo an assignment, so discarding one because the clear failed would strand that
+    // process for good. A record whose process is gone, or whose pid now belongs to somebody
+    // else, has nothing left to undo and is dropped.
+    std::vector<JournalEntry> keep;
 
-        ULONGLONG liveCreated = 0;
-        if (!GetProcessCreationTime(e.pid, liveCreated)) {
-            // Not live (or not queryable) - nothing to undo.
-            ++skippedDead;
-            continue;
-        }
-        if (liveCreated != e.creationTime) {
-            // The pid has been RECYCLED. Clearing here would strip CPU sets from a
-            // process this program never touched, so it is left alone deliberately.
-            ++skippedRecycled;
-            LogLine(L"applier: recovery - pid %lu recycled (journal %llu, live %llu), skipping %s",
-                    static_cast<unsigned long>(e.pid), e.creationTime, liveCreated,
-                    e.name.c_str());
-            continue;
-        }
+    for (size_t i = 0; i < on.entries.size(); ++i) {
+        const JournalEntry& e = on.entries[i];
 
-        ApplyOutcome o = ClearCpuSets(e.pid);
+        // ONE CALL, AND THE IDENTITY IS CHECKED ON THE HANDLE THAT DOES THE CLEARING. This
+        // used to be a separate GetProcessCreationTime followed by an unguarded
+        // ClearCpuSets, which left a window for the pid to be recycled BETWEEN the two -
+        // the exact failure the check exists to prevent.
+        ApplyOutcome o = ClearCpuSets(e.pid, e.creationTime);
         if (o.result == ApplyResult::Ok) {
             ++cleared;
             LogLine(L"applier: recovery - cleared pid %lu (%s)",
                     static_cast<unsigned long>(e.pid), e.name.c_str());
+        } else if (o.identityMismatch) {
+            // The pid has been RECYCLED. Clearing would strip CPU sets from a process this
+            // program never touched, so it is left alone deliberately - and nothing of ours
+            // is behind that pid any more, so the record goes.
+            ++skippedRecycled;
+            LogLine(L"applier: recovery - pid %lu recycled, skipping %s",
+                    static_cast<unsigned long>(e.pid), e.name.c_str());
+        } else if (o.result == ApplyResult::Gone) {
+            ++skippedDead;   // not live - nothing to undo
         } else {
             ++failed;
-            LogLine(L"applier: recovery - clear FAILED pid %lu (%s): %s err=%lu",
+            keep.push_back(e);
+            LogLine(L"applier: recovery - clear FAILED pid %lu (%s): %s err=%lu - the "
+                    L"record is KEPT so the next launch tries again",
                     static_cast<unsigned long>(e.pid), e.name.c_str(),
                     ApplyResultName(o.result),
                     static_cast<unsigned long>(o.lastError));
@@ -735,9 +871,10 @@ int RecoverFromJournal() {
     }
 
     LogLine(L"applier: recovery - %d entries: %d cleared, %d gone, %d recycled, %d failed",
-            static_cast<int>(entries.size()), cleared, skippedDead, skippedRecycled, failed);
+            static_cast<int>(on.entries.size()), cleared, skippedDead, skippedRecycled,
+            failed);
 
-    JournalWriteLocked(std::vector<JournalEntry>());
+    JournalWriteLocked(keep);
     return cleared;
 }
 

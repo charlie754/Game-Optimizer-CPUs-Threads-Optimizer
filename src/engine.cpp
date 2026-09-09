@@ -22,6 +22,7 @@
 
 #include "agent_transition.h"
 #include "applier.h"
+#include "apply_rules.h"
 #include "games.h"
 #include "procwatch.h"
 #include "util.h"
@@ -579,6 +580,18 @@ size_t ExtremeSweptProcessCount(const EngineStatus& st) {
     return n;
 }
 
+size_t ExtremeSweptNotAppliedCount(const EngineStatus& st) {
+    size_t n = 0;
+    for (size_t i = 0; i < st.governed.size(); ++i) {
+        // applyResult, never `blocked`. They agree today, but `blocked` is a flag the UI
+        // reads and the setter's own answer is the fact - and a row the engine never even
+        // attempted carries the default OtherError with blocked still false.
+        if (st.governed[i].extremeSwept &&
+            st.governed[i].applyResult != ApplyResult::Ok) ++n;
+    }
+    return n;
+}
+
 // ---------------------------------------------------------------------------
 // BuildTooltip - pure
 // ---------------------------------------------------------------------------
@@ -603,15 +616,43 @@ std::wstring BuildTooltip(const EngineStatus& st) {
 // ---------------------------------------------------------------------------
 
 struct Engine::Impl {
-    // What we believe is currently applied to a pid. `blocked` means the apply itself
-    // failed, so nothing landed on that process - we keep the record anyway so the failure
-    // is reported instead of silently retried four times a second.
+    // What we believe about one pid. `blocked` means the apply itself failed, so nothing
+    // landed on that process THIS TIME - we keep the record anyway so the failure is
+    // reported instead of silently retried four times a second.
+    //
+    // IT HAS TO CARRY THREE FACTS THAT ARE NOT THE SAME FACT. Until v0.4.4 it carried only
+    // the LATEST ATTEMPT, which made a failed re-assignment indistinguishable from "nothing
+    // is assigned" - and "blocked" was then read as "there is nothing on this process",
+    // which is false for any pid whose EARLIER assignment succeeded. See apply_rules.h.
     struct AppliedRec {
+        // The LATEST ATTEMPT: which mask this pid was last asked to move to, and how that
+        // attempt ended. The two together are the gate that stops an identical mask being
+        // re-issued every tick, so they must track the attempt and not the success.
+        //
+        // 🔴 BOTH THE NAME AND THE IDS, AND THE IDS ARE THE HALF THAT WAS MISSING. Until
+        // v0.4.4 only the name was kept, so editing mask "Cache" on the Core map and
+        // keeping its name left every already-governed process on the OLD processors for
+        // the life of the run - the gate compared "Cache" with "Cache" and skipped. See
+        // rule 5 in apply_rules.h. Stored NORMALISED (ascending, unique) so the comparison
+        // is a plain vector == on every tick that changes nothing.
         std::wstring maskName;
+        std::vector<ULONG> maskIds;
         std::wstring name;
         ULONGLONG creationTime = 0;
         bool blocked = false;
         ApplyResult applyResult = ApplyResult::OtherError;
+
+        // THE LAST SUCCESSFUL ASSIGNMENT, tracked apart from the latest attempt. A process
+        // moved to Cache and then REFUSED a move to Freq is still on Cache: the attempt
+        // failed, the assignment did not go away, and something has to know that before
+        // this pid stops being wanted or the mask is never taken off.
+        bool everApplied = false;        // a setter has succeeded for this pid at least once
+        std::wstring liveMaskName;       // the mask that succeeded; empty until one does
+
+        // Is there a recovery record on disk for this pid RIGHT NOW? The journal is the
+        // only thing that can undo an assignment after an unclean exit, and this is what
+        // lets a later attempt notice that an earlier failure took the record away.
+        bool journalled = false;
     };
 
     // --- guarded by mu ---------------------------------------------------------------
@@ -675,7 +716,9 @@ struct Engine::Impl {
 
     int Tick();
     void WatcherLoop();
-    void ClearAllApplied();   // caller holds tickMu
+    // Returns the pids whose recovery record may now leave the journal: cleared, or gone.
+    // A pid whose clear FAILED is not in the list and its record is KEPT - see Stop().
+    std::vector<DWORD> ClearAllApplied();   // caller holds tickMu
     void EnsureKnownGames();  // caller holds tickMu; MAY hit the filesystem and registry
     void RefreshAllGamesSpec(Config& cfgCopy, const ProcessSnapshot& snap);
 };
@@ -747,21 +790,44 @@ void Engine::Impl::RefreshAllGamesSpec(Config& cfgCopy, const ProcessSnapshot& s
     all->game = Join(live, L'|');
 }
 
-// Clears every mask we believe we applied. The journal is truncated by the caller, so no
-// per-pid JournalRemove here - that would rewrite the file once per process.
-void Engine::Impl::ClearAllApplied() {
-    for (std::map<DWORD, AppliedRec>::const_iterator it = applied.begin();
-         it != applied.end(); ++it) {
-        if (it->second.blocked) continue;   // nothing ever landed; do not spend a syscall
-        ApplyOutcome oc = ClearCpuSets(it->first);
-        if (oc.result != ApplyResult::Ok && oc.result != ApplyResult::Gone) {
-            LogLine(L"engine: clear pid %lu failed: %s (err %lu)",
-                    static_cast<unsigned long>(it->first),
-                    ApplyResultName(oc.result),
-                    static_cast<unsigned long>(oc.lastError));
+// Clears every mask we believe we applied. The journal is rewritten ONCE by the caller with
+// the pids this returns, so no per-pid JournalRemove here - that would rewrite the file once
+// per process.
+//
+// IT NO LONGER CLEARS THE WHOLE MAP. A clear that FAILED leaves a live process still on our
+// mask; discarding its record and then truncating the journal - which is exactly what this
+// pair did until v0.4.4 - throws away the only two things that could ever undo it. Those
+// records stay, so the next launch's RecoverFromJournal finds them.
+std::vector<DWORD> Engine::Impl::ClearAllApplied() {
+    std::vector<DWORD> done;
+    std::map<DWORD, AppliedRec>::iterator it = applied.begin();
+    while (it != applied.end()) {
+        const DWORD pid = it->first;
+        const AppliedRec& rec = it->second;
+
+        ApplyResult clearResult = ApplyResult::Ok;   // the "there was nothing to clear" answer
+        if (NeedsClearOnLeaving(rec.everApplied)) {
+            ApplyOutcome oc = ClearCpuSets(pid, rec.creationTime);
+            clearResult = oc.result;
+            if (oc.result != ApplyResult::Ok && oc.result != ApplyResult::Gone) {
+                LogLine(L"engine: shutdown clear of pid %lu failed: %s (err %lu) - mask '%s' "
+                        L"is STILL APPLIED; its journal entry is kept so the next launch "
+                        L"undoes it",
+                        static_cast<unsigned long>(pid),
+                        ApplyResultName(oc.result),
+                        static_cast<unsigned long>(oc.lastError),
+                        rec.liveMaskName.c_str());
+            }
+        }
+
+        if (MayDropRecoveryRecord(rec.everApplied, clearResult)) {
+            done.push_back(pid);
+            applied.erase(it++);
+        } else {
+            ++it;
         }
     }
-    applied.clear();
+    return done;
 }
 
 int Engine::Impl::Tick() {
@@ -873,20 +939,45 @@ int Engine::Impl::Tick() {
          it != applied.end(); ++it) {
         if (desired.find(it->first) == desired.end()) toClear.push_back(it->first);
     }
+    // The pids whose recovery record may now leave the file. IT IS NOT `toClear`: a clear
+    // that failed leaves the mask on a live process, and its record is the only thing that
+    // can still undo it. See MayDropRecoveryRecord in apply_rules.h.
+    std::vector<DWORD> clearedPids;
     for (size_t i = 0; i < toClear.size(); ++i) {
-        DWORD pid = toClear[i];
+        const DWORD pid = toClear[i];
         std::map<DWORD, AppliedRec>::iterator a = applied.find(pid);
-        const bool wasBlocked = (a != applied.end() && a->second.blocked);
-        if (!wasBlocked) {
-            ApplyOutcome oc = ClearCpuSets(pid);
-            if (oc.result != ApplyResult::Ok && oc.result != ApplyResult::Gone) {
-                LogLine(L"engine: clear pid %lu failed: %s (err %lu)",
+        if (a == applied.end()) continue;
+        const AppliedRec& rec = a->second;
+
+        ApplyResult clearResult = ApplyResult::Ok;   // the "there was nothing to clear" answer
+        // NOT "was it blocked". A pid whose LAST attempt failed may still be carrying an
+        // EARLIER mask that succeeded, and the old test skipped its clear entirely.
+        if (NeedsClearOnLeaving(rec.everApplied)) {
+            ApplyOutcome oc = ClearCpuSets(pid, rec.creationTime);
+            clearResult = oc.result;
+            if (oc.identityMismatch) {
+                LogLine(L"engine: pid %lu was recycled before its mask could be cleared; "
+                        L"the process behind that pid now is a stranger and is left alone",
+                        static_cast<unsigned long>(pid));
+            } else if (oc.result != ApplyResult::Ok && oc.result != ApplyResult::Gone) {
+                LogLine(L"engine: clear pid %lu failed: %s (err %lu) - mask '%s' is STILL "
+                        L"APPLIED, so its record and journal entry are kept and the next "
+                        L"tick tries again",
                         static_cast<unsigned long>(pid),
                         ApplyResultName(oc.result),
-                        static_cast<unsigned long>(oc.lastError));
+                        static_cast<unsigned long>(oc.lastError),
+                        rec.liveMaskName.c_str());
             }
         }
-        applied.erase(pid);
+
+        // ponytail: a permanently un-clearable live pid is retried every tick for the life
+        // of the run - one OpenProcess each. If that is ever measured as a cost, cap the
+        // retries per pid; it is not capped now because giving up means abandoning a process
+        // on half the machine, which is the worse failure.
+        if (MayDropRecoveryRecord(rec.everApplied, clearResult)) {
+            clearedPids.push_back(pid);
+            applied.erase(a);
+        }
     }
     // ONE rewrite for the whole batch, AFTER every clear. Per-pid JournalRemove cost 4-7 ms
     // each (see applier.h), which is invisible at the six processes rules 2-4 govern and is
@@ -896,11 +987,14 @@ int Engine::Impl::Tick() {
     // AFTER the clears, not before, because that ordering IS the journal's contract: an entry
     // may only leave the file once the assignment it records is gone. Removing first and
     // crashing mid-loop would leave processes masked with nothing on disk to recover them.
-    JournalRemoveMany(toClear);
+    JournalRemoveMany(clearedPids);
 
-    // --- diff: new pids, and pids whose desired mask NAME changed ------------------------
-    // Re-issuing an identical mask every 250 ms would be pointless syscall traffic, so the
-    // name comparison is the whole gate.
+    // --- diff: new pids, and pids whose desired mask CONTENT changed ---------------------
+    // Re-issuing an identical mask every 250 ms would be pointless syscall traffic, so a
+    // pid whose record already says what is wanted is skipped - but "what is wanted" is the
+    // NAME AND THE PROCESSORS, never the name alone. See rule 5 in apply_rules.h for the
+    // bug that cost: a mask edited in place, keeping its name, never reached a single
+    // already-governed process.
     //
     // TWO PASSES SINCE EXTREME GAME MODE, and the split is a cost fix rather than a redesign.
     // The first pass decides what to do and journals EVERY new pid in one rewrite; the second
@@ -912,7 +1006,7 @@ int Engine::Impl::Tick() {
         DWORD pid;
         std::wstring want;
         std::vector<ULONG> ids;
-        bool isNew;
+        bool needsRecord;      // a recovery record must reach disk before the setter may run
         std::wstring name;
         ULONGLONG creationTime;
     };
@@ -920,31 +1014,88 @@ int Engine::Impl::Tick() {
     std::vector<JournalEntry> toJournal;
     pending.reserve(desired.size());
 
+    // THE RESOLVE HAS TO HAPPEN BEFORE THE GATE NOW, because the gate compares processors
+    // and a name cannot supply them. Done naively that is one ResolveMask per DESIRED
+    // PROCESS per tick - ~200 scans of the mask list every 250 ms under extreme game mode,
+    // for an answer that is the same every time. Memoised per mask NAME instead, so the
+    // cost is one resolve per DISTINCT mask - a governing profile names at most two, plus
+    // the empty "clear" name - however many processes it governs.
+    //
+    // Tick-local by construction: it is declared here and dies at the end of the tick, so a
+    // config edit between ticks is always seen. That is the whole point of the fix and a
+    // memo that outlived the tick would re-introduce the bug it exists to close.
+    struct ResolvedMask {
+        bool ok = false;
+        std::vector<ULONG> ids;   // normalised: ascending, no duplicates
+    };
+    std::map<std::wstring, ResolvedMask> resolvedByName;
+
+    // Hoisted so the gate call below allocates nothing for a pid that has no record yet.
+    const std::wstring kNoMaskName;
+    const std::vector<ULONG> kNoMaskIds;
+
     for (std::map<DWORD, std::wstring>::const_iterator it = desired.begin();
          it != desired.end(); ++it) {
         const DWORD pid = it->first;
         const std::wstring& want = it->second;
 
+        std::map<std::wstring, ResolvedMask>::iterator r = resolvedByName.find(want);
+        if (r == resolvedByName.end()) {
+            ResolvedMask rm;
+            std::vector<ULONG> raw;
+            rm.ok = ResolveMask(cfgCopy, want, raw);
+            // NORMALISED ONCE, HERE. config.ini is hand-editable and ParseMaskValue keeps a
+            // mask's ids in file order, so "8,1,3" arrives verbatim; normalising at the one
+            // place they are read keeps the gate's comparison a plain vector == and makes
+            // an order-only edit correctly a non-change. The setter takes these ids as a
+            // SET (applier.cpp - SetProcessDefaultCpuSets), so ordering them changes what
+            // is asked of Windows not at all.
+            if (rm.ok) rm.ids = NormalizedMaskIds(raw);
+            r = resolvedByName.insert(std::make_pair(want, rm)).first;
+            // ONE line per distinct missing mask per tick, not one per process: the sweep
+            // can hold two hundred pids and they would all name the same absent mask.
+            if (!rm.ok) {
+                LogLine(L"engine: profile names mask '%s' which is not in the config; "
+                        L"the processes it would govern are left alone",
+                        want.c_str());
+            }
+        }
+        if (!r->second.ok) continue;
+        const std::vector<ULONG>& wantIds = r->second.ids;
+
         std::map<DWORD, AppliedRec>::iterator a = applied.find(pid);
-        const bool isNew = (a == applied.end());
-        if (!isNew && a->second.maskName == want) continue;
+        const bool haveRecord = (a != applied.end());
+        if (!NeedsReissue(haveRecord,
+                          haveRecord ? a->second.maskName : kNoMaskName,
+                          haveRecord ? a->second.maskIds : kNoMaskIds,
+                          want, wantIds)) {
+            continue;
+        }
 
         Pending p;
         p.pid = pid;
         p.want = want;
-        p.isNew = isNew;
-        if (!ResolveMask(cfgCopy, want, p.ids)) {
-            LogLine(L"engine: profile names mask '%s' which is not in the config; pid %lu left alone",
-                    want.c_str(), static_cast<unsigned long>(pid));
-            continue;
-        }
+        p.ids = wantIds;
 
         const ProcInfo* pi = fresh.Find(pid);
         p.name = pi ? pi->name : std::wstring();
         p.creationTime = pi ? pi->creationTime : 0;
+
+        // 🔴 NOT "is this pid new to the map". A pid whose FIRST assignment was refused
+        // keeps a map entry - blocked - and LOSES its journal entry, so `isNew` said false
+        // on the next attempt and a later success was never recorded. The question the
+        // journal actually asks is whether a record exists on disk.
+        //
+        // A record keyed on a creation time of ZERO is not a record: recovery matches on pid
+        // AND creation time, so such an entry could never be matched to anything and would
+        // sit in the file for ever. We do not write one - and nothing can land without one,
+        // because the setter itself REFUSES a process it cannot identify (see applier.h).
+        const bool recordable = (p.creationTime != 0);
+        p.needsRecord = recordable &&
+                        NeedsRecoveryRecord(haveRecord, haveRecord && a->second.journalled);
         pending.push_back(p);
 
-        if (isNew) {
+        if (p.needsRecord) {
             JournalEntry e;
             e.pid = pid;
             e.creationTime = p.creationTime;
@@ -953,32 +1104,63 @@ int Engine::Impl::Tick() {
         }
     }
 
-    // Written BEFORE any apply below, so a crash between here and a setter call cannot strand
-    // a process on half the machine.
-    JournalAddMany(toJournal);
+    // 🔴 WRITTEN BEFORE ANY APPLY BELOW, AND THE RESULT IS OBEYED. Ordering alone was never
+    // the guarantee: this call returned void until v0.4.4 and only LOGGED a failed write, so
+    // a full disk still pinned every process in the batch with nothing on disk to undo them.
+    // A false here holds those assignments back - see MayApplyAssignment in apply_rules.h.
+    const bool journalOk = JournalAddMany(toJournal);
 
     // The blanket sweep's refusals, collected rather than logged one line each - see the note
     // on extremeSweptOut in engine.h.
     std::vector<std::wstring> extremeDenied;
     // Pids whose entry has to come back OUT: the process was gone, or the apply was refused
-    // so nothing landed. Batched like the adds, and the window that opens between the failure
-    // and the removal is safe in the one direction that matters - the journal briefly names a
-    // pid that carries no assignment, so a crash inside it costs a redundant clear on the next
-    // launch. The reverse mistake, a masked process with no journal entry, is the one the
-    // journal exists to prevent and it is not reachable from here.
+    // and NOTHING OF OURS HAS EVER LANDED ON IT. Batched like the adds, and the window that
+    // opens between the failure and the removal is safe in the one direction that matters -
+    // the journal briefly names a pid that carries no assignment, so a crash inside it costs
+    // a redundant clear on the next launch.
+    //
+    // THE REVERSE MISTAKE - a masked process with no journal entry - USED TO BE REACHABLE
+    // FROM HERE, in two ways, and a comment claiming otherwise is what let both survive
+    // since v0.3.4. Both are now closed: an entry is only dropped when `everApplied` is
+    // false, and an assignment is only attempted when its record reached disk.
     std::vector<DWORD> journalDrop;
+    // Assignments not even attempted because their recovery record could not be written.
+    int heldBack = 0;
 
     for (size_t i = 0; i < pending.size(); ++i) {
         const Pending& p = pending[i];
+
+        if (!MayApplyAssignment(p.needsRecord, journalOk)) {
+            // NOT recorded in `applied`, deliberately: nothing was attempted and nothing
+            // landed, so the next tick must see this pid exactly as this one did and try
+            // the journal write again. The process is left ON ALL CORES, which is the
+            // machine's own default and needs no recovery record to undo.
+            ++heldBack;
+            continue;
+        }
+
+        std::map<DWORD, AppliedRec>::const_iterator prev = applied.find(p.pid);
+        // CARRIED, NOT REBUILT. everApplied / liveMaskName / journalled describe history
+        // this attempt does not erase - a failed move does not un-apply the mask that is
+        // already on the process, nor delete the record that can undo it.
         AppliedRec rec;
+        if (prev != applied.end()) rec = prev->second;
         rec.maskName = p.want;
+        // 🔴 WITH the name, never instead of it. This is the value the next tick's gate
+        // compares against a freshly resolved mask, so a mask edited in place stops looking
+        // identical the moment its processors change.
+        rec.maskIds = p.ids;
         rec.name = p.name;
         rec.creationTime = p.creationTime;
         rec.blocked = false;
+        if (p.needsRecord) rec.journalled = true;   // the batch write above is on disk
 
-        ApplyOutcome oc = p.want.empty() ? ClearCpuSets(p.pid) : ApplyCpuSets(p.pid, p.ids);
+        ApplyOutcome oc = p.want.empty() ? ClearCpuSets(p.pid, p.creationTime)
+                                         : ApplyCpuSets(p.pid, p.ids, p.creationTime);
         rec.applyResult = oc.result;
         if (oc.result == ApplyResult::Ok) {
+            rec.everApplied = true;
+            rec.liveMaskName = p.want;
             applied[p.pid] = rec;
         } else if (oc.result == ApplyResult::Gone) {
             journalDrop.push_back(p.pid);
@@ -987,8 +1169,14 @@ int Engine::Impl::Tick() {
             // AccessDenied / InvalidParameter / OtherError. Recorded, never silently
             // skipped: it is counted into blockedCount and listed by name in Settings.
             rec.blocked = true;
+            // ONLY when nothing of ours has ever landed on this pid. If an earlier mask
+            // succeeded it is still on the process, and its record is the only thing that
+            // can take it off again.
+            if (!rec.everApplied) {
+                journalDrop.push_back(p.pid);
+                rec.journalled = false;
+            }
             applied[p.pid] = rec;
-            if (p.isNew) journalDrop.push_back(p.pid);   // nothing landed, nothing to recover
 
             // ONE LINE PER PROCESS IS RIGHT FOR RULES 2-4 AND WRONG FOR RULE 4b. An app the
             // user named, or one the CPU% rule measured, being refused is news. A blanket
@@ -1030,6 +1218,16 @@ int Engine::Impl::Tick() {
         }
     }
     JournalRemoveMany(journalDrop);
+
+    if (heldBack > 0) {
+        // ONE LINE, AND IT IS NEWS EVERY TIME. A journal write that fails is a disk or a
+        // permission problem, not an expected refusal, and the user is entitled to know that
+        // the app deliberately did nothing rather than that it quietly did the wrong thing.
+        LogLine(L"engine: %d assignment(s) NOT applied this tick - their recovery records "
+                L"could not be written, and an assignment that cannot be undone after a "
+                L"crash is not one this app will make. Those processes stay on all cores.",
+                heldBack);
+    }
 
     if (!extremeDenied.empty()) {
         // Distinct executables, so the line says what a user can act on rather than repeating
@@ -1253,15 +1451,35 @@ void Engine::Stop() {
     if (impl_->stopEvent) SetEvent(impl_->stopEvent);
     if (impl_->worker.joinable()) impl_->worker.join();
 
+    std::vector<DWORD> cleared;
+    size_t stillApplied = 0;
     {
         std::lock_guard<std::mutex> lk(impl_->tickMu);
-        impl_->ClearAllApplied();
+        cleared = impl_->ClearAllApplied();
+        // Read under the lock that guards it, like everything else in this block. The
+        // watcher is joined by now, but a count sampled outside its own lock is a habit
+        // this file does not have.
+        stillApplied = impl_->applied.size();
         impl_->sticky.clear();
         impl_->havePrev = false;
         impl_->lastProfileName.clear();
         impl_->staleTopology = false;
+        // Rule 1's memory is session state like the rest of this block, and leaving it
+        // behind would let a reused Engine object defend an incumbent from the last run.
+        impl_->selection = ProfileSelection();
     }
-    JournalClearAll();
+    // 🔴 TRUNCATE ONLY WHEN THERE IS PROVABLY NOTHING LEFT TO RECOVER. This used to be an
+    // unconditional JournalClearAll(), which threw away the recovery record of every process
+    // whose clear had just FAILED - the one case where the file is the only thing standing
+    // between the user and a process pinned to half the machine until they notice.
+    if (stillApplied == 0) {
+        JournalClearAll();
+    } else {
+        JournalRemoveMany(cleared);
+        LogLine(L"engine: shutdown left %d assignment(s) that could not be cleared; their "
+                L"journal entries are kept so the next launch undoes them",
+                static_cast<int>(stillApplied));
+    }
 
     if (impl_->stopEvent) { CloseHandle(impl_->stopEvent); impl_->stopEvent = nullptr; }
     if (impl_->wakeEvent) { CloseHandle(impl_->wakeEvent); impl_->wakeEvent = nullptr; }

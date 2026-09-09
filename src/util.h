@@ -28,9 +28,32 @@ bool ParseIntW(const std::wstring& s, int& out);
 bool ParseUlongW(const std::wstring& s, unsigned long& out);
 
 // ---- Files -----------------------------------------------------------------
+
+// THREE OUTCOMES, NOT TWO, AND THE THIRD ONE IS A CORRECTNESS REQUIREMENT.
+//
+// "The file is not there" and "the file is there and I could not read it" are opposite
+// facts about the same failed read, and a caller that rewrites the file cannot treat them
+// alike: rewriting over a MISSING file creates it, and rewriting over an UNREADABLE one
+// DESTROYS whatever it held. The restore journal is exactly that caller - it reads, edits
+// and rewrites - and it conflated the two until v0.4.4, so a single unreadable read
+// silently dropped every recovery record on disk.
+//
+// Missing    - CreateFileW answered ERROR_FILE_NOT_FOUND / ERROR_PATH_NOT_FOUND, i.e. there
+//              is provably nothing there.
+// Unreadable - anything else: a sharing violation, a denied ACL, a directory, a file too
+//              large to be one of ours, a read that failed part way. Content MAY exist.
+enum class FileReadResult { Ok, Missing, Unreadable };
+FileReadResult ReadFileUtf8Checked(const std::wstring& path, std::wstring& out);
+
 // UTF-8 on disk, wide in memory. ReadFileUtf8 returns false when the file is absent.
+// It is ReadFileUtf8Checked with the two failures folded back together, kept for the callers
+// that genuinely cannot act on the difference (a missing config is a default config).
 bool ReadFileUtf8(const std::wstring& path, std::wstring& out);
+
 // Writes via a .tmp + MoveFileEx replace, so an interrupted write cannot truncate config.
+// FALSE MEANS NOTHING REACHED DISK: the temp file is deleted and the destination is left
+// exactly as it was. A failed FlushFileBuffers counts as a failure - see util.cpp for why
+// ignoring it made "the journal write succeeded" a claim about a buffer rather than a disk.
 bool WriteFileUtf8Atomic(const std::wstring& path, const std::wstring& text);
 
 // ---- AMD 3D V-Cache status ------------------------------------------------

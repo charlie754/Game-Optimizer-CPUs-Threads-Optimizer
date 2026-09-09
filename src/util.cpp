@@ -331,24 +331,38 @@ bool ParseUlongW(const std::wstring& s, unsigned long& out) {
 
 // ---- Files -----------------------------------------------------------------
 
-bool ReadFileUtf8(const std::wstring& path, std::wstring& out) {
+FileReadResult ReadFileUtf8Checked(const std::wstring& path, std::wstring& out) {
     out.clear();
-    if (path.empty()) return false;
+    // An empty path names nothing, and nothing is not the same as a file we failed to read.
+    // Missing is the honest answer and it is the SAFE one for a rewriting caller: it creates.
+    if (path.empty()) return FileReadResult::Missing;
 
+    ::SetLastError(ERROR_SUCCESS);
     HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ,
                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return false;   // absent -> false, per header
+    if (h == INVALID_HANDLE_VALUE) {
+        // ONLY these two mean "there is provably nothing there". A sharing violation, a
+        // denied ACL or a directory all mean content MAY exist and we could not see it -
+        // see the enum comment in util.h for why a rewriting caller must not confuse them.
+        const DWORD err = ::GetLastError();
+        if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND)
+            return FileReadResult::Missing;
+        return FileReadResult::Unreadable;
+    }
 
     LARGE_INTEGER size;
     size.QuadPart = 0;
     if (!::GetFileSizeEx(h, &size)) {
         ::CloseHandle(h);
-        return false;
+        return FileReadResult::Unreadable;
     }
     if (size.QuadPart > 64ll * 1024ll * 1024ll) {   // refuse absurd config files
+        // The file EXISTS and holds more than we are willing to parse. Reporting that as
+        // "missing" would invite the caller to REPLACE it, which is the one thing that must
+        // not happen to a file whose contents we never saw.
         ::CloseHandle(h);
-        return false;
+        return FileReadResult::Unreadable;
     }
 
     std::string raw(static_cast<size_t>(size.QuadPart), '\0');
@@ -359,7 +373,7 @@ bool ReadFileUtf8(const std::wstring& path, std::wstring& out) {
         DWORD read = 0;
         if (!::ReadFile(h, &raw[got], want, &read, nullptr)) {
             ::CloseHandle(h);
-            return false;
+            return FileReadResult::Unreadable;
         }
         if (read == 0) break;
         got += read;
@@ -376,7 +390,11 @@ bool ReadFileUtf8(const std::wstring& path, std::wstring& out) {
     }
 
     out = Widen(raw);
-    return true;
+    return FileReadResult::Ok;
+}
+
+bool ReadFileUtf8(const std::wstring& path, std::wstring& out) {
+    return ReadFileUtf8Checked(path, out) == FileReadResult::Ok;
 }
 
 bool WriteFileUtf8Atomic(const std::wstring& path, const std::wstring& text) {
@@ -410,7 +428,12 @@ bool WriteFileUtf8Atomic(const std::wstring& path, const std::wstring& text) {
         }
     }
 
-    if (ok) ::FlushFileBuffers(h);
+    // FLUSH FAILURE IS A WRITE FAILURE, and until v0.4.4 this return value was discarded.
+    // WriteFile only reaches the cache; FlushFileBuffers is what puts the bytes on the
+    // platter, and this function's whole promise to the restore journal is "false means
+    // nothing reached disk". Swallowing it made that promise about a buffer instead - and
+    // the journal exists precisely for the crash that happens before a cache is flushed.
+    if (ok && !::FlushFileBuffers(h)) ok = false;
     ::CloseHandle(h);
 
     if (!ok) {

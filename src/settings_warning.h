@@ -108,7 +108,7 @@ inline bool AutoPinControlsEnabled(bool extremeModeChecked) {
 // off - it is stored, untouched, and simply cannot add anything - and a greyed control whose
 // sentence still reports "Active - 3 apps moved" is two answers to one question.
 inline std::wstring AutoPinSupersededByExtremeText() {
-    return L"Extreme game mode already moves every background process, so this rule cannot "
+    return L"Extreme game mode already covers every background process, so this rule cannot "
            L"add anything while it is on.";
 }
 
@@ -282,29 +282,79 @@ inline std::wstring FormatBlockedProcessesLine(const std::vector<std::wstring>& 
 // told both numbers rather than one number twice.
 //
 // `processCount` comes from ExtremeSweptProcessCount and is NOT the sum of `exes`, on
-// purpose: a process whose name could not be read is dropped from the grouping and still
-// moved, so summing the groups would under-report what the app did.
+// purpose: a process whose name could not be read is dropped from the grouping and was still
+// requested, so summing the groups would under-report what the app asked for.
+//
+// 🔴 IT REPORTS WHAT WAS REQUESTED AND WHAT DID NOT LAND. IT MUST NEVER SAY "MOVED".
+// v0.4.3 shipped "Extreme game mode also moved N processes in M apps to <mask>", built from
+// a count that includes every REFUSED assignment - and this app runs unelevated on purpose,
+// so [M] ~41 processes on the operator's own desktop refuse it on every single tick. The
+// sentence therefore over-stated the count AND claimed effective placement, which this
+// product cannot observe at all: applier.h records a MEASURED case where the setter returned
+// TRUE, the getter echoed all 16 ids, and not one of those processors ran a sample. The
+// honest verb is what this app DID - it requested - and the refusals are named beside it.
+//
+// `notApplied` comes from ExtremeSweptNotAppliedCount. It is folded into the sentence rather
+// than given a row of its own because the two numbers are only meaningful together: "147
+// requested" alone over-claims and "41 refused" alone is a fragment.
+//
+// 🔴 AND IT IS THE LAST CLAUSE, NEVER THE ONE THAT INTRODUCES THE LIST. v0.4.4 got the
+// words right and the PLACE wrong: it spliced the refusal clause in front of the colon, so
+// the row on the operator's machine read "... requested Freq for 197 processes in 90 apps;
+// 44 were not applied: conhost.exe x19, obs-browser-page.exe x16, chrome.exe x14,
+// msedgewebview2.exe x12 and 86 more apps." A colon binds what follows it to the number in
+// front of it, so that sentence offers those four apps as the breakdown of the 44. THEY ARE
+// NOT. The list is the largest contributors to the 197 REQUESTS, and [M] three checks on
+// that same screen each refute the plain reading:
+//
+//   19+16+14+12 = 61, which already exceeds the 44 the clause claims to be enumerating;
+//   4 named + "86 more apps" = 90, the app count of the 197 - not the 38 apps the Setting
+//     page reports for the refusals;
+//   chrome.exe is ABSENT from that page's case-insensitive alphabetical blocked list, where
+//     it would sort between choice.exe and ChtIME.exe - yet it is named here as "not
+//     applied". All four also carry an amber SWEPT badge in the list ~300 px above, so ONE
+//     screen said "swept" and "not applied" about the same four executables.
+//
+// So the ORDER is load-bearing rather than a matter of taste: the head, then the list its
+// own colon introduces, then the refusal clause behind a semicolon that closes the list.
+// The names are then bound to the apps, and the refusal count stands alone with nothing to
+// attach to. The exes.empty() branch obeys the same rule for the same reason - see there.
 //
 // EMPTY MEANS DRAW NOTHING. The row takes height only while it has something to say, exactly
 // as the AMD V-Cache row above it does.
 inline std::wstring FormatExtremeSweptLine(const std::vector<SweptExe>& exes,
                                            size_t processCount,
+                                           size_t notApplied,
                                            const std::wstring& maskName,
                                            size_t maxNamed,
                                            size_t maxListChars) {
     if (processCount == 0) return std::wstring();
     const std::wstring mask =
         maskName.empty() ? std::wstring(L"the background mask") : maskName;
-    std::wstring head = L"Extreme game mode also moved " + std::to_wstring(processCount) +
+    // Defensive: a caller that hands in more refusals than requests would otherwise print a
+    // sentence that cannot be true. Clamped rather than asserted - this is a status row.
+    if (notApplied > processCount) notApplied = processCount;
+    const std::wstring tail =
+        notApplied == 0 ? std::wstring()
+                        : (L"; " + std::to_wstring(notApplied) + L" were not applied");
+
+    std::wstring head = L"Extreme game mode also requested " + mask + L" for " +
+                        std::to_wstring(processCount) +
                         (processCount == 1 ? L" process" : L" processes");
     // Every swept process was an executable the user had ALREADY named, so the grouping is
     // empty while the sweep is plainly working. Naming zero apps under a non-zero count would
     // read as a defect in this line rather than as the true statement it is.
+    //
+    // `tail` GOES LAST HERE TOO, and for the same reason the list branch below needs it to:
+    // "12 processes; 4 were not applied, all of them apps you already listed above" attaches
+    // "all of them" to the four REFUSALS, when what it qualifies is the twelve REQUESTS.
     if (exes.empty()) {
-        return head + L" to " + mask + L", all of them apps you already listed above.";
+        return head + L", all of them apps you already listed above" + tail + L".";
     }
+    // The colon introduces the APP LIST and nothing else. Nothing may be spliced between the
+    // app count and that colon - see the header note above.
     head += L" in " + std::to_wstring(exes.size()) +
-            (exes.size() == 1 ? L" app to " : L" apps to ") + mask + L": ";
+            (exes.size() == 1 ? L" app" : L" apps") + L": ";
 
     std::wstring list;
     size_t shown = 0;
@@ -324,7 +374,42 @@ inline std::wstring FormatExtremeSweptLine(const std::vector<SweptExe>& exes,
         const size_t rest = exes.size() - shown;
         list += L" and " + std::to_wstring(rest) + (rest == 1 ? L" more app" : L" more apps");
     }
-    return head + list + L".";
+    // head : list ; refusals .  - the refusal clause closes the sentence and introduces
+    // nothing. `tail` is empty when nothing was refused, so there is no dangling separator.
+    return head + list + tail + L".";
+}
+
+// ---- WHICH profile is the engine governing? ----------------------------------------------
+
+// Pure. Given, for every profile in the working config, whether it matches the engine's
+// published status EXACTLY (by name) and whether it matches only through the game-executable
+// FALLBACK, which one is the governing profile? -1 for "cannot tell".
+//
+// THE FALLBACK IS A RENAME HELPER AND IT WAS BEING USED AS AN IDENTITY. StatusDescribesProfile
+// answers "is this profile the active one" and deliberately falls back to matching the game
+// executable, so a profile the operator has renamed but not yet applied is still recognised.
+// Scanning the list and taking the FIRST profile that answers yes then picks whichever comes
+// first in the file - so a DISABLED profile A and an enabled profile B naming the same
+// executable put the NOW pill, and the panel-follow, on A while the engine governs B.
+//
+// Two rules, and the second is the one that makes the first safe:
+//   1. AN EXACT NAME MATCH ANYWHERE IN THE LIST BEATS EVERY FALLBACK. The name is what the
+//      engine actually publishes; the executable is an inference about it.
+//   2. A FALLBACK IS ONLY USED WHEN IT IS UNAMBIGUOUS. Two profiles sharing one executable
+//      say nothing about which is governing, and guessing is how the wrong panel is shown
+//      with full confidence. -1 leaves the selection alone, which is the honest answer.
+inline int PickGoverningProfile(const std::vector<bool>& exactNameMatch,
+                                const std::vector<bool>& fallbackMatch) {
+    for (size_t i = 0; i < exactNameMatch.size(); ++i)
+        if (exactNameMatch[i]) return static_cast<int>(i);
+
+    int only = -1;
+    for (size_t i = 0; i < fallbackMatch.size(); ++i) {
+        if (!fallbackMatch[i]) continue;
+        if (only >= 0) return -1;          // ambiguous - two profiles, one executable
+        only = static_cast<int>(i);
+    }
+    return only;
 }
 
 // ---- Does the Profiles panel follow the profile the engine is actually governing? ---------

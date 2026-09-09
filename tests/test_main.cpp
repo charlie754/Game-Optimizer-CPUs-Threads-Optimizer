@@ -32,6 +32,7 @@
 
 #include "agent_transition.h"
 #include "applier.h"
+#include "apply_rules.h"
 #include "config.h"
 #include "engine.h"
 #include "mask_merge.h"
@@ -228,6 +229,29 @@ std::string Show(cd::SelectReason r) {
         case cd::SelectReason::Cleared: return "SelectReason::Cleared";
     }
     return "SelectReason::<bad>";
+}
+
+// The applier's outcome enum and the file reader's three-valued answer. REQUIRED, not
+// optional - see the note above IrqRefusal: CHECK_EQ on a type with no Show() overload is a
+// compile error in this harness rather than an ugly diagnostic.
+std::string Show(cd::ApplyResult r) {
+    switch (r) {
+        case cd::ApplyResult::Ok: return "ApplyResult::Ok";
+        case cd::ApplyResult::AccessDenied: return "ApplyResult::AccessDenied";
+        case cd::ApplyResult::Gone: return "ApplyResult::Gone";
+        case cd::ApplyResult::InvalidParameter: return "ApplyResult::InvalidParameter";
+        case cd::ApplyResult::OtherError: return "ApplyResult::OtherError";
+    }
+    return "ApplyResult::<bad>";
+}
+
+std::string Show(cd::FileReadResult r) {
+    switch (r) {
+        case cd::FileReadResult::Ok: return "FileReadResult::Ok";
+        case cd::FileReadResult::Missing: return "FileReadResult::Missing";
+        case cd::FileReadResult::Unreadable: return "FileReadResult::Unreadable";
+    }
+    return "FileReadResult::<bad>";
 }
 
 std::string Show(cd::MaskNameProblem p) {
@@ -5196,8 +5220,11 @@ void Test_Z9_AutoPinGreysUnderExtremeMode() {
     // whole point of this change is that Profile::autoPin is NOT touched.
     const std::wstring superseded = cd::AutoPinSupersededByExtremeText();
     CHECK_EQ(superseded,
-             L"Extreme game mode already moves every background process, so this rule cannot "
+             L"Extreme game mode already covers every background process, so this rule cannot "
              L"add anything while it is on.");
+    // AND IT NO LONGER SAYS "moves". Same reason as AC3d: this app requests an assignment
+    // and Windows may refuse it, so no status line may state the move as a fact.
+    CHECK(superseded.find(L"moves") == std::wstring::npos);
     CHECK(superseded.find(L"is off") == std::wstring::npos);
     CHECK(superseded.find(L"Extreme game mode") != std::wstring::npos);
 
@@ -5485,19 +5512,175 @@ void Test_AC3_SweepLineReportsBothCountsAndTheMask() {
     std::vector<cd::SweptExe> exes;
     cd::SweptExe a; a.name = L"chrome.exe";  a.count = 3; exes.push_back(a);
     cd::SweptExe b; b.name = L"svchost.exe"; b.count = 2; exes.push_back(b);
-    CHECK_EQ(cd::FormatExtremeSweptLine(exes, 5, L"Freq", 0, 0),
-             L"Extreme game mode also moved 5 processes in 2 apps to Freq: "
+    CHECK_EQ(cd::FormatExtremeSweptLine(exes, 5, 0, L"Freq", 0, 0),
+             L"Extreme game mode also requested Freq for 5 processes in 2 apps: "
              L"chrome.exe x3, svchost.exe x2.");
 
     Case("AC3b one process of one app reads as singular in both places");
     std::vector<cd::SweptExe> one;
     cd::SweptExe c; c.name = L"a.exe"; c.count = 1; one.push_back(c);
-    CHECK_EQ(cd::FormatExtremeSweptLine(one, 1, L"Freq", 0, 0),
-             L"Extreme game mode also moved 1 process in 1 app to Freq: a.exe x1.");
+    CHECK_EQ(cd::FormatExtremeSweptLine(one, 1, 0, L"Freq", 0, 0),
+             L"Extreme game mode also requested Freq for 1 process in 1 app: a.exe x1.");
 
     Case("AC3c an unnamed mask is described rather than left blank");
-    CHECK(cd::FormatExtremeSweptLine(one, 1, L"", 0, 0)
+    CHECK(cd::FormatExtremeSweptLine(one, 1, 0, L"", 0, 0)
               .find(L"the background mask") != std::wstring::npos);
+
+    // ---- THE v0.4.3 DEFECT, PINNED --------------------------------------------------
+    // CATCHES the sentence claiming EFFECTIVE PLACEMENT for assignments Windows refused.
+    // This app runs unelevated on purpose and [M] ~41 processes on the operator's desktop
+    // refuse the mask on every tick, so "moved N processes" over-stated the count and made a
+    // claim about placement that applier.h's own measurements forbid. The refusals now
+    // travel with the count, and the verb is what this app DID.
+    Case("AC3d THE WORD 'moved' IS BANNED - the sentence says what was REQUESTED");
+    const std::wstring refused = cd::FormatExtremeSweptLine(exes, 147, 41, L"Freq", 0, 0);
+    // The refusal clause CLOSES the sentence; it does not introduce the app list. Test_AC7
+    // is what pins that placement - see there for the defect it was written from.
+    CHECK_EQ(refused,
+             L"Extreme game mode also requested Freq for 147 processes in 2 apps: "
+             L"chrome.exe x3, svchost.exe x2; 41 were not applied.");
+    // POSITIVE CONTROL: the scan must find the banned word when it really is there.
+    CHECK(std::wstring(L"also moved 5 processes").find(L"moved") != std::wstring::npos);
+    CHECK(refused.find(L"moved") == std::wstring::npos);
+    CHECK(cd::FormatExtremeSweptLine(exes, 5, 0, L"Freq", 0, 0).find(L"moved") ==
+          std::wstring::npos);
+
+    Case("AC3e no refusals means no refusal clause - the sentence does not carry a zero");
+    CHECK(cd::FormatExtremeSweptLine(exes, 5, 0, L"Freq", 0, 0).find(L"not applied") ==
+          std::wstring::npos);
+    CHECK(cd::FormatExtremeSweptLine(exes, 5, 1, L"Freq", 0, 0).find(L"1 were not applied") !=
+          std::wstring::npos);
+
+    Case("AC3f every request refused still reports the request, and never a negative");
+    const std::wstring allRefused = cd::FormatExtremeSweptLine(exes, 5, 5, L"Freq", 0, 0);
+    CHECK(allRefused.find(L"for 5 processes") != std::wstring::npos);
+    CHECK(allRefused.find(L"5 were not applied") != std::wstring::npos);
+    // A caller handing in more refusals than requests is clamped, not printed.
+    CHECK(cd::FormatExtremeSweptLine(exes, 5, 9, L"Freq", 0, 0).find(L"9 were not applied") ==
+          std::wstring::npos);
+}
+
+void Test_AC6_SweptNotAppliedCountsTheSettersOwnAnswer() {
+    // CATCHES the arithmetic behind AC3d: a refusal count derived from rule INTENT rather
+    // than from the setter's result. Every row below is extremeSwept - the rule chose all of
+    // them - and only the applyResult tells them apart.
+    Case("AC6 the refusal count comes from applyResult, never from the sweep flag");
+    cd::EngineStatus st;
+    cd::GovernedProcess ok1 = Swept(101, L"a.exe"); ok1.applyResult = cd::ApplyResult::Ok;
+    cd::GovernedProcess ok2 = Swept(102, L"a.exe"); ok2.applyResult = cd::ApplyResult::Ok;
+    cd::GovernedProcess den = Swept(103, L"b.exe");
+    den.applyResult = cd::ApplyResult::AccessDenied;
+    den.blocked = true;
+    cd::GovernedProcess bad = Swept(104, L"c.exe");
+    bad.applyResult = cd::ApplyResult::InvalidParameter;
+    bad.blocked = true;
+    // Held back because its recovery record could not be written: never attempted, so it
+    // carries the default OtherError and blocked is still FALSE. A count keyed on `blocked`
+    // would miss this row, which is why the helper reads applyResult.
+    cd::GovernedProcess held = Swept(105, L"d.exe");
+    st.governed.push_back(ok1);
+    st.governed.push_back(ok2);
+    st.governed.push_back(den);
+    st.governed.push_back(bad);
+    st.governed.push_back(held);
+    // A rule-4 pid that was refused is NOT the sweep's business and must not be counted.
+    cd::GovernedProcess other = Gov(106, L"e.exe", true);
+    other.applyResult = cd::ApplyResult::AccessDenied;
+    st.governed.push_back(other);
+
+    CHECK_EQ((int)cd::ExtremeSweptProcessCount(st), 5);
+    CHECK_EQ((int)cd::ExtremeSweptNotAppliedCount(st), 3);
+
+    Case("AC6b everything accepted reports no refusals at all");
+    cd::EngineStatus clean;
+    clean.governed.push_back(ok1);
+    clean.governed.push_back(ok2);
+    CHECK_EQ((int)cd::ExtremeSweptProcessCount(clean), 2);
+    CHECK_EQ((int)cd::ExtremeSweptNotAppliedCount(clean), 0);
+}
+
+// THE v0.4.4 DEFECT, PINNED. A test that passes both before and after a change proves nothing
+// about the change, so this one was run against BOTH: [M] compiled against the pre-change
+// formatter (git c59a85a) on 2026-09-09, the assertions here and in AC5c fail 11 of 16 - and
+// the one that must NOT fail, the positive control below, passes on both. What v0.4.4 rendered
+// for AC7's own inputs was
+//   "Extreme game mode also requested Freq for 147 processes in 2 apps; 41 were not applied:
+//    chrome.exe x3, svchost.exe x2."
+//
+// WHAT WENT WRONG, and it was one `+ tail` in the wrong operand: the refusal clause was
+// concatenated into the HEAD, immediately in front of the colon that introduces the app list.
+// A colon binds what follows it to the number in front of it, so the sentence offered the
+// four named apps as the breakdown of the 44 refusals. [M] On the operator's own screen they
+// were nothing of the kind - 19+16+14+12 = 61 exceeds 44 outright; the 4 named plus "86 more
+// apps" reconstruct the 90 apps of the 197 REQUESTS, not the 38 apps of the refusals; and
+// chrome.exe, named in the clause, is absent from the Setting page's own alphabetical blocked
+// list where it would sort between choice.exe and ChtIME.exe. All four also wore an amber
+// SWEPT badge 300 px up the same page.
+//
+// IF THE LOGIC BREAKS AGAIN this test says so in the specific way that matters: not "the
+// string changed" but "a number is once more offering a list of apps as its own contents".
+void Test_AC7_RefusalCountNeverIntroducesTheAppList() {
+    Case("AC7 the refusal count is the LAST clause and introduces nothing");
+    std::vector<cd::SweptExe> exes;
+    cd::SweptExe a; a.name = L"chrome.exe";  a.count = 3; exes.push_back(a);
+    cd::SweptExe b; b.name = L"svchost.exe"; b.count = 2; exes.push_back(b);
+    const std::wstring s = cd::FormatExtremeSweptLine(exes, 147, 41, L"Freq", 0, 0);
+
+    // 1. NO COLON MAY FOLLOW THE REFUSAL CLAUSE. The colon IS the binding, so its absence
+    //    there is the property, and an executable name behind it is the observed symptom.
+    CHECK(s.find(L"were not applied:") == std::wstring::npos);
+    CHECK(s.find(L"were not applied: chrome.exe") == std::wstring::npos);
+    // POSITIVE CONTROL: the scan really can see that shape - it is v0.4.4's own output.
+    CHECK(std::wstring(L"in 2 apps; 41 were not applied: chrome.exe x3, svchost.exe x2.")
+              .find(L"were not applied: chrome.exe") != std::wstring::npos);
+
+    // 2. THE LIST COMES FIRST, THE REFUSAL CLAUSE LAST. Ordering, not spelling: a rewording
+    //    that keeps the words and restores the old order still fails here.
+    const size_t firstName = s.find(L"chrome.exe x3");
+    const size_t lastName  = s.find(L"svchost.exe x2");
+    const size_t refusal   = s.find(L"41 were not applied");
+    CHECK(firstName != std::wstring::npos);
+    CHECK(lastName != std::wstring::npos);
+    CHECK(refusal != std::wstring::npos);
+    CHECK(firstName < refusal);
+    CHECK(lastName < refusal);
+    // 3. And the colon that DOES introduce the list belongs to the app count.
+    CHECK(s.find(L"in 2 apps: chrome.exe x3") != std::wstring::npos);
+    // 4. Nothing trails the refusal clause but the full stop.
+    CHECK_EQ(s.substr(s.size() - 22), std::wstring(L"; 41 were not applied."));
+
+    Case("AC7b a TRUNCATED list and a refusal count in one sentence stay separate");
+    // CATCHES the interaction the move creates: "and N more apps" is appended to the LIST and
+    // the refusal clause to the SENTENCE, so a naive fix that appends the tail before the
+    // truncation clause would read "... x27; 44 were not applied and 26 more apps."
+    std::vector<cd::SweptExe> lots;
+    for (int i = 0; i < 30; ++i) {
+        wchar_t nm[32];
+        swprintf_s(nm, 32, L"app%02d.exe", i);
+        cd::SweptExe e;
+        e.name = nm;
+        e.count = static_cast<size_t>(30 - i);
+        lots.push_back(e);
+    }
+    const std::wstring cut = cd::FormatExtremeSweptLine(lots, 465, 44, L"Freq", 4, 85);
+    CHECK_EQ(cut,
+             L"Extreme game mode also requested Freq for 465 processes in 30 apps: "
+             L"app00.exe x30, app01.exe x29, app02.exe x28, app03.exe x27 and 26 more apps; "
+             L"44 were not applied.");
+    // The truncation clause stays welded to the list it truncates.
+    CHECK(cut.find(L"x27 and 26 more apps;") != std::wstring::npos);
+    CHECK(cut.find(L"and 26 more apps") < cut.find(L"44 were not applied"));
+    CHECK(cut.find(L"were not applied:") == std::wstring::npos);
+    // And the whole thing still fits the row it has to fit - see AC4e for that budget.
+    CHECK(cut.size() <= 192);
+
+    Case("AC7c with nothing refused the sentence simply ends - no dangling separator");
+    const std::wstring none = cd::FormatExtremeSweptLine(exes, 5, 0, L"Freq", 0, 0);
+    CHECK_EQ(none,
+             L"Extreme game mode also requested Freq for 5 processes in 2 apps: "
+             L"chrome.exe x3, svchost.exe x2.");
+    CHECK(none.find(L";") == std::wstring::npos);
+    CHECK(none.find(L"..") == std::wstring::npos);
 }
 
 void Test_AC4_SweepLineCapsByCountAndByLength() {
@@ -5515,7 +5698,7 @@ void Test_AC4_SweepLineCapsByCountAndByLength() {
         e.count = static_cast<size_t>(30 - i);   // strictly descending, so the order is fixed
         lots.push_back(e);
     }
-    const std::wstring capped = cd::FormatExtremeSweptLine(lots, 465, L"Freq", 4, 114);
+    const std::wstring capped = cd::FormatExtremeSweptLine(lots, 465, 0, L"Freq", 4, 85);
     CHECK(capped.find(L"465 processes in 30 apps") != std::wstring::npos);
     CHECK(capped.find(L"app00.exe x30") != std::wstring::npos);
     CHECK(capped.find(L"app03.exe x27") != std::wstring::npos);
@@ -5533,7 +5716,7 @@ void Test_AC4_SweepLineCapsByCountAndByLength() {
         longNames.push_back(e);
     }
     // Same maxNamed as above, so anything that fails here failed on LENGTH alone.
-    const std::wstring cut = cd::FormatExtremeSweptLine(longNames, 30, L"Freq", 4, 114);
+    const std::wstring cut = cd::FormatExtremeSweptLine(longNames, 30, 0, L"Freq", 4, 85);
     CHECK(cut.find(L"averyveryverylongexecutablename00.exe x9") != std::wstring::npos);
     CHECK(cut.find(L"averyveryverylongexecutablename01.exe x8") != std::wstring::npos);
     CHECK(cut.find(L"averyveryverylongexecutablename02.exe") == std::wstring::npos);
@@ -5546,14 +5729,44 @@ void Test_AC4_SweepLineCapsByCountAndByLength() {
     big.count = 4;
     huge.push_back(big);
     cd::SweptExe small; small.name = L"b.exe"; small.count = 1; huge.push_back(small);
-    const std::wstring forced = cd::FormatExtremeSweptLine(huge, 5, L"Freq", 4, 114);
+    const std::wstring forced = cd::FormatExtremeSweptLine(huge, 5, 0, L"Freq", 4, 85);
     CHECK(forced.find(big.name) != std::wstring::npos);
     CHECK(forced.find(L"b.exe") == std::wstring::npos);
     CHECK(forced.find(L"and 1 more app") != std::wstring::npos);
 
     Case("AC4d a cap of 0 on either axis means no cap");
-    CHECK(cd::FormatExtremeSweptLine(lots, 465, L"Freq", 0, 0).find(L"app29.exe x1") !=
+    CHECK(cd::FormatExtremeSweptLine(lots, 465, 0, L"Freq", 0, 0).find(L"app29.exe x1") !=
           std::wstring::npos);
+
+    Case("AC4e THE WHOLE SENTENCE STILL FITS THE ROW - the budget is re-derived, not copied");
+    // CATCHES the failure this budget exists for, in the direction a REWORDING breaks it: the
+    // row is a fixed Dp(48), which is [M] three lines of Font::UiSmall at 96 dpi and about 192
+    // characters at that column width. kExtremeListChars caps only the LIST, so a longer fixed
+    // head silently eats the margin and the promise is clipped instead of truncated.
+    //
+    // [M] v0.4.3's head was 63 characters and the budget shipped as 114. v0.4.4's honest
+    // sentence carried its refusal clause inside the head: 89 + 85 + 18 (" and 58 more
+    // apps.") = 192. Moving that clause behind the list splits the same 107 the other way -
+    // head 68, and a tail of " and 58 more apps" 17 + "; 41 were not applied" 21 + "." 1 =
+    // 39, so 68 + 85 + 39 = 192 and the constant did not have to move. THIS ASSERTS THE SUM
+    // AND NOT THE CONSTANT, which is the only reason a pure re-ordering could be checked
+    // rather than assumed - and the next rewording, which will not be pure, has to re-derive
+    // it too. The `worst` case below carries a refusal count precisely so the tail it now
+    // owns is inside the measurement.
+    std::vector<cd::SweptExe> typical;
+    for (int i = 0; i < 62; ++i) {
+        wchar_t nm[64];
+        swprintf_s(nm, 64, L"msedgewebview%02d.exe", i);   // 22 chars with its " x12" suffix
+        cd::SweptExe e;
+        e.name = nm;
+        e.count = 12;
+        typical.push_back(e);
+    }
+    const std::wstring worst =
+        cd::FormatExtremeSweptLine(typical, 147, 41, L"Freq", 4, 85);
+    CHECK(worst.size() <= 192);
+    // POSITIVE CONTROL: the same inputs with no cap at all blow straight past the row.
+    CHECK(cd::FormatExtremeSweptLine(typical, 147, 41, L"Freq", 0, 0).size() > 192);
 }
 
 void Test_AC5_SweepLineIsSilentWithNothingToSay() {
@@ -5562,13 +5775,32 @@ void Test_AC5_SweepLineIsSilentWithNothingToSay() {
     // because every process it moved was one the user had already named.
     Case("AC5 nothing swept produces NO sentence at all, so the row takes no height");
     std::vector<cd::SweptExe> none;
-    CHECK_EQ(cd::FormatExtremeSweptLine(none, 0, L"Freq", 4, 114), L"");
+    CHECK_EQ(cd::FormatExtremeSweptLine(none, 0, 0, L"Freq", 4, 85), L"");
 
     Case("AC5b processes swept but every app already listed still reports the count");
-    const std::wstring all = cd::FormatExtremeSweptLine(none, 12, L"Freq", 4, 114);
+    const std::wstring all = cd::FormatExtremeSweptLine(none, 12, 0, L"Freq", 4, 85);
+    CHECK_EQ(all,
+             L"Extreme game mode also requested Freq for 12 processes, all of them apps you "
+             L"already listed above.");
     CHECK(all.find(L"12 processes") != std::wstring::npos);
     CHECK(all.find(L"already listed above") != std::wstring::npos);
     CHECK(all.find(L"0 apps") == std::wstring::npos);
+
+    Case("AC5c that branch reports refusals too - it is not a place the count can hide");
+    const std::wstring allRefused = cd::FormatExtremeSweptLine(none, 12, 4, L"Freq", 4, 85);
+    // AND "all of them" QUALIFIES THE TWELVE REQUESTS, NOT THE FOUR REFUSALS. v0.4.4 built
+    // this branch as head + tail + ", all of them apps you already listed above.", which
+    // reads "; 4 were not applied, all of them apps you already listed above" - the same
+    // mis-binding Test_AC7 pins for the list branch, in the branch that has no list.
+    CHECK_EQ(allRefused,
+             L"Extreme game mode also requested Freq for 12 processes, all of them apps you "
+             L"already listed above; 4 were not applied.");
+    CHECK(allRefused.find(L"12 processes") != std::wstring::npos);
+    CHECK(allRefused.find(L"4 were not applied") != std::wstring::npos);
+    CHECK(allRefused.find(L"already listed above") != std::wstring::npos);
+    CHECK(allRefused.find(L"moved") == std::wstring::npos);
+    // The refusal clause is last, so nothing trails it that could attach to it.
+    CHECK(allRefused.find(L"not applied") > allRefused.find(L"already listed above"));
 }
 
 // ===========================================================================
@@ -5654,6 +5886,633 @@ void Test_AD4_NothingGoverningNeverMovesTheSelection() {
     cd::ProfileFollowInputs half = Following(-1, 0);
     half.haveGoverning = true;             // inconsistent input, refused rather than trusted
     CHECK(!cd::ShouldFollowGoverningProfile(half));
+}
+
+
+void Test_AD5_TheFollowPicksTheProfileTheEngineNAMES() {
+    // CATCHES the latent defect the v0.4.3 review found: GoverningProfileIndex took the FIRST
+    // profile that StatusDescribesProfile accepted, and that helper falls back to matching the
+    // GAME EXECUTABLE so a renamed profile is still recognised. With two profiles naming one
+    // executable the fallback fires on whichever comes first in the file, so an earlier -
+    // possibly disabled - profile takes the NOW pill and the panel-follow while the engine is
+    // governing the later one.
+    //
+    // [M] Not reachable in the operator's current config, where every profile has a distinct
+    // game=. It is one duplicated executable away from being reachable.
+    Case("AD5 an exact name match ANYWHERE beats an executable fallback that comes first");
+    std::vector<bool> exact(3, false), fallback(3, false);
+    fallback[0] = true;    // profile A: same exe, wrong profile
+    exact[2] = true;       // profile B: the one the engine actually names
+    CHECK_EQ(cd::PickGoverningProfile(exact, fallback), 2);
+
+    Case("AD5b with no exact match a SINGLE fallback is still used - renames keep working");
+    std::vector<bool> noExact(3, false), oneFallback(3, false);
+    oneFallback[1] = true;
+    CHECK_EQ(cd::PickGoverningProfile(noExact, oneFallback), 1);
+
+    Case("AD5c two fallbacks say nothing about which is governing, so nothing is chosen");
+    std::vector<bool> two(3, false);
+    two[0] = true;
+    two[2] = true;
+    CHECK_EQ(cd::PickGoverningProfile(noExact, two), -1);
+
+    Case("AD5d nothing matching at all is -1, which leaves the operator's selection alone");
+    CHECK_EQ(cd::PickGoverningProfile(noExact, noExact), -1);
+
+    Case("AD5e the first exact match wins even when a later one also matches");
+    std::vector<bool> twoExact(3, false);
+    twoExact[0] = true;
+    twoExact[1] = true;
+    CHECK_EQ(cd::PickGoverningProfile(twoExact, noExact), 0);
+}
+
+// ===========================================================================
+// AE. THE RESTORE JOURNAL IS A PROMISE, NOT AN ORDERING.
+//
+// THE BLOCKER, found by a three-vendor review of the SHIPPED v0.4.3: the engine wrote the
+// journal BEFORE applying - which establishes the ORDER - and then applied unconditionally,
+// because JournalAddMany returned void and a failed write was only logged. A full disk, a
+// denied ACL or a failed flush therefore still pinned every process in the batch, with
+// nothing on disk to undo them. After an unclean exit those processes stay on half the
+// machine and no launch can find them.
+//
+// The defect had survived since v0.3.4 UNDER TWO COMMENTS THAT PROMISED THE OPPOSITE, and
+// the reason it survived is that not one of these paths could be reached from a test: the
+// harness had no call to JournalAddMany, ApplyCpuSets or ClearCpuSets anywhere in it.
+//
+// So this section drives the real code against REAL FAULTS - a directory that does not
+// exist, a file too large to read, a creation time that does not match the live process -
+// rather than mocking them. Every case below FAILS against v0.4.3.
+// ===========================================================================
+
+std::wstring TempFilePath(const wchar_t* leaf) {
+    wchar_t buf[MAX_PATH] = { 0 };
+    const DWORD n = ::GetTempPathW(MAX_PATH, buf);
+    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(buf, n) : std::wstring(L".\\");
+    if (!dir.empty() && dir[dir.size() - 1] != L'\\') dir += L'\\';
+    return dir + leaf;
+}
+
+std::wstring TempDirNoSlash() {
+    wchar_t buf[MAX_PATH] = { 0 };
+    const DWORD n = ::GetTempPathW(MAX_PATH, buf);
+    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(buf, n) : std::wstring(L".");
+    while (!dir.empty() && (dir[dir.size() - 1] == L'\\' || dir[dir.size() - 1] == L'/'))
+        dir.erase(dir.size() - 1);
+    return dir;
+}
+
+cd::JournalEntry Entry(DWORD pid, ULONGLONG created, const wchar_t* name) {
+    cd::JournalEntry e;
+    e.pid = pid;
+    e.creationTime = created;
+    e.name = name;
+    return e;
+}
+
+bool FileSizeOf(const std::wstring& path, LONGLONG& out) {
+    out = -1;
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ,
+                             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    LARGE_INTEGER sz;
+    sz.QuadPart = 0;
+    const bool ok = ::GetFileSizeEx(h, &sz) != 0;
+    ::CloseHandle(h);
+    if (ok) out = sz.QuadPart;
+    return ok;
+}
+
+void Test_AE1_TheFourJournalRules() {
+    // CATCHES all three bookkeeping defects the review named, at the one place each rule is
+    // now written. Each assertion below is a row of the review's own counterexample table.
+    Case("AE1 a pid with no record on disk needs one - even when the map already knows it");
+    // The F2 defect in one line: the FIRST assignment failed, which leaves a map entry
+    // (blocked) and REMOVES the journal entry. "Is this pid new to the map" answered NO, so
+    // a later attempt with a different mask succeeded and was never journalled.
+    CHECK_EQ(cd::NeedsRecoveryRecord(false, false), true);   // never seen
+    CHECK_EQ(cd::NeedsRecoveryRecord(true, false), true);    // seen, record was taken away
+    CHECK_EQ(cd::NeedsRecoveryRecord(true, true), false);    // seen and recorded
+
+    Case("AE2 THE BLOCKER - nothing may reach the setter without a durable record");
+    CHECK_EQ(cd::MayApplyAssignment(true, false), false);    // record needed, write failed
+    CHECK_EQ(cd::MayApplyAssignment(true, true), true);      // record needed, write landed
+    // A pid that is already recorded is not held hostage by an unrelated failed batch: its
+    // recovery record is on disk from an earlier tick and is still valid.
+    CHECK_EQ(cd::MayApplyAssignment(false, false), true);
+    CHECK_EQ(cd::MayApplyAssignment(false, true), true);
+
+    Case("AE3 a pid is cleared because something LANDED, not because the last try worked");
+    // A process moved to Cache and then refused a move to Freq is still on Cache. The old
+    // test - "was the last attempt blocked" - skipped its clear entirely.
+    CHECK_EQ(cd::NeedsClearOnLeaving(true), true);
+    CHECK_EQ(cd::NeedsClearOnLeaving(false), false);
+
+    Case("AE4 a recovery record only leaves the file when there is nothing left to recover");
+    CHECK_EQ(cd::MayDropRecoveryRecord(false, cd::ApplyResult::OtherError), true);
+    CHECK_EQ(cd::MayDropRecoveryRecord(true, cd::ApplyResult::Ok), true);
+    CHECK_EQ(cd::MayDropRecoveryRecord(true, cd::ApplyResult::Gone), true);
+    // THE ONE THAT SHIPPED WRONG: an ordinary clear failure was logged and the record and
+    // journal entry were removed anyway, leaving a live process masked with nothing that
+    // could undo it.
+    CHECK_EQ(cd::MayDropRecoveryRecord(true, cd::ApplyResult::AccessDenied), false);
+    CHECK_EQ(cd::MayDropRecoveryRecord(true, cd::ApplyResult::InvalidParameter), false);
+    CHECK_EQ(cd::MayDropRecoveryRecord(true, cd::ApplyResult::OtherError), false);
+}
+
+void Test_AE5_MissingIsNotUnreadable() {
+    // CATCHES the third bullet of the blocker: applier.cpp turned ANY journal-read failure
+    // into an EMPTY journal, so one unreadable read followed by an ordinary add rewrote the
+    // file with nothing but the new entry - every existing recovery record dropped, by the
+    // code that exists to preserve them. Nothing could tell the two failures apart because
+    // the reader returned bool.
+    Case("AE5 a missing file and an unreadable one are different answers");
+    const std::wstring missing = TempFilePath(L"go_test_definitely_absent_8271.txt");
+    ::DeleteFileW(missing.c_str());
+    std::wstring text;
+    CHECK_EQ(cd::ReadFileUtf8Checked(missing, text), cd::FileReadResult::Missing);
+
+    // A DIRECTORY exists and cannot be opened as a file. Content is not there to be lost,
+    // but the classification is the one that matters: never Missing.
+    CHECK_EQ(cd::ReadFileUtf8Checked(TempDirNoSlash(), text), cd::FileReadResult::Unreadable);
+
+    Case("AE5b a readable file still round-trips, so the classifier is not just refusing");
+    const std::wstring good = TempFilePath(L"go_test_readable_8271.txt");
+    CHECK_EQ(cd::WriteFileUtf8Atomic(good, L"hello\nworld\n"), true);
+    CHECK_EQ(cd::ReadFileUtf8Checked(good, text), cd::FileReadResult::Ok);
+    CHECK_EQ(text, L"hello\nworld\n");
+
+    Case("AE5c POSITIVE CONTROL - the two-valued reader genuinely cannot tell them apart");
+    // This is what every caller used to see, and it is why the distinction had to be made
+    // at the reader rather than guessed at by the journal.
+    CHECK_EQ(cd::ReadFileUtf8(missing, text), false);
+    CHECK_EQ(cd::ReadFileUtf8(TempDirNoSlash(), text), false);
+
+    Case("AE5d a write that cannot land returns false and creates nothing");
+    const std::wstring nowhere =
+        TempFilePath(L"go_test_no_such_dir_8271\\applied.journal");
+    CHECK_EQ(cd::WriteFileUtf8Atomic(nowhere, L"x"), false);
+    LONGLONG size = 0;
+    CHECK_EQ(FileSizeOf(nowhere, size), false);
+    // ...and the temp file it writes through is cleaned up rather than left behind.
+    CHECK_EQ(FileSizeOf(nowhere + L".tmp", size), false);
+
+    ::DeleteFileW(good.c_str());
+}
+
+void Test_AE6_AFailedJournalWriteIsReported() {
+    // CATCHES THE BLOCKER ITSELF at the applier boundary. JournalAddMany returned void, so
+    // the engine could not have obeyed a failure even if it had wanted to. The fault here is
+    // real, not mocked: the journal is pointed at a path whose DIRECTORY does not exist, so
+    // CreateFileW on the atomic write's temp file genuinely fails.
+    Case("AE6 a journal write that cannot land is reported as a failure");
+    const std::wstring nowhere =
+        TempFilePath(L"go_test_no_such_dir_8271\\applied.journal");
+    cd::JournalSetPathForTests(nowhere);
+
+    std::vector<cd::JournalEntry> add;
+    add.push_back(Entry(4242, 777777ull, L"probe.exe"));
+    CHECK_EQ(cd::JournalAddMany(add), false);
+    CHECK_EQ(cd::JournalAdd(4243, 777778ull, L"probe2.exe"), false);
+    CHECK_EQ((int)cd::JournalRead().size(), 0);
+
+    Case("AE6b a journal write that CAN land is reported as a success and round-trips");
+    // POSITIVE CONTROL for AE6: without it a function that returned false unconditionally
+    // would pass the case above.
+    const std::wstring good = TempFilePath(L"go_test_journal_8271.txt");
+    ::DeleteFileW(good.c_str());
+    cd::JournalSetPathForTests(good);
+
+    CHECK_EQ(cd::JournalAddMany(add), true);
+    std::vector<cd::JournalEntry> back = cd::JournalRead();
+    CHECK_EQ((int)back.size(), 1);
+    CHECK_EQ(back[0].pid, (DWORD)4242);
+    CHECK_EQ(back[0].creationTime, 777777ull);
+    CHECK_EQ(back[0].name, std::wstring(L"probe.exe"));
+
+    Case("AE6c re-adding a pid already on disk is a no-op that reports SUCCESS");
+    // The claim is about the on-disk STATE, not about whether a write happened. A false here
+    // would hold back an assignment whose record is already safe.
+    CHECK_EQ(cd::JournalAddMany(add), true);
+    CHECK_EQ(cd::JournalAdd(4242, 777777ull, L"probe.exe"), true);
+    CHECK_EQ((int)cd::JournalRead().size(), 1);
+
+    Case("AE6d removing reports success, and removing what is not there is not a failure");
+    std::vector<DWORD> drop;
+    drop.push_back(4242);
+    CHECK_EQ(cd::JournalRemoveMany(drop), true);
+    CHECK_EQ((int)cd::JournalRead().size(), 0);
+    CHECK_EQ(cd::JournalRemoveMany(drop), true);
+    CHECK_EQ(cd::JournalRemove(4242), true);
+
+    ::DeleteFileW(good.c_str());
+    cd::JournalSetPathForTests(L"");
+}
+
+void Test_AE7_AnUnreadableJournalIsNeverOverwritten() {
+    // CATCHES the worst consequence of the missing/unreadable conflation, with a fault that
+    // is real and reversible: a file LARGER than the reader will accept. It exists, it is
+    // perfectly writable, and it cannot be read - which is precisely the shape that turned
+    // one failed read into a rewrite that dropped every record on disk.
+    //
+    // SetEndOfFile allocates without writing, so the 65 MB costs no I/O.
+    Case("AE7 a journal too large to read is left exactly as it is");
+    const std::wstring big = TempFilePath(L"go_test_journal_toobig_8271.bin");
+    ::DeleteFileW(big.c_str());
+    HANDLE h = ::CreateFileW(big.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                             FILE_ATTRIBUTE_NORMAL, nullptr);
+    CHECK(h != INVALID_HANDLE_VALUE);
+    if (h == INVALID_HANDLE_VALUE) return;
+    LARGE_INTEGER want;
+    want.QuadPart = 65ll * 1024ll * 1024ll;      // one megabyte past the reader's ceiling
+    CHECK(::SetFilePointerEx(h, want, nullptr, FILE_BEGIN) != 0);
+    CHECK(::SetEndOfFile(h) != 0);
+    ::CloseHandle(h);
+
+    std::wstring text;
+    CHECK_EQ(cd::ReadFileUtf8Checked(big, text), cd::FileReadResult::Unreadable);
+
+    cd::JournalSetPathForTests(big);
+    std::vector<cd::JournalEntry> add;
+    add.push_back(Entry(4242, 777777ull, L"probe.exe"));
+
+    CHECK_EQ(cd::JournalAddMany(add), false);
+    LONGLONG after = 0;
+    CHECK_EQ(FileSizeOf(big, after), true);
+    CHECK_EQ(after == want.QuadPart, true);      // v0.4.3 replaced it with ONE LINE
+
+    Case("AE7b removal refuses too - the same rewrite, the same records lost");
+    std::vector<DWORD> drop;
+    drop.push_back(4242);
+    CHECK_EQ(cd::JournalRemoveMany(drop), false);
+    CHECK_EQ(FileSizeOf(big, after), true);
+    CHECK_EQ(after == want.QuadPart, true);
+
+    Case("AE7c and startup recovery does not truncate a journal it never read");
+    // v0.4.3 read the file, got an empty vector, logged "journal empty, nothing to clear"
+    // and truncated - which is how an unreadable journal became a lost one at the exact
+    // moment recovery was supposed to be undoing the last run's assignments.
+    // Nothing is cleared here because nothing is parsed: no live process is touched.
+    CHECK_EQ(cd::RecoverFromJournal(), 0);
+    CHECK_EQ(FileSizeOf(big, after), true);
+    CHECK_EQ(after == want.QuadPart, true);
+
+    cd::JournalSetPathForTests(L"");
+    ::DeleteFileW(big.c_str());
+}
+
+void Test_AE8_TheSetterChecksWhoItIsWriting() {
+    // CATCHES the review's HIGH finding, and it is the one that can move a process the user
+    // never agreed to move: ApplyCpuSets opened a PID and set its CPU sets without ever
+    // asking whether the process behind that pid was still the one the caller decided about.
+    // Windows reuses pids, so a process that exits after the snapshot hands its number to a
+    // replacement - which then receives the original's decision, exclusion result and all.
+    //
+    // THIS RUNS AGAINST A REAL PROCESS - THIS ONE - AND THE REAL SETTER. Our own pid and our
+    // own creation time are the only pair a test can be certain about, and the readback is
+    // what proves the refusal was a refusal rather than a silent write.
+    Case("AE8 a creation time that does not match the live process is refused");
+    const DWORD me = ::GetCurrentProcessId();
+    ULONGLONG created = 0;
+    CHECK(cd::GetProcessCreationTime(me, created));
+    CHECK(created != 0ull);
+    if (created == 0ull) return;
+
+    std::vector<ULONG> before;
+    CHECK(cd::ReadCpuSets(me, before));
+
+    cd::Topology topo;
+    std::wstring err;
+    CHECK(cd::DetectTopology(topo, &err));
+    CHECK(!topo.entries.empty());
+    if (topo.entries.empty()) return;
+    std::vector<ULONG> ids;
+    ids.push_back(topo.entries[0].Id);
+
+    // A pid that has been RECYCLED reads as Gone - our process really is gone - and the flag
+    // is what lets a log say WHICH kind of gone.
+    cd::ApplyOutcome wrong = cd::ApplyCpuSets(me, ids, created + 1ull);
+    CHECK_EQ(wrong.result, cd::ApplyResult::Gone);
+    CHECK_EQ(wrong.identityMismatch, true);
+    std::vector<ULONG> afterWrong;
+    CHECK(cd::ReadCpuSets(me, afterWrong));
+    CHECK_EQ(afterWrong == before, true);       // NOTHING was written
+
+    Case("AE8b no identity at all is a refusal, not a licence to write");
+    cd::ApplyOutcome blind = cd::ApplyCpuSets(me, ids, 0ull);
+    CHECK_EQ(blind.result, cd::ApplyResult::OtherError);
+    CHECK_EQ(blind.identityMismatch, true);
+    CHECK(cd::ReadCpuSets(me, afterWrong));
+    CHECK_EQ(afterWrong == before, true);
+
+    Case("AE8c POSITIVE CONTROL - the RIGHT identity is accepted and really does write");
+    // Without this the two refusals above would pass against a setter that refuses
+    // everything, which is the vacuous-check failure this project keeps guarding against.
+    cd::ApplyOutcome ok = cd::ApplyCpuSets(me, ids, created);
+    CHECK_EQ(ok.result, cd::ApplyResult::Ok);
+    std::vector<ULONG> now;
+    CHECK(cd::ReadCpuSets(me, now));
+    CHECK_EQ((int)now.size(), 1);
+    if (now.size() == 1) CHECK_EQ(now[0], ids[0]);
+
+    Case("AE8d and the clear is guarded the same way, so the restore is identity-checked");
+    cd::ApplyOutcome wrongClear = cd::ClearCpuSets(me, created + 1ull);
+    CHECK_EQ(wrongClear.result, cd::ApplyResult::Gone);
+    CHECK(cd::ReadCpuSets(me, now));
+    CHECK_EQ((int)now.size(), 1);               // still ours, still assigned
+
+    // Put this process back exactly as it was found.
+    cd::ApplyOutcome restore = cd::ApplyCpuSets(me, before, created);
+    CHECK_EQ(restore.result, cd::ApplyResult::Ok);
+    CHECK(cd::ReadCpuSets(me, now));
+    CHECK_EQ(now == before, true);
+}
+
+// ===========================================================================
+// AF. The apply gate compares the mask's CONTENT, not its NAME.
+//
+// THE DEFECT. Engine::Impl::Tick skips any pid whose record already says what is wanted,
+// so an unchanged mask is not re-issued four times a second. At commit 80fea8b that test
+// was, in full:
+//
+//     if (haveRecord && a->second.maskName == want) continue;
+//
+// and AppliedRec carried a maskName and no ids at all - so the only thing the gate could
+// ever compare was the NAME. Edit mask "Cache" on the Core map from LPs 0-15 down to 0-7
+// and KEEP THE NAME, which is what editing a mask normally looks like, and every already
+// governed process stays on the old processors until it exits or the app restarts. The UI
+// says the profile is on Cache; Cache now means 0-7; the processes are on 0-15.
+//
+// Nothing in the product can catch it: the CPU-Set getters echo stored intent and never
+// effective placement, so there is no reading anywhere that disagrees with the wrong one.
+//
+// HOW THESE TESTS ESTABLISH FAILURE-BEFORE-FIX. The old gate is not described here, it is
+// TRANSCRIBED - OldNameOnlyGate_Skips below is that one line and nothing else. Every case
+// runs against BOTH gates and the disagreements are counted, so the suite does not assert
+// that a fix was made, it exhibits the answers the shipped code gave. AF1 counts them as
+// single decisions; AF2 replays them as a sequence of ticks, which is the form the user
+// actually meets.
+// ===========================================================================
+
+// engine.cpp:1013 at commit 80fea8b, verbatim, as a function. Returns "the gate skipped
+// this pid", i.e. no re-issue. It can only see names, because that is all the shipped
+// AppliedRec stored.
+bool OldNameOnlyGate_Skips(bool haveRecord,
+                           const std::wstring& recordedMask,
+                           const std::wstring& wantMask) {
+    return haveRecord && recordedMask == wantMask;
+}
+
+struct GateCase {
+    const char* what;
+    bool haveRecord;
+    const wchar_t* recordedMask;
+    std::vector<ULONG> recordedIds;
+    const wchar_t* wantMask;
+    std::vector<ULONG> wantIds;
+    bool expectReissue;
+};
+
+// LPs 0-15 and LPs 0-7 on the reference machine, as CPU Set Ids. The +256 offset is real on
+// that part and is deliberately never assumed by the product - see coremap.cpp.
+std::vector<ULONG> Cache16() { return IdRange(256, 16, 1); }
+std::vector<ULONG> Cache8()  { return IdRange(256, 8, 1); }
+
+std::vector<GateCase> GateCases() {
+    std::vector<GateCase> v;
+    std::vector<ULONG> shuffled = Cache8();
+    std::swap(shuffled[0], shuffled[7]);
+    std::swap(shuffled[2], shuffled[5]);
+    std::vector<ULONG> dupes = Cache8();
+    dupes.push_back(256);
+    dupes.push_back(259);
+    std::vector<ULONG> other8 = IdRange(264, 8, 1);
+    std::vector<ULONG> shrunk = Cache8();
+    shrunk.pop_back();
+    std::vector<ULONG> none;
+
+    v.push_back({ "a pid with no record at all is always issued",
+                  false, L"", none, L"Cache", Cache16(), true });
+    v.push_back({ "nothing changed - the gate must still hold",
+                  true, L"Cache", Cache16(), L"Cache", Cache16(), false });
+    v.push_back({ "THE BUG: the mask was edited 0-15 -> 0-7 and kept its name",
+                  true, L"Cache", Cache16(), L"Cache", Cache8(), true });
+    v.push_back({ "THE BUG, the other way: the mask was widened and kept its name",
+                  true, L"Cache", Cache8(), L"Cache", Cache16(), true });
+    v.push_back({ "THE BUG, same size: the mask was moved onto the other CCD",
+                  true, L"Cache", Cache8(), L"Cache", other8, true });
+    v.push_back({ "THE BUG, one processor taken away",
+                  true, L"Cache", Cache8(), L"Cache", shrunk, true });
+    v.push_back({ "the same processors in a different order are not a change",
+                  true, L"Cache", Cache8(), L"Cache", shuffled, false });
+    v.push_back({ "the same processors listed twice are not a change",
+                  true, L"Cache", Cache8(), L"Cache", dupes, false });
+    v.push_back({ "a different mask name is a change, as it always was",
+                  true, L"Cache", Cache16(), L"Freq", other8, true });
+    v.push_back({ "a renamed mask with identical content is still a change",
+                  true, L"Cache", Cache8(), L"CacheV2", Cache8(), true });
+    v.push_back({ "a pid recorded as cleared, now wanted on a real mask",
+                  true, L"", none, L"Cache", Cache8(), true });
+    v.push_back({ "a pid recorded as cleared and still wanted cleared",
+                  true, L"", none, L"", none, false });
+    return v;
+}
+
+void Test_AF1_TheGateComparesContentNotName() {
+    Case("AF1 the gate's answer for every shape of change, name-only vs name-and-content");
+    const std::vector<GateCase> cases = GateCases();
+    int oldWrong = 0;
+    for (size_t i = 0; i < cases.size(); ++i) {
+        const GateCase& c = cases[i];
+        // THE RULE UNDER TEST. Both id lists arrive normalised, exactly as engine.cpp
+        // normalises them at the one place a mask is resolved.
+        const bool reissue = cd::NeedsReissue(c.haveRecord,
+                                              c.recordedMask,
+                                              cd::NormalizedMaskIds(c.recordedIds),
+                                              c.wantMask,
+                                              cd::NormalizedMaskIds(c.wantIds));
+        if (reissue != c.expectReissue) std::printf("       case: %s\n", c.what);
+        CHECK_EQ(reissue, c.expectReissue);
+
+        // THE SHIPPED GATE, on the same row. Not a paraphrase - the transcribed line.
+        const bool oldReissue = !OldNameOnlyGate_Skips(c.haveRecord, c.recordedMask, c.wantMask);
+        if (oldReissue != c.expectReissue) {
+            ++oldWrong;
+            std::printf("       80fea8b answered %s, the right answer is %s: %s\n",
+                        oldReissue ? "re-issue" : "skip",
+                        c.expectReissue ? "re-issue" : "skip",
+                        c.what);
+        }
+    }
+
+    Case("AF1b FAILURE-BEFORE-FIX - the shipped gate gets exactly four of these twelve wrong");
+    // Every one of the four is the same shape: the name stayed, the processors moved, and
+    // the process was left where it was. The number is pinned so a later edit that quietly
+    // reintroduces a name-only comparison cannot pass this file.
+    CHECK_EQ((int)cases.size(), 12);
+    CHECK_EQ(oldWrong, 4);
+
+    Case("AF1c POSITIVE CONTROL - the new rule is not simply answering 're-issue' every time");
+    // Four of the twelve rows expect a SKIP, and a rule that always re-issued would fail
+    // them. Counted here as well so the control cannot be lost inside the table.
+    int expectSkip = 0;
+    for (size_t i = 0; i < cases.size(); ++i) if (!cases[i].expectReissue) ++expectSkip;
+    CHECK_EQ(expectSkip, 4);
+}
+
+// The gate AS THE TICK RUNS IT: resolve the mask, normalise it, ask the rule, and on a
+// re-issue write BOTH halves back into the record. Mirrors engine.cpp's apply loop; the
+// only thing left out is the applier itself.
+struct GateSim {
+    bool haveRecord = false;
+    std::wstring maskName;
+    std::vector<ULONG> maskIds;
+    int reissues = 0;
+
+    void Tick(const std::wstring& want, const std::vector<ULONG>& rawIds) {
+        const std::vector<ULONG> ids = cd::NormalizedMaskIds(rawIds);
+        if (!cd::NeedsReissue(haveRecord, maskName, maskIds, want, ids)) return;
+        ++reissues;
+        haveRecord = true;
+        maskName = want;
+        maskIds = ids;
+    }
+};
+
+// The same loop with the shipped gate in it, and a record with nowhere to put the ids.
+struct OldGateSim {
+    bool haveRecord = false;
+    std::wstring maskName;
+    int reissues = 0;
+
+    void Tick(const std::wstring& want, const std::vector<ULONG>&) {
+        if (OldNameOnlyGate_Skips(haveRecord, maskName, want)) return;
+        ++reissues;
+        haveRecord = true;
+        maskName = want;
+    }
+};
+
+void Test_AF2_AnEditedMaskReachesTheMachine() {
+    Case("AF2 forty ticks, one edit at the halfway mark - the new gate issues twice");
+    // Ten seconds of watcher at the default 250 ms poll. The mask is edited in place at
+    // tick 20: same name, half the processors.
+    GateSim sim;
+    for (int t = 0; t < 40; ++t) {
+        sim.Tick(L"Cache", t < 20 ? Cache16() : Cache8());
+    }
+    CHECK_EQ(sim.reissues, 2);                       // the first tick, and the edit
+    CHECK_EQ(sim.maskIds, Cache8());                 // and the record carries the edit
+
+    Case("AF2b FAILURE-BEFORE-FIX - the shipped gate issues ONCE and never sees the edit");
+    OldGateSim shipped;
+    for (int t = 0; t < 40; ++t) {
+        shipped.Tick(L"Cache", t < 20 ? Cache16() : Cache8());
+    }
+    CHECK_EQ(shipped.reissues, 1);                   // twenty ticks of a stale mask, silently
+
+    Case("AF2c THE CONVERSE, with the storm it prevents made explicit");
+    // Losing the gate is not a smaller bug than the one being fixed: at ~200 processes under
+    // extreme game mode and a 250 ms poll it is 800 setter calls a second, for ever.
+    GateSim quiet;
+    for (int t = 0; t < 40; ++t) quiet.Tick(L"Cache", Cache16());
+    CHECK_EQ(quiet.reissues, 1);
+    // ...and forty ticks whose ids are merely REORDERED each time, which is what a
+    // hand-written config.ini can produce, still issue once.
+    GateSim jumbled;
+    std::vector<ULONG> a = Cache8();
+    std::vector<ULONG> b = Cache8();
+    std::swap(b[0], b[7]);
+    for (int t = 0; t < 40; ++t) jumbled.Tick(L"Cache", (t % 2) ? a : b);
+    CHECK_EQ(jumbled.reissues, 1);
+
+    Case("AF2d a real edit still gets through after a run of reordered no-ops");
+    jumbled.Tick(L"Cache", Cache16());
+    CHECK_EQ(jumbled.reissues, 2);
+}
+
+void Test_AF3_OrderComesOffDiskAndIsNotAChange() {
+    Case("AF3 config.ini keeps a mask's ids in FILE ORDER, which is why the gate normalises");
+    // The claim the normalisation rests on, measured against the real parser rather than
+    // assumed: ParseMaskValue appends ids as it meets them and nothing sorts them
+    // afterwards, so a hand-edited file really can hand ResolveMask "258,256,257".
+    cd::Config c;
+    std::wstring err;
+    CHECK(cd::ParseConfig(L"[masks]\nCache=258,256,257\n", c, &err));
+    const cd::Mask* m = c.FindMask(L"Cache");
+    CHECK(m != nullptr);
+    if (!m) return;
+    std::vector<ULONG> fileOrder;
+    fileOrder.push_back(258);
+    fileOrder.push_back(256);
+    fileOrder.push_back(257);
+    CHECK_EQ(m->ids, fileOrder);                     // NOT sorted on the way in
+
+    Case("AF3b so an order-only difference is not a change, and normalising says so");
+    std::vector<ULONG> ascending;
+    ascending.push_back(256);
+    ascending.push_back(257);
+    ascending.push_back(258);
+    CHECK_EQ(cd::NormalizedMaskIds(fileOrder), ascending);
+    CHECK_EQ(cd::SameMaskIds(fileOrder, ascending), true);
+    CHECK_EQ(cd::NeedsReissue(true, L"Cache", ascending, L"Cache", fileOrder), false);
+
+    Case("AF3c POSITIVE CONTROL - SameMaskIds is not answering true for everything");
+    std::vector<ULONG> missingOne;
+    missingOne.push_back(256);
+    missingOne.push_back(257);
+    CHECK_EQ(cd::SameMaskIds(fileOrder, missingOne), false);
+    CHECK_EQ(cd::NeedsReissue(true, L"Cache", ascending, L"Cache", missingOne), true);
+    // A duplicate is not a difference either - the setter takes these ids as a SET.
+    std::vector<ULONG> withDupe = ascending;
+    withDupe.push_back(257);
+    CHECK_EQ(cd::SameMaskIds(ascending, withDupe), true);
+}
+
+void Test_AF4_AnEditedMaskAfterABlockedAttemptIsStillJournalled() {
+    // THE INTERACTION WITH v0.4.4's JOURNAL RULES. A re-issue caused by changed ids is a new
+    // assignment attempt on a pid that ALREADY HAS A RECORD, which is the exact shape rule 1
+    // was rewritten for. These cases compose rule 5 with rules 1 and 2 in the order a tick
+    // meets them, so a re-issue can neither drop nor duplicate a journal entry.
+    Case("AF4 an edited mask retries a pid whose first attempt was REFUSED, and journals it");
+    // Tick 1: the assignment was refused (AccessDenied, an elevated process). engine.cpp
+    // keeps the record - blocked - and, because nothing of ours ever landed, takes the
+    // journal entry back out: everApplied = false, journalled = false.
+    const bool haveRecord = true;
+    const bool journalled = false;
+
+    // Ticks 2..n: same mask, so the gate holds and the refusal is NOT retried at 4 Hz.
+    CHECK_EQ(cd::NeedsReissue(haveRecord, L"Cache", Cache16(), L"Cache", Cache16()), false);
+
+    // The operator now edits Cache. The gate opens...
+    CHECK_EQ(cd::NeedsReissue(haveRecord, L"Cache", Cache16(), L"Cache", Cache8()), true);
+    // ...rule 1 sees a pid with a record but NO entry on disk, and writes one...
+    CHECK_EQ(cd::NeedsRecoveryRecord(haveRecord, haveRecord && journalled), true);
+    // ...and rule 2 lets the retry reach the setter only once that write has landed.
+    CHECK_EQ(cd::MayApplyAssignment(true, true), true);
+    CHECK_EQ(cd::MayApplyAssignment(true, false), false);
+
+    Case("AF4b a held-back re-issue leaves the record alone, so the next tick tries again");
+    // Rule 2 said no, so engine.cpp writes NOTHING into `applied` - the record still names
+    // the OLD ids, and the gate must still be open on the next tick. A fix that updated the
+    // record before the apply would close it and lose the edit for ever.
+    CHECK_EQ(cd::NeedsReissue(haveRecord, L"Cache", Cache16(), L"Cache", Cache8()), true);
+
+    Case("AF4c a re-issue on an ALREADY JOURNALLED pid adds no second entry");
+    // The journal entry is keyed on pid + creation time + name and says nothing about which
+    // mask is on the process, so the entry already on disk still describes this assignment.
+    // Rule 1 answers no, and no duplicate is written.
+    CHECK_EQ(cd::NeedsRecoveryRecord(true, true), false);
+    // ...and rule 2 does not hold a re-issue hostage to an unrelated failed batch write.
+    CHECK_EQ(cd::MayApplyAssignment(false, false), true);
+
+    Case("AF4d a re-issue never drops an entry, because it is not a clear");
+    // Rules 3 and 4 are reached only by a pid that LEFT the desired set. A re-issued pid is
+    // still in it, so nothing on this path can remove its record - and if the retry succeeds
+    // everApplied becomes true, which is what keeps the entry when the pid does leave.
+    CHECK_EQ(cd::NeedsClearOnLeaving(true), true);
+    CHECK_EQ(cd::MayDropRecoveryRecord(true, cd::ApplyResult::AccessDenied), false);
 }
 
 // ===========================================================================
@@ -6091,9 +6950,11 @@ void Test_AA13_OneCandidateIgnoresTheForegroundEntirely() {
 }
 
 void Test_AB1_TheShippedVersionFormatsAsTheOperatorNamesIt() {
-    Case("AB1 0,4,3,0 in the resource reads 'v0.4.3' on screen");
+    Case("AB1 0,4,4,0 in the resource reads 'v0.4.4' on screen");
     // ms = (major<<16)|minor, ls = (patch<<16)|build - the VS_FIXEDFILEINFO packing.
-    CHECK_EQ(cd::FormatVersionLabel(0x00000004u, 0x00030000u), std::wstring(L"v0.4.3"));
+    // Tracks src\GameOptimizer.rc: a version bump that leaves this vector behind makes the
+    // case NAME a lie while the assertion still passes, which is the quiet half of a stale test.
+    CHECK_EQ(cd::FormatVersionLabel(0x00000004u, 0x00040000u), std::wstring(L"v0.4.4"));
 }
 
 void Test_AB2_AFourthFieldIsShownOnlyWhenItSaysSomething() {
@@ -6417,12 +7278,28 @@ int main() {
     Test_AC3_SweepLineReportsBothCountsAndTheMask();
     Test_AC4_SweepLineCapsByCountAndByLength();
     Test_AC5_SweepLineIsSilentWithNothingToSay();
+    Test_AC6_SweptNotAppliedCountsTheSettersOwnAnswer();
+    Test_AC7_RefusalCountNeverIntroducesTheAppList();
 
     std::printf("\n== AD. The panel follows the governing profile ==\n");
     Test_AD1_ThePanelFollowsTheGameInFront();
     Test_AD2_FollowNeverStealsAnEditInProgress();
     Test_AD3_TheOperatorsOwnChoiceIsHonoured();
     Test_AD4_NothingGoverningNeverMovesTheSelection();
+    Test_AD5_TheFollowPicksTheProfileTheEngineNAMES();
+
+    std::printf("\n== AE. The restore journal is a promise, not an ordering ==\n");
+    Test_AE1_TheFourJournalRules();
+    Test_AE5_MissingIsNotUnreadable();
+    Test_AE6_AFailedJournalWriteIsReported();
+    Test_AE7_AnUnreadableJournalIsNeverOverwritten();
+    Test_AE8_TheSetterChecksWhoItIsWriting();
+
+    std::printf("\n== AF. The apply gate compares the mask's CONTENT, not its NAME ==\n");
+    Test_AF1_TheGateComparesContentNotName();
+    Test_AF2_AnEditedMaskReachesTheMachine();
+    Test_AF3_OrderComesOffDiskAndIsNotAChange();
+    Test_AF4_AnEditedMaskAfterABlockedAttemptIsStillJournalled();
 
     std::printf("\n== AB. The version label in the settings window ==\n");
     Test_AB1_TheShippedVersionFormatsAsTheOperatorNamesIt();

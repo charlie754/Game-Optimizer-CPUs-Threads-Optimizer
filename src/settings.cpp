@@ -867,7 +867,10 @@ enum : int {
 // Controls added this round. A separate block so nothing above it can shift.
 enum : int {
     IDC_SEARCH = 1500,    // profile search EDIT
-    IDC_ADDGAME,          // "Add game..." -> cd::PickGame
+    // IDC_ADDGAME IS GONE, and the two ids below deliberately shifted down to fill the hole
+    // rather than leaving a placeholder - the same call the IDC_NAV_RULES removal above made.
+    // Nothing persists a control id: they are created and dispatched inside one process run,
+    // and every use of these is by name. Verified by grep before removing it.
     IDC_HEAVYADD,         // type a heavy exe name
     IDC_HEAVYREM          // drop the selected heavy exe
 };
@@ -1082,7 +1085,8 @@ struct SettingsState {
     // reading a NEWER status - the watcher publishes four times a second - and would then
     // name an executable the rows beside it do not show. One snapshot, one answer.
     std::vector<SweptExe> sweptExes;
-    size_t extremeProcTotal = 0;   // processes, which is the bigger and more honest number
+    size_t extremeProcTotal = 0;   // processes REQUESTED, which is the bigger number
+    size_t extremeNotApplied = 0;  // of those, how many the setter did not accept
 
     // ---- Which profile the ENGINE is actually governing ---------------------------------
     // Index into work.profiles, or -1. Cached on the same 1 s beat as everything else because
@@ -1104,7 +1108,7 @@ struct SettingsState {
     HBRUSH inputBrush = nullptr;
 
     HWND hProfHdr = nullptr, hProfList = nullptr;
-    HWND hSearch = nullptr, hAddGame = nullptr;
+    HWND hSearch = nullptr;
     HWND hAdd = nullptr, hDup = nullptr, hRem = nullptr, hRen = nullptr;
     HWND hEditHdr = nullptr, hEnabled = nullptr;
     HWND hGameLbl = nullptr, hGame = nullptr, hGamePick = nullptr, hGameBrowse = nullptr;
@@ -1776,6 +1780,7 @@ void SetHeavyItems(SettingsState* st, const std::vector<std::wstring>& v) {
     st->autoTotal = 0;
     st->sweptExes.clear();
     st->extremeProcTotal = 0;
+    st->extremeNotApplied = 0;
 }
 
 // Appends one entry, case-insensitively de-duplicated, and selects it.
@@ -2321,6 +2326,7 @@ bool SyncAutoPinRows(SettingsState* st) {
     st->autoApplyByExe.clear();
     size_t total = 0;
     size_t procTotal = 0;
+    size_t notApplied = 0;
     bool haveMore = false;
 
     const bool has = st->selProfile >= 0 &&
@@ -2377,6 +2383,7 @@ bool SyncAutoPinRows(SettingsState* st) {
             // sentence under the check box, which has room for them.
             swept = ExtremeSweptExes(s, manual);
             procTotal = ExtremeSweptProcessCount(s);
+            notApplied = ExtremeSweptNotAppliedCount(s);
             const size_t sweptShown =
                 swept.size() > kExtremeRowsShown ? kExtremeRowsShown : swept.size();
             for (size_t i = 0; i < sweptShown; ++i) {
@@ -2394,6 +2401,7 @@ bool SyncAutoPinRows(SettingsState* st) {
     st->autoTotal = total;
     st->sweptExes = swept;
     st->extremeProcTotal = procTotal;
+    st->extremeNotApplied = notApplied;
     if (rows == st->autoRows && kinds == st->autoRowKinds) return false;
     st->autoRows = rows;
     st->autoRowKinds = kinds;
@@ -2540,11 +2548,45 @@ bool RefreshAutoPinStatus(SettingsState* st) {
 // [M] The budget is derived, not guessed. At 96 dpi and the window's own minimum width this
 // row's text width is iw - indent - Dp(18) = 487 - 20 - 18 = 449 px; Font::UiSmall averages
 // about 7 px per character there, so a line holds roughly 64 characters and three lines hold
-// about 192. The fixed head of the sentence ("Extreme game mode also moved 147 processes in
-// 62 apps to Freq: ") is about 60, and the tail (" and 58 more apps.") about 18, which leaves
-// 114 for the list. Four names of a typical 22 characters ("msedgewebview2.exe x12") is 94.
+// about 192.
+//
+// RE-DERIVED 2026-09-09 WHEN THE SENTENCE STOPPED SAYING "MOVED", AND AGAIN THE SAME DAY WHEN
+// THE REFUSAL CLAUSE MOVED TO THE END OF IT. The row's HEIGHT has not moved through either -
+// it is a fixed Dp(48), i.e. three lines, and the formatter truncates the list to fit rather
+// than the row growing to fit the list - so NEITHER WM_GETMINMAXINFO's needH NOR ShowSettings'
+// wantH changes. What moves is the SPLIT between the fixed head and the fixed tail:
+//
+//   v0.4.3   head "Extreme game mode also moved 147 processes in 62 apps to Freq: "       63
+//            tail " and 58 more apps."                                                    18
+//                                                                          192 - 81  =  111
+//            [M] It SHIPPED as 114, because that derivation estimated the head at "about
+//            60" instead of counting it. The sentence was replaced before the 3 characters
+//            of overdraft could clip anything - which is why the two figures below are
+//            counted, not eyeballed.
+//
+//   v0.4.4   head "Extreme game mode also requested Freq for 147 processes in 62 apps;
+//                  41 were not applied: "                                                 89
+//            tail " and 58 more apps."                                                    18
+//                                                                          192 - 107 =   85
+//
+//   now      head "Extreme game mode also requested Freq for 147 processes in 62 apps: "  68
+//            tail " and 58 more apps" 17 + "; 41 were not applied" 21 + "." 1             39
+//                                                                          192 - 107 =   85
+//
+// [M] Every count above is len() of the literal, computed 2026-09-09, not estimated.
+//
+// 🔴 THE CONSTANT DID NOT CHANGE AND THAT IS NOT A COINCIDENCE WORTH TRUSTING BLINDLY: the
+// refusal clause was MOVED, not resized, so 89 + 18 and 68 + 39 are both 107 and the list's
+// share is 85 either way. It is re-derived rather than copied because the next rewording will
+// not be a pure move, and Test_AC4e asserts head + list + tail <= 192 rather than pinning 85 -
+// so a head that grows fails the test instead of silently clipping the row.
+//
+// THE COST IS STILL ONE NAME against v0.4.3: at a typical 23 characters
+// ("msedgewebview00.exe x12") 85 holds three names where 111 held four. That is the price of
+// the sentence being true, and it is the right way round - the names are a courtesy, the
+// count and the refusals are the claim.
 const size_t kExtremeNamesShown = 4;
-const size_t kExtremeListChars = 114;
+const size_t kExtremeListChars = 85;
 
 // Rebuilds the sweep sentence from the set SyncAutoPinRows cached. Returns true when the
 // text changed - which INCLUDES appearing and disappearing, because an empty string is how
@@ -2563,7 +2605,7 @@ bool RefreshExtremeSweptStatus(SettingsState* st) {
         // The mask name comes from the same helper the auto-pin sentence uses, so the two
         // sentences on this card cannot name different masks for the same profile.
         line = FormatExtremeSweptLine(st->sweptExes, st->extremeProcTotal,
-                                      AutoPinTargetMask(st, p),
+                                      st->extremeNotApplied, AutoPinTargetMask(st, p),
                                       kExtremeNamesShown, kExtremeListChars);
     }
 
@@ -2615,11 +2657,26 @@ bool ProfilePageDropdownOpen(const SettingsState* st) {
 // used unchanged: it keys on the published profile NAME first and falls back to the game
 // executable, so a profile the operator has renamed but not yet applied is still recognised.
 // Re-deriving the match here would be a second implementation of rule 1.
+//
+// WHAT CHANGED IN v0.4.4 IS THE SEARCH, NOT THE MATCHER. This loop took the FIRST profile
+// that answered yes, and "yes" includes the executable fallback - so with two profiles naming
+// one executable it could return the wrong one while the exact name sat further down the
+// list. The two kinds of match are now separated and ranked by PickGoverningProfile, which
+// is where the rule is written and tested; this function only gathers the evidence.
 int GoverningProfileIndex(const SettingsState* st, const EngineStatus& s) {
     if (s.paused) return -1;
-    for (size_t i = 0; i < st->work.profiles.size(); ++i)
-        if (StatusDescribesProfile(s, st->work.profiles[i])) return static_cast<int>(i);
-    return -1;
+
+    std::vector<bool> exact(st->work.profiles.size(), false);
+    std::vector<bool> fallback(st->work.profiles.size(), false);
+    for (size_t i = 0; i < st->work.profiles.size(); ++i) {
+        const Profile& p = st->work.profiles[i];
+        if (!StatusDescribesProfile(s, p)) continue;
+        // The same test StatusDescribesProfile makes first, asked separately so the two
+        // reasons it can answer yes stop being one answer.
+        if (!s.profileName.empty() && IEquals(s.profileName, p.name)) exact[i] = true;
+        else fallback[i] = true;
+    }
+    return PickGoverningProfile(exact, fallback);
 }
 
 bool RefreshGoverningProfile(SettingsState* st, HWND hwnd) {
@@ -3580,11 +3637,27 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
             RECT c = AddCard(y, fixedL + listH, x0, LW);
             int ix = c.left + PAD, iy = c.top + PAD, iw = LW - 2 * PAD;
 
-            // "Profiles" and the "Add game..." action share the header row.
+            // "Profiles" and the "Add profile..." action share the header row. That slot
+            // held "Add game..." until 2026-09-09; the button now in it is the SAME hAdd that
+            // used to sit first in the bottom row, promoted rather than duplicated. The split
+            // it creates is the reason it is worth doing: the header CREATES a profile, and
+            // the bottom row only ever acts on the one already selected.
+            //
+            // [M] The width is unchanged at Dp(112) because the caption still fits. At 96 dpi
+            // and the minimum client width (Dp 880) this button is 112 px and DrawButton insets
+            // Dp(10) each side, leaving 92 px of text rect; "Add profile..." measures 68 px in
+            // Segoe UI Variable Text 9pt (GetTextExtentPoint32W, 2026-09-09) against 63 px for
+            // the caption it replaces. 24 px of slack, so DT_END_ELLIPSIS never fires.
+            //
+            // [M] AND THE CARD'S HEIGHT DOES NOT MOVE, which is why neither WM_GETMINMAXINFO's
+            // needH nor ShowSettings' wantH is touched this round. fixedL below is
+            // 2*PAD + BH + GT + RH + GT + GT + BH: the header row still contributes one BH and
+            // the button row still contributes one BH, so the expression is unchanged at 136 px
+            // at 96 dpi. listH is the sink for whatever is left over, exactly as before.
             int agw = theme::Dp(112, dpi);
             if (agw > iw / 2) agw = iw / 2;
             Put(st->hProfHdr, ix, iy + (BH - HH) / 2, iw - agw - GT, HH);
-            Put(st->hAddGame, ix + iw - agw, iy, agw, BH);
+            Put(st->hAdd, ix + iw - agw, iy, agw, BH);
             iy += BH + GT;
 
             Put(st->hSearch, ix, iy, iw, RH);
@@ -3592,11 +3665,20 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
             Put(st->hProfList, ix, iy, iw, listH);
             iy += listH + GT;
             {
+                // THREE buttons and TWO gaps now that Add has moved to the header, so the
+                // divisor moved with them. Leaving the /4 would have kept them at the old
+                // narrower width with a button's worth of dead space on the right.
+                //
+                // [M] It also repairs a pre-existing clip. At 96 dpi and the minimum client
+                // width iw is 293, so the old cap gave (293 - 18) / 4 = 68 px, a 48 px text
+                // rect after DrawButton's Dp(10) insets - and "Duplicate" measures 50 px, so
+                // it was ellipsised at the minimum window size. The new cap gives
+                // (293 - 12) / 3 = 93 px, a 73 px text rect, and the longest of the three
+                // captions now clears it by 23 px.
                 int bw = BW;
-                if (bw > (iw - 3 * GT) / 4) bw = (iw - 3 * GT) / 4;
+                if (bw > (iw - 2 * GT) / 3) bw = (iw - 2 * GT) / 3;
                 if (bw < theme::Dp(48, dpi)) bw = theme::Dp(48, dpi);
                 int bx = ix;
-                Put(st->hAdd, bx, iy, bw, BH); bx += bw + GT;
                 Put(st->hDup, bx, iy, bw, BH); bx += bw + GT;
                 Put(st->hRem, bx, iy, bw, BH); bx += bw + GT;
                 Put(st->hRen, bx, iy, bw, BH);
@@ -3687,7 +3769,7 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
             //
             // Dp(48) IS THREE LINES OF Font::UiSmall AT 96 DPI, AND IT IS THE BUDGET THE
             // FORMATTER'S CHARACTER CAP WAS DERIVED FROM - see kExtremeListChars, which
-            // computes 114 characters of list from this row's 449 px text width at the
+            // computes 85 characters of list from this row's 449 px text width at the
             // minimum window size. Its two siblings use Dp(34) for two lines; this sentence
             // carries a list rather than a fixed clause, so it gets one line more and a cap
             // that keeps it inside it. Every other row on this page reserves height for a
@@ -4745,7 +4827,7 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
     n = 0;
     // The auto-pin rule is on THIS page now: it is per profile, and a page of its own could
     // never say which profile it belonged to.
-    HWND profiles[] = { st->hProfHdr, st->hSearch, st->hAddGame, st->hProfList, st->hAdd,
+    HWND profiles[] = { st->hProfHdr, st->hAdd, st->hSearch, st->hProfList,
                         st->hDup, st->hRem, st->hRen, st->hEditHdr, st->hEnabled,
                         st->hGameLbl, st->hGame, st->hGamePick, st->hGameBrowse,
                         st->hGameMaskLbl, st->hGameMask, st->hGameMaskWarn, st->hHeavyLbl,
@@ -4955,32 +5037,14 @@ void ClearProfileFilter(SettingsState* st) {
         SetWindowTextW(st->hSearch, L"");
 }
 
-// "Add game..." - the picker is cd::PickGame, implemented elsewhere; this only consumes it.
-// A new profile from here is ENABLED with auto-pin ON, which is the operator's default: a
-// user who just picked a game wants the machine managed, and the useful half switched off is
-// a worse default than one unwanted pin, which a single Cancel undoes.
-void OnAddGame(SettingsState* st, HWND hwnd) {
-    std::wstring display;
-    const std::wstring exe = PickGame(hwnd, &display);
-    if (exe.empty()) return;
-
-    StoreUiToProfile(st);
-    Profile p;
-    p.name = Trim(display);
-    if (p.name.empty()) p.name = exe;
-    p.game = exe;
-    p.enabled = true;
-    p.autoPin = true;
-    p.gameMask = st->topo->defaultGameMask;
-    p.heavyMask = st->topo->defaultHeavyMask;
-    st->work.profiles.push_back(p);
-    st->selProfile = static_cast<int>(st->work.profiles.size()) - 1;
-    ClearProfileFilter(st);
-    RefreshProfileList(st);
-    LoadProfileToUi(st);
-    SettingsLayout(st, hwnd);
-    RedrawSettings(hwnd);
-}
+// OnAddGame IS GONE, and so is cd::PickGame and the whole picker dialog behind it. It built
+// a profile whose `game` came from DISCOVERED titles only, and that dialog had no free-text
+// field - so for a game the scan had missed, Cancel was the only way out and NO profile could
+// be created for it at all. The operator's workaround was to pick some arbitrary listed game
+// and correct the exe here afterwards; one correction was missed, and two enabled profiles
+// ended up naming one executable - the conflict IDC_DUP below already refuses to create.
+// IDC_ADD plus the Game field's "Browse..." reaches any file on disk and is a strict
+// superset of what this did.
 
 void OnProfileButton(SettingsState* st, HWND hwnd, int id) {
     switch (id) {
@@ -5323,21 +5387,33 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
 
             st->hProfHdr  = Mk(hwnd, L"STATIC", L"Profiles", SS_LEFT, -1);
+            // CREATED HERE, BEFORE THE SEARCH BOX AND THE LIST, BECAUSE CREATION ORDER IS
+            // TAB ORDER. This window runs IsDialogMessageW (see RunModalLoop), which walks
+            // Z-order, and Z-order is the order controls are created in. The button is drawn
+            // in the header row beside the heading, so it is created in the header's place
+            // too - left where the bottom row used to hold it, Tab would reach the page's
+            // primary action AFTER the list it exists to add to.
+            //
+            // "Add profile...", not the bare "Add" it carried in the bottom row: beside a
+            // heading that already reads "Profiles", a lone "Add" has to be read against the
+            // heading to mean anything, and the ellipsis is this app's standing convention
+            // for a button that opens a dialog - which this one does (PromptName). The
+            // phrase is the operator's own, from the request that removed "Add game...".
+            st->hAdd = Mk(hwnd, L"BUTTON", L"Add profile...",
+                          BS_OWNERDRAW | WS_TABSTOP, IDC_ADD);
             // The search box is a PLAIN edit; its frame, magnifier and placeholder are drawn
             // by theme::DrawSearchChrome from the parent's paint - see OverdrawSearchChrome.
             st->hSearch = Mk(hwnd, L"EDIT", L"", ES_AUTOHSCROLL | WS_TABSTOP, IDC_SEARCH);
-            st->hAddGame = Mk(hwnd, L"BUTTON", L"Add game...",
-                              BS_OWNERDRAW | WS_TABSTOP, IDC_ADDGAME);
-            SetButtonKind(st->hAddGame, theme::ButtonKind::Primary);
             st->hProfList = Mk(hwnd, L"LISTBOX", L"",
                                LBS_NOTIFY | LBS_HASSTRINGS | LBS_OWNERDRAWFIXED |
                                    WS_VSCROLL | WS_TABSTOP,
                                IDC_PROFLIST);
-            st->hAdd = Mk(hwnd, L"BUTTON", L"Add", BS_OWNERDRAW | WS_TABSTOP, IDC_ADD);
             st->hDup = Mk(hwnd, L"BUTTON", L"Duplicate", BS_OWNERDRAW | WS_TABSTOP, IDC_DUP);
             st->hRem = Mk(hwnd, L"BUTTON", L"Remove", BS_OWNERDRAW | WS_TABSTOP, IDC_REMOVE);
             st->hRen = Mk(hwnd, L"BUTTON", L"Rename", BS_OWNERDRAW | WS_TABSTOP, IDC_RENAME);
-            SetButtonKind(st->hAdd, theme::ButtonKind::Secondary);
+            // Primary, because it inherited the header slot the Primary "Add game..." held and
+            // creating a profile is this page's one constructive action. Remove stays Danger.
+            SetButtonKind(st->hAdd, theme::ButtonKind::Primary);
             SetButtonKind(st->hDup, theme::ButtonKind::Secondary);
             SetButtonKind(st->hRem, theme::ButtonKind::Danger);
             SetButtonKind(st->hRen, theme::ButtonKind::Secondary);
@@ -6139,9 +6215,6 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         // repainted when the control gains or loses focus.
                         OverdrawSearchChrome(st, hwnd);
                     }
-                    return 0;
-                case IDC_ADDGAME:
-                    OnAddGame(st, hwnd);
                     return 0;
                 case IDC_PROFLIST:
                     // A LIST ROW IS NOT A PROFILE INDEX. The list is ordered by

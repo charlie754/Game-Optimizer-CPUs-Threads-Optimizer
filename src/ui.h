@@ -104,10 +104,6 @@ bool RunFirstRunWizard(HWND owner, Config& cfg, const Topology& topo);
 std::wstring PickRunningProcess(HWND owner);   // returns the exe basename
 std::wstring BrowseForExe(HWND owner);         // returns a full path
 
-// A game picker backed by cd::DiscoverGames(), with a search box. Returns the chosen exe
-// basename, or empty on cancel. `outDisplayName` receives the friendly name when known.
-std::wstring PickGame(HWND owner, std::wstring* outDisplayName);
-
 // ---- "We noticed you started a game" prompt --------------------------------
 // Shown when the engine detects a running process that looks like a game and no enabled
 // profile already covers it.
