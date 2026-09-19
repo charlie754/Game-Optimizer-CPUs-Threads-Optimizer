@@ -61,7 +61,8 @@ std::vector<GameEntry> FilterGames(const std::vector<GameEntry>& all,
                                    const std::wstring& query);
 
 // ---- Runtime game detection ------------------------------------------------
-// Used by the "we noticed you started X" prompt and by the All Games profile.
+// Used by the "we noticed you started X" prompt. That is now the ONLY consumer: the All
+// Games profile was the other one and it was retired in v0.5.4.
 //
 // A process is treated as a game when it is NOT excluded and at least one holds:
 //   * its basename is in the discovered or bundled game list, OR

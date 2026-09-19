@@ -14,8 +14,12 @@
 //   "Add profile..." plus the Game field's "Browse..." is a strict superset: Browse reaches
 //   any file on disk, discovered or not. So the picker was not replaced, it was redundant.
 //
-// cd::DiscoverGames() ITSELF IS STILL LIVE and games.h is untouched - engine.cpp builds the
-// "All Games" profile's candidate list from it. Only this dialog went.
+// cd::DiscoverGames() ITSELF IS STILL LIVE and games.h is untouched. Until v0.5.4 it had two
+// consumers, this detector and the All Games profile's generated candidate list in
+// engine.cpp; the second went with that feature. [M] main.cpp:308/310/340 is now the only
+// caller, and games.h is included by exactly games.cpp and main.cpp - so the list is alive on
+// this dialog's account alone, and deleting it would break the prompt AND the unit-test link
+// line, which names games.cpp in tools\build-tests.bat.
 //
 // ---------------------------------------------------------------------------
 // ShowGamePrompt - a bottom-right toast that MUST NOT STEAL FOCUS

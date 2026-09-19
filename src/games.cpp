@@ -1012,8 +1012,8 @@ std::vector<GameEntry> DiscoverGames() {
 //
 // SELECTION RULE, and it is the opposite of the obvious one: an entry whose exe name is WRONG
 // is worse than a missing entry.  A missing entry costs the user one Browse click; a wrong or
-// colliding one silently mis-detects an unrelated process as this game, and can hand that
-// process to an All Games profile.  So the bar for inclusion is COLLISION RISK, not fame:
+// colliding one silently mis-detects an unrelated process as this game, and puts that name in
+// front of the user as a profile to create.  So the bar is COLLISION RISK, not fame:
 //
 //   * Engine template and engine project basenames are excluded even when they are genuinely
 //     this game's binary, because several unrelated titles ship the identical file name.

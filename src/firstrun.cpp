@@ -839,7 +839,7 @@ LRESULT CALLBACK WizardProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 LogLine(L"firstrun: the core map control could not be created "
                         L"(class %s), gle=%lu", kCoreMapClass, gle);
                 st->hP1MapFail = Mk(hwnd, L"STATIC",
-                                    L"The core map could not be created, so the per-core view "
+                                    L"The CPU Core Map could not be created, so the per-core view "
                                     L"is not shown. The summary and mask text below still "
                                     L"describe what was detected. See GameOptimizer.log in the "
                                     L"config folder.",

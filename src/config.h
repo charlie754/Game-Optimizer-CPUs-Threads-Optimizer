@@ -29,7 +29,7 @@ struct Profile {
     // wants the machine managed, and leaving the useful half switched off is a worse default
     // than the occasional unwanted pin, which one Cancel undoes.
     bool autoPin = true;
-    int  autoPinPercent = 8;              // 1..100, machine-wide %
+    int  autoPinPercent = 3;              // 1..100, machine-wide %
 
     // NOT USER-EDITABLE, and deliberately still here.
     // The operator asked for "no more second limit", and the seconds control is gone from the
@@ -56,14 +56,29 @@ struct Profile {
     //     is empty - a blanket sweep to "clear" is not a thing anybody asked for.
     bool extremeMode = false;
 
-    // ALL GAMES. When true this profile matches ANY process that looks like a game rather than
-    // one named executable, and Profile::game is ignored. Exactly one such profile may exist,
-    // and it is always considered LAST, so a specific profile always wins over it.
-    bool isAllGames = false;
+    // RETIRED, AND THIS FIELD IS NOT THE FEATURE - IT IS THE MIGRATION SHIM. "All Games" was
+    // a profile type that matched ANY process that looked like a game rather than one named
+    // executable. v0.5.4 deleted it: the engine rule, the accessor, the pill and the
+    // generated candidate list are all gone. This bool is the only thing left that knows the
+    // word, and it exists so that an older config can be migrated rather than misread.
+    //
+    // WRITTEN ONLY BY ParseConfig, from the `all_games` key an earlier version wrote, and
+    // NEVER SERIALIZED - so the key leaves the user's file on the next save and cannot come
+    // back. ValidateAndRepair consumes it, clears it, clears the profile's stale `game`, and
+    // reports what it did. Rule 6b in config.cpp says why the clear is not optional.
+    //
+    // ponytail: a permanent shim for a transient problem; it can go once no config in the
+    // wild carries `all_games=`, which is not a date anyone can name. The ceiling is one bool.
+    bool legacyAllGames = false;
 
     // Most-recently-used stamp (FILETIME as ULONGLONG, 0 = never). Drives the ordering of the
     // profile list: used profiles first, newest at the top, a separator, then the rest.
     ULONGLONG lastUsed = 0;
+
+    // GPU isolation - per-profile overrides. Empty/absent means inherit from global [gpus] section.
+    std::wstring gameGpu;      // adapter key if this profile should override the global game GPU
+    std::wstring heavyGpu;     // adapter key if this profile should override the global background GPU
+    bool gpuApplied = false;   // whether the preference has been written to the registry for this profile's game
 };
 
 // The fixed debounce described above, in poll ticks. At the default 250 ms poll this is 500 ms.
@@ -90,6 +105,12 @@ struct Config {
     // wildcard; a bare '*' is ignored so it cannot disable the feature globally.
     std::vector<std::wstring> exclusions;
 
+    // GPU isolation settings. Defaults: ON (true) for machines with 2+ GPUs, empty adapter keys.
+    // Per-profile overrides in Profile::gameGpu and Profile::heavyGpu.
+    bool autoIsolateGpu = true;      // whether GPU isolation is enabled
+    std::wstring gameGpu;            // global default adapter key for game GPU (empty = not set)
+    std::wstring backgroundGpu;      // global default adapter key for background GPU (empty = not set)
+
     // Verbatim lines from sections/keys this version did not recognise. Key is the
     // section name; value is the raw "key=value" lines. Re-emitted on save.
     std::map<std::wstring, std::vector<std::wstring>> unknown;
@@ -106,14 +127,11 @@ struct Config {
 
     // Stamp a profile as used now. Called by the engine when a profile's game starts.
     void MarkProfileUsed(const std::wstring& name, ULONGLONG nowFileTime);
-
-    // The single All Games profile, or nullptr.
-    const Profile* AllGamesProfile() const;
 };
 
 // A fresh config for this machine: masks derived from `t`, the default exclusion list, and
-// one DISABLED example profile named "Overwatch" so a new user has a worked example to
-// adopt or delete rather than a blank screen. firstRunDone is false.
+// one ENABLED profile named "Overwatch" so a new user has a worked example to adopt or delete
+// rather than a blank screen. firstRunDone is false.
 Config DefaultConfig(const Topology& t);
 
 // Ships pre-populated: anti-cheat services, launchers, GPU vendor containers, audiodg and

@@ -30,6 +30,7 @@ const wchar_t* const kSecGeneral    = L"general";
 const wchar_t* const kSecMasks      = L"masks";
 const wchar_t* const kSecTopology   = L"topology";
 const wchar_t* const kSecExclusions = L"exclusions";
+const wchar_t* const kSecGpus       = L"gpus";
 const wchar_t* const kSecProfixLow  = L"profile:";   // followed by the profile name
 
 // A mask the user has hand-edited (Mask::derived == false) is written with a leading
@@ -37,7 +38,7 @@ const wchar_t* const kSecProfixLow  = L"profile:";   // followed by the profile 
 // The token is not a number, so an older parser that only reads numbers ignores it.
 const wchar_t* const kCustomToken = L"custom";
 
-enum class SecKind { None, General, Masks, Topology, Exclusions, Profile, Unknown };
+enum class SecKind { None, General, Masks, Topology, Exclusions, Gpus, Profile, Unknown };
 
 struct SectionRef {
     SecKind kind = SecKind::None;
@@ -65,6 +66,9 @@ SectionRef ClassifySection(const std::wstring& raw) {
     }
     if (IEquals(name, std::wstring(kSecExclusions))) {
         r.kind = SecKind::Exclusions; r.canonical = kSecExclusions; return r;
+    }
+    if (IEquals(name, std::wstring(kSecGpus))) {
+        r.kind = SecKind::Gpus;     r.canonical = kSecGpus;     return r;
     }
     if (StartsWithNoCase(name, kSecProfixLow)) {
         r.kind = SecKind::Profile;
@@ -280,12 +284,6 @@ void Config::MarkProfileUsed(const std::wstring& name, ULONGLONG nowFileTime) {
     // between one poll tick and the next, and that must not resurrect it.
 }
 
-const Profile* Config::AllGamesProfile() const {
-    for (size_t i = 0; i < profiles.size(); ++i) {
-        if (profiles[i].isAllGames) return &profiles[i];
-    }
-    return nullptr;
-}
 
 bool Config::IsExcluded(const std::wstring& exeBaseName) const {
     const std::wstring want = BaseName(exeBaseName);
@@ -368,7 +366,7 @@ Config DefaultConfig(const Topology& t) {
     c.masks = DeriveMasks(t);
     c.exclusions = DefaultExclusions();
 
-    // The default heavy list, shared by both shipped profiles.
+    // The default heavy list for the shipped Overwatch profile.
     std::vector<std::wstring> heavy;
     heavy.push_back(L"claude.exe");
     heavy.push_back(L"node.exe");
@@ -388,7 +386,7 @@ Config DefaultConfig(const Topology& t) {
     p.heavyMask = t.defaultHeavyMask;
     p.heavy = heavy;
     p.autoPin = true;
-    p.autoPinPercent = 8;
+    p.autoPinPercent = 3;
     p.autoPinSeconds = kAutoPinDebounceTicks;
     // WRITTEN OUT even though it is the struct's own default. Extreme game mode moving a
     // process the user never named is the one thing in this program that must not arrive by
@@ -397,22 +395,12 @@ Config DefaultConfig(const Topology& t) {
     p.extremeMode = false;
     c.profiles.push_back(p);
 
-    // ALL GAMES, and it must be LAST: config.h states the All Games profile is considered
-    // after every specific one, so a named game always wins over it. Its `game` field is
-    // empty by definition - it matches on "looks like a game", not on a name.
-    Profile all;
-    all.name = L"All Games";
-    all.isAllGames = true;
-    all.enabled = true;
-    all.game.clear();
-    all.gameMask = t.defaultGameMask;
-    all.heavyMask = t.defaultHeavyMask;
-    all.heavy = heavy;
-    all.autoPin = true;
-    all.autoPinPercent = 8;
-    all.autoPinSeconds = kAutoPinDebounceTicks;
-    all.extremeMode = false;   // see the shipped profile above
-    c.profiles.push_back(all);
+    // ONE PROFILE SHIPS, AND THAT IS THE WHOLE DEFAULT. v0.5.3 removed the "All Games" profile
+    // from here on the operator's instruction - only one application is ever picked for the
+    // game mask, so a profile matching "any game" had nothing to add. v0.5.4 then retired the
+    // feature outright, so this comment no longer has to warn a future edit off re-adding the
+    // profile: there is nothing left for it to be. An older config's `all_games=1` is migrated
+    // by ValidateAndRepair rule 6b, and no path in this program can create such a profile.
     return c;
 }
 
@@ -518,6 +506,19 @@ bool ParseConfig(const std::wstring& text, Config& out, std::wstring* error) {
                 }
                 break;
             }
+            case SecKind::Gpus: {
+                known = true;
+                if (IEquals(key, std::wstring(L"auto_isolate"))) {
+                    ParseBoolW(value, out.autoIsolateGpu);
+                } else if (IEquals(key, std::wstring(L"game_gpu"))) {
+                    out.gameGpu = value;
+                } else if (IEquals(key, std::wstring(L"background_gpu"))) {
+                    out.backgroundGpu = value;
+                } else {
+                    known = false;
+                }
+                break;
+            }
             case SecKind::Masks: {
                 // Every key in [masks] is a mask name. Names may contain spaces, which is
                 // exactly why the split is on the FIRST '=' and nothing else.
@@ -562,10 +563,36 @@ bool ParseConfig(const std::wstring& text, Config& out, std::wstring* error) {
                 } else if (IEquals(key, std::wstring(L"extreme_mode"))) {
                     ParseBoolW(value, p.extremeMode);
                 } else if (IEquals(key, std::wstring(L"all_games"))) {
-                    ParseBoolW(value, p.isAllGames);
+                    // RETIRED KEY, STILL PARSED ON PURPOSE. SerializeConfig no longer writes
+                    // it, so this branch only ever fires for a file an older version wrote.
+                    // Deleting the branch instead would route the line into Config::unknown,
+                    // where it would be re-emitted verbatim on every save and live in the
+                    // user's file forever - and ValidateAndRepair would never see it.
+                    ParseBoolW(value, p.legacyAllGames);
+
+                    // 🔴 AND THE STALE `game` IS CLEARED HERE, NOT ONLY IN ValidateAndRepair.
+                    // Found by adversarial review of v0.5.4, and it is a hole this very change
+                    // opened. RunVCacheSet (main.cpp) LOADS AND SAVES THE CONFIG WITHOUT EVER
+                    // CALLING ValidateAndRepair - it dispatches before startup and returns.
+                    // Because the serializer no longer writes `all_games`, that round trip
+                    // DROPS THE FLAG AND KEEPS THE EXECUTABLE, so the next launch sees an
+                    // ordinary enabled profile governing a game the user never chose for it -
+                    // exactly the hazard rule 6b exists to prevent, reached by a side door.
+                    //
+                    // The old code was safe by accident: it wrote `all_games` back out, so the
+                    // pairing survived until a real repair ran. The clear happens in a POST-PASS
+                    // at the end of this function rather than here, because key order in the
+                    // file is not guaranteed - a hand-edited section can put `all_games` ABOVE
+                    // `game`, and clearing here would be undone three lines later.
                 } else if (IEquals(key, std::wstring(L"last_used"))) {
                     ULONGLONG v = p.lastUsed;
                     if (ParseUlonglongW(value, v)) p.lastUsed = v;
+                } else if (IEquals(key, std::wstring(L"game_gpu"))) {
+                    p.gameGpu = value;
+                } else if (IEquals(key, std::wstring(L"heavy_gpu"))) {
+                    p.heavyGpu = value;
+                } else if (IEquals(key, std::wstring(L"gpu_applied"))) {
+                    ParseBoolW(value, p.gpuApplied);
                 } else {
                     known = false;
                 }
@@ -582,6 +609,23 @@ bool ParseConfig(const std::wstring& text, Config& out, std::wstring* error) {
             // Verbatim, so an older binary re-emits a newer build's settings untouched.
             out.unknown[section.canonical].push_back(line);
         }
+    }
+
+    // 🔴 THE RETIRED "All Games" FLAG AND A STALE `game` MUST NEVER LEAVE THIS FUNCTION
+    //    TOGETHER, and this runs as a POST-PASS so the order of keys in the file cannot
+    //    matter. Such a profile matched on a candidate list the engine generated into `game`,
+    //    and every previous version cleared that field on load, so the value in the file is
+    //    dead data. See ValidateAndRepair rule 6b for the full account.
+    //
+    //    IT IS HERE AND NOT ONLY IN ValidateAndRepair BECAUSE ONE CALLER SKIPS THE REPAIR.
+    //    RunVCacheSet in main.cpp loads the config, edits one field and saves - with no
+    //    repair, before startup, and it returns without ever reaching it. Since v0.5.4 the
+    //    serializer no longer writes `all_games`, so that round trip would DROP THE FLAG AND
+    //    KEEP THE EXECUTABLE, and the next launch would govern a game the user never chose
+    //    for that profile. Clearing at parse time makes the pairing unable to survive any
+    //    load at all, whichever code path saves next.
+    for (size_t i = 0; i < out.profiles.size(); ++i) {
+        if (out.profiles[i].legacyAllGames) out.profiles[i].game.clear();
     }
 
     // A file with content but not one [section] header is not this format at all - that is
@@ -634,6 +678,13 @@ std::wstring SerializeConfig(const Config& c) {
     AppendUnknownFor(out, c, std::wstring(kSecExclusions), consumed);
     out += L"\r\n";
 
+    out += L"[gpus]\r\n";
+    AppendKv(out, L"auto_isolate", BoolText(c.autoIsolateGpu));
+    AppendKv(out, L"game_gpu", c.gameGpu);
+    AppendKv(out, L"background_gpu", c.backgroundGpu);
+    AppendUnknownFor(out, c, std::wstring(kSecGpus), consumed);
+    out += L"\r\n";
+
     for (size_t i = 0; i < c.profiles.size(); ++i) {
         const Profile& p = c.profiles[i];
         out += L"[";
@@ -650,8 +701,13 @@ std::wstring SerializeConfig(const Config& c) {
         // auto_pin_seconds is deliberately NOT written: it is a fixed internal debounce, not
         // a setting, and writing it would invite a hand-edit ValidateAndRepair silently undoes.
         AppendKv(out, L"extreme_mode", BoolText(p.extremeMode));
-        AppendKv(out, L"all_games", BoolText(p.isAllGames));
+        // all_games is deliberately NOT written: the feature was retired in v0.5.4 and
+        // ValidateAndRepair clears the flag on load, so writing it would re-create a setting
+        // this build cannot honour. The key leaves the user's file on their first save.
         AppendKv(out, L"last_used", std::to_wstring(static_cast<unsigned long long>(p.lastUsed)));
+        AppendKv(out, L"game_gpu", p.gameGpu);
+        AppendKv(out, L"heavy_gpu", p.heavyGpu);
+        AppendKv(out, L"gpu_applied", BoolText(p.gpuApplied));
         AppendUnknownFor(out, c, std::wstring(kSecProfixLow) + p.name, consumed);
         out += L"\r\n";
     }
@@ -803,29 +859,38 @@ std::vector<std::wstring> ValidateAndRepair(Config& c, const Topology& t) {
         p.autoPinSeconds = kAutoPinDebounceTicks;
     }
 
-    // 6b. Exactly one All Games profile may exist, and it matches on "looks like a game"
-    //     rather than on a name, so a `game` field on one is dead weight that would read as
-    //     a working filter. Both are reported: the user chose these and must be told.
-    {
-        bool seenAllGames = false;
-        for (size_t i = 0; i < c.profiles.size(); ++i) {
-            Profile& p = c.profiles[i];
-            if (!p.isAllGames) continue;
-            if (seenAllGames) {
-                p.isAllGames = false;
-                notes.push_back(L"Profile \"" + p.name
-                                + L"\" was a second All Games profile; only one is allowed, so "
-                                  L"it is now an ordinary profile.");
-                continue;
-            }
-            seenAllGames = true;
-            if (!p.game.empty()) {
-                notes.push_back(L"Profile \"" + p.name
-                                + L"\" is an All Games profile, so its game \"" + p.game
-                                + L"\" was cleared; it matches any game.");
-                p.game.clear();
-            }
+    // 6b. THE RETIRED "All Games" PROFILE TYPE, migrated on load. v0.5.4 deleted the feature
+    //     outright: nothing matches "any game" any more, and `all_games` is no longer written.
+    //     Only a config an earlier version wrote still carries the key.
+    //
+    //     🔴 CLEARING `game` IS THE POINT, NOT A TIDY-UP. Such a profile matched on a candidate
+    //     list the ENGINE generated into that same field, and the old rule below this one
+    //     cleared it on every single load. A hand-edited config can therefore carry
+    //     `all_games=1` beside a real `game=` value that has been dead for the profile's whole
+    //     life. Dropping the flag without clearing the field would bring that value LIVE and
+    //     silently turn a "matches any game" profile into one governing an executable the user
+    //     never chose for it. config.ini is documented as hand-editable, so this is reachable.
+    //
+    //     THE PROFILE ITSELF IS KEPT. Deleting a row out of a user's file to retire a feature
+    //     is destroying their data. What is left is an ordinary profile with no game set - a
+    //     state the settings window already describes correctly, and one click removes it.
+    //
+    //     THE NOTE REACHES THE LOG AND NOWHERE ELSE, which is an operator decision rather than
+    //     an oversight: main.cpp logs these at startup and the only dialog that shows repairs
+    //     re-runs this function, by which time there is nothing left to report.
+    for (size_t i = 0; i < c.profiles.size(); ++i) {
+        Profile& p = c.profiles[i];
+        if (!p.legacyAllGames) continue;
+        p.legacyAllGames = false;
+        std::wstring note = L"Profile \"" + p.name
+                          + L"\" used the retired \"All Games\" setting, which no longer exists;"
+                            L" it is now an ordinary profile";
+        if (!p.game.empty()) {
+            note += L" and its stale game \"" + p.game + L"\" was cleared";
+            p.game.clear();
         }
+        note += L".";
+        notes.push_back(note);
     }
 
     // 7. An empty exclusion list would let anti-cheat services onto the game CCD.

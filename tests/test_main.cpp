@@ -34,6 +34,10 @@
 #include "applier.h"
 #include "apply_rules.h"
 #include "config.h"
+#include "gpu_edit.h"
+#include "gpu_pref.h"
+#include "gpu_policy.h"
+#include "gpu_rows.h"
 #include "engine.h"
 #include "mask_merge.h"
 #include "mask_edit.h"
@@ -41,6 +45,7 @@
 #include "settings_environment.h"
 #include "settings_heavy_order.h"
 #include "settings_merge.h"
+#include "settings_pages.h"
 #include "settings_warning.h"
 #include "envwarning_text.h"
 #include "firstrun_text.h"
@@ -837,7 +842,6 @@ cd::Config MakeRoundTripConfig() {
     p1.autoPin = true;
     p1.autoPinPercent = 12;
     p1.autoPinSeconds = 7;   // deliberately NOT the default: see ExpectConfigEqual
-    p1.isAllGames = false;
     p1.lastUsed = kStampMarker;
 
     cd::Profile p2;
@@ -849,8 +853,7 @@ cd::Config MakeRoundTripConfig() {
     p2.autoPin = false;
     p2.autoPinPercent = 3;
     p2.autoPinSeconds = 42;  // ditto
-    p2.isAllGames = true;    // both values of all_games are exercised by the pair
-    p2.lastUsed = 0;         // and both a set and an unset stamp
+    p2.lastUsed = 0;         // both a set and an unset stamp are exercised
 
     c.profiles.push_back(p1);
     c.profiles.push_back(p2);
@@ -896,7 +899,6 @@ void ExpectConfigEqual(const cd::Config& got, const cd::Config& want, const char
         CHECK_EQ(a.heavyMask, b.heavyMask);
         CHECK_EQ(a.autoPin, b.autoPin);
         CHECK_EQ(a.autoPinPercent, b.autoPinPercent);
-        CHECK_EQ(a.isAllGames, b.isAllGames);
         CHECK_EQ(a.lastUsed, b.lastUsed);
         // autoPinSeconds is NOT compared against the original on purpose. config.h now
         // declares it not user-editable and Config no longer writes it, so a parsed profile
@@ -953,15 +955,25 @@ void Test_B1_B2_B3_RoundTrip() {
     CHECK(text.find(L"auto_pin_seconds") == std::wstring::npos);
 }
 
-void Test_B10_AllGamesAndLastUsedRoundTrip() {
-    Case("B10 all_games and last_used round-trip through SerializeConfig -> ParseConfig");
+void Test_B10_LastUsedRoundTripsAndTheRetiredKeyIsNeverWritten() {
+    Case("B10 last_used round-trips, and the retired all_games key is never serialized");
     cd::Config c = MakeRoundTripConfig();
     std::wstring text = cd::SerializeConfig(c);
 
-    // The keys are actually emitted (a parser that defaulted both would otherwise pass).
-    CHECK(text.find(L"all_games=") != std::wstring::npos);
+    // last_used IS emitted (a parser that defaulted it would otherwise pass).
     CHECK(text.find(L"last_used=") != std::wstring::npos);
     CHECK(text.find(L"133700000000000000") != std::wstring::npos);
+
+    // 🔴 AND all_games IS NOT, WHICHEVER WAY THE FLAG IS SET. This is the half of the v0.5.4
+    // retirement that a user can see: the key has to leave their file on the next save and
+    // never come back. A build that re-emitted it would be writing a setting it refuses to
+    // honour, which is the same defect auto_pin_seconds is asserted against above.
+    CHECK(text.find(L"all_games") == std::wstring::npos);
+    {
+        cd::Config withFlag = MakeRoundTripConfig();
+        withFlag.profiles[1].legacyAllGames = true;
+        CHECK(cd::SerializeConfig(withFlag).find(L"all_games") == std::wstring::npos);
+    }
 
     cd::Config out;
     std::wstring err;
@@ -971,22 +983,18 @@ void Test_B10_AllGamesAndLastUsedRoundTrip() {
 
     CHECK_EQ((int)out.profiles.size(), 2);
     if (out.profiles.size() == 2) {
-        CHECK_EQ(out.profiles[0].isAllGames, false);
         CHECK_EQ(out.profiles[0].lastUsed, kStampMarker);
-        CHECK_EQ(out.profiles[1].isAllGames, true);
         CHECK_EQ(out.profiles[1].lastUsed, 0ull);
-        // AllGamesProfile() finds it, and finds the FIRST one.
-        const cd::Profile* ag = out.AllGamesProfile();
-        CHECK(ag != nullptr);
-        if (ag) CHECK_EQ(ag->name, L"Counter Strike 2");
+        // Nothing this build writes can set the migration shim.
+        CHECK_EQ(out.profiles[0].legacyAllGames, false);
+        CHECK_EQ(out.profiles[1].legacyAllGames, false);
     }
 
-    // An OLDER config - no all_games, no last_used anywhere - still loads, with both fields
-    // at their documented defaults rather than as preserved unknown keys.
+    // An OLDER config - no last_used anywhere - still loads, with the field at its documented
+    // default rather than as a preserved unknown key.
     std::vector<std::wstring> lines = SplitLines(ToLf(text));
     std::vector<std::wstring> stripped;
     for (size_t i = 0; i < lines.size(); ++i) {
-        if (lines[i].find(L"all_games=") != std::wstring::npos) continue;
         if (lines[i].find(L"last_used=") != std::wstring::npos) continue;
         stripped.push_back(lines[i]);
     }
@@ -996,12 +1004,9 @@ void Test_B10_AllGamesAndLastUsedRoundTrip() {
     CHECK(cd::ParseConfig(JoinLines(stripped), old, &err));
     CHECK_EQ((int)old.profiles.size(), 2);
     if (old.profiles.size() == 2) {
-        CHECK_EQ(old.profiles[0].isAllGames, false);
         CHECK_EQ(old.profiles[0].lastUsed, 0ull);
-        CHECK_EQ(old.profiles[1].isAllGames, false);
         CHECK_EQ(old.profiles[1].lastUsed, 0ull);
     }
-    CHECK(old.AllGamesProfile() == nullptr);
 }
 
 void Test_B4_LineEndingsAndBom() {
@@ -1195,44 +1200,21 @@ void Test_B7_ValidateAndRepair() {
 }
 
 void Test_B8_DefaultConfig() {
-    // REWRITTEN. This case previously asserted ONE profile, "Overwatch", enabled == false.
-    // Both halves encoded behaviour the operator has since changed: profiles now ship
-    // ENABLED with auto-pin ON, and a second "All Games" profile ships alongside the worked
-    // example. config.h states the All Games profile is always considered LAST, so its
-    // position in the vector is part of the contract and is asserted here.
+    // Exactly ONE profile ships: "Overwatch", enabled with autoPin ON.
+    // No All Games profile ships. The All Games machinery is retained for configs that already
+    // have one (see ValidateAndRepair), but new defaults start with a single worked example.
     Case("B8 DefaultConfig(referenceTopology)");
     cd::Topology t = MakeReference(false);
     cd::Config c = cd::DefaultConfig(t);
 
-    CHECK_EQ((int)c.profiles.size(), 2);
-    if (c.profiles.size() == 2) {
+    CHECK_EQ((int)c.profiles.size(), 1);
+    if (c.profiles.size() == 1) {
         CHECK_EQ(c.profiles[0].name, L"Overwatch");
         CHECK_EQ(c.profiles[0].enabled, true);
         CHECK_EQ(c.profiles[0].autoPin, true);
-        CHECK_EQ(c.profiles[0].isAllGames, false);
         CHECK_EQ(c.profiles[0].game, L"Overwatch.exe");
         CHECK_EQ(c.profiles[0].lastUsed, 0ull);
-
-        // LAST in the vector, by contract.
-        CHECK_EQ(c.profiles[1].name, L"All Games");
-        CHECK_EQ(c.profiles[1].isAllGames, true);
-        CHECK_EQ(c.profiles[1].enabled, true);
-        CHECK_EQ(c.profiles[1].autoPin, true);
-        CHECK_EQ(c.profiles[1].game, L"");
-        CHECK(!c.profiles[1].heavy.empty());
-        CHECK_EQ(c.profiles[1].heavy, c.profiles[0].heavy);
-        CHECK_EQ(c.profiles[1].lastUsed, 0ull);
-    }
-
-    // Exactly one All Games profile, and AllGamesProfile() finds it.
-    {
-        int allGamesCount = 0;
-        for (size_t i = 0; i < c.profiles.size(); ++i)
-            if (c.profiles[i].isAllGames) ++allGamesCount;
-        CHECK_EQ(allGamesCount, 1);
-        const cd::Profile* ag = c.AllGamesProfile();
-        CHECK(ag != nullptr);
-        if (ag) CHECK_EQ(ag->name, L"All Games");
+        CHECK_EQ(c.profiles[0].autoPinPercent, 3);
     }
 
     CHECK_EQ(c.firstRunDone, false);
@@ -1251,6 +1233,43 @@ void Test_B8_DefaultConfig() {
         std::vector<size_t> order = c.ProfilesForDisplay(&sep);
         CHECK_EQ(sep, -1);
         CHECK_EQ((int)order.size(), (int)c.profiles.size());
+    }
+}
+
+void Test_B8b_TheStructDefaultIsTheOneUsersInherit() {
+    Case("B8b Profile::autoPinPercent defaults to 3, which every NEW profile inherits");
+    // ASSERTED SEPARATELY FROM THE SHIPPED PROFILE, and that is the whole point of this case.
+    // "Add profile..." in settings.cpp and CreateProfileForGame in main.cpp both leave this
+    // field at the struct default ON PURPOSE, with comments saying so, so the number a user
+    // actually gets comes from HERE and not from DefaultConfig. A change that moved only
+    // config.cpp would leave every user-created profile on the old threshold.
+    CHECK_EQ(cd::Profile().autoPinPercent, 3);
+}
+
+void Test_B8c_TheShippedProfileCarriesTheSameThreshold() {
+    Case("B8c the shipped Overwatch profile also carries auto-pin 3%");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = cd::DefaultConfig(t);
+    CHECK(!c.profiles.empty());
+    if (!c.profiles.empty()) CHECK_EQ(c.profiles[0].autoPinPercent, 3);
+}
+
+void Test_B8d_TheNewDefaultIsSelfConsistent() {
+    Case("B8d the shipped default needs no repair on its first load");
+    cd::Topology t = MakeReference(false);
+    cd::Config c = cd::DefaultConfig(t);
+
+    // Nothing shipped carries the retired migration flag.
+    for (size_t i = 0; i < c.profiles.size(); ++i) CHECK_EQ(c.profiles[i].legacyAllGames, false);
+
+    // AND IT STILL LOADS CLEAN. Dropping a profile out of the default is exactly the kind of
+    // edit that leaves the remainder invalid - a dangling mask name, a count something else
+    // relies on - and ValidateAndRepair is what would notice. An empty list is the claim.
+    std::vector<std::wstring> rep = cd::ValidateAndRepair(c, t);
+    CHECK(rep.empty());
+    if (!rep.empty()) {
+        for (size_t i = 0; i < rep.size(); ++i)
+            std::printf("       unexpected repair[%d]: %s\n", (int)i, Utf8(rep[i]).c_str());
     }
 }
 
@@ -1334,6 +1353,13 @@ void Test_B12_ValidateAndRepairNewRules() {
     cd::Topology t = MakeReference(false);
     {
         cd::Config c = cd::DefaultConfig(t);
+        // Add a second ordinary profile to test that autoPinSeconds is forced on EVERY profile
+        cd::Profile p2;
+        p2.name = L"TestProfile";
+        p2.gameMask = t.defaultGameMask;
+        p2.heavyMask = t.defaultHeavyMask;
+        c.profiles.push_back(p2);
+
         // Values on both sides of the fixed debounce, and one the old clamp would have
         // accepted silently, so "forced" cannot be confused with "clamped to a range".
         c.profiles[0].autoPinSeconds = 900;
@@ -1345,7 +1371,7 @@ void Test_B12_ValidateAndRepairNewRules() {
             CHECK_EQ(c.profiles[i].autoPinSeconds, cd::kAutoPinDebounceTicks);
 
         // It is not the user's setting any more, so it is not reported as a repair. The
-        // whole list must still be empty here: DefaultConfig is otherwise valid.
+        // whole list must still be empty here: the new config is otherwise valid.
         CHECK(rep.empty());
         CHECK(!AnyContains(rep, L"auto-pin hold"));
         CHECK(!AnyContains(rep, L"seconds"));
@@ -1355,51 +1381,159 @@ void Test_B12_ValidateAndRepairNewRules() {
         }
     }
 
-    Case("B12b a second All Games profile is demoted, and that IS reported");
+    Case("B12b a profile carrying the RETIRED all_games flag is migrated, and that IS reported");
     {
+        // THE ONE MIGRATION v0.5.4 OWES ITS USERS. "All Games" is gone; a config written by an
+        // earlier version still carries all_games=1, and ParseConfig puts it in the shim.
+        //
+        // 🔴 THE `game` FIELD IS THE POINT. The old rule cleared it on every load, so a
+        // hand-edited config can carry a real executable there that has been dead for the
+        // profile's whole life. Migrating without clearing it would bring that value LIVE and
+        // hand the profile an executable the user never chose for it.
         cd::Config c = cd::DefaultConfig(t);
-        cd::Profile extra = c.profiles[1];       // a copy of the real All Games profile
-        extra.name = L"Second All Games";
-        extra.isAllGames = true;
-        c.profiles.push_back(extra);
-        CHECK_EQ((int)c.profiles.size(), 3);
+        cd::Profile legacy;
+        legacy.name = L"All Games";
+        legacy.legacyAllGames = true;
+        legacy.game = L"Palworld.exe";
+        legacy.gameMask = t.defaultGameMask;
+        legacy.heavyMask = t.defaultHeavyMask;
+        c.profiles.push_back(legacy);
 
         std::vector<std::wstring> rep = cd::ValidateAndRepair(c, t);
 
-        CHECK_EQ((int)c.profiles.size(), 3);     // demoted, not dropped
-        if (c.profiles.size() == 3) {
+        // KEPT, NOT DELETED - removing a row from the user's file is destroying their data.
+        CHECK_EQ((int)c.profiles.size(), 2);
+        if (c.profiles.size() == 2) {
             CHECK_EQ(c.profiles[1].name, L"All Games");
-            CHECK_EQ(c.profiles[1].isAllGames, true);   // the FIRST one is kept
-            CHECK_EQ(c.profiles[2].name, L"Second All Games");
-            CHECK_EQ(c.profiles[2].isAllGames, false);  // the rest are cleared
+            CHECK_EQ(c.profiles[1].legacyAllGames, false);   // the flag is consumed
+            CHECK_EQ(c.profiles[1].game, L"");               // and the stale game with it
+            CHECK_EQ(c.profiles[0].game, L"Overwatch.exe");  // the ordinary one is untouched
         }
+        // REPORTED, naming the profile and the game it lost. The operator chose log-only
+        // delivery, so this note is the whole user-visible record of the migration.
         CHECK(!rep.empty());
-        CHECK(AnyContains(rep, L"Second All Games"));
-        if (!AnyContains(rep, L"Second All Games")) {
+        CHECK(AnyContains(rep, L"All Games"));
+        CHECK(AnyContains(rep, L"Palworld.exe"));
+        if (!AnyContains(rep, L"Palworld.exe")) {
             for (size_t i = 0; i < rep.size(); ++i)
                 std::printf("       repair[%d]: %s\n", (int)i, Utf8(rep[i]).c_str());
         }
-        // and AllGamesProfile() now finds exactly the surviving one.
-        const cd::Profile* ag = c.AllGamesProfile();
-        CHECK(ag != nullptr);
-        if (ag) CHECK_EQ(ag->name, L"All Games");
     }
 
-    Case("B12c an All Games profile carrying a game name has it cleared, and reported");
+    Case("B12c migrating the retired flag is idempotent and silent the second time");
     {
+        // A CONTROL. The note must fire ONCE, on the load that finds the key - not on every
+        // launch forever. Without this, a rule that reported unconditionally would pass B12b.
         cd::Config c = cd::DefaultConfig(t);
-        c.profiles[1].game = L"Overwatch.exe";
-        std::vector<std::wstring> rep = cd::ValidateAndRepair(c, t);
+        cd::Profile legacy;
+        legacy.name = L"All Games";
+        legacy.legacyAllGames = true;
+        legacy.gameMask = t.defaultGameMask;
+        legacy.heavyMask = t.defaultHeavyMask;
+        c.profiles.push_back(legacy);
 
-        CHECK_EQ((int)c.profiles.size(), 2);
-        if (c.profiles.size() == 2) {
-            CHECK_EQ(c.profiles[1].isAllGames, true);
-            CHECK_EQ(c.profiles[1].game, L"");
-            // The ordinary profile's game is untouched.
-            CHECK_EQ(c.profiles[0].game, L"Overwatch.exe");
+        std::vector<std::wstring> first = cd::ValidateAndRepair(c, t);
+        CHECK(AnyContains(first, L"All Games"));
+
+        std::vector<std::wstring> second = cd::ValidateAndRepair(c, t);
+        CHECK(second.empty());
+        if (!second.empty()) {
+            for (size_t i = 0; i < second.size(); ++i)
+                std::printf("       unexpected repeat[%d]: %s\n", (int)i, Utf8(second[i]).c_str());
         }
-        CHECK(!rep.empty());
-        CHECK(AnyContains(rep, L"All Games"));
+    }
+}
+
+void Test_B12d_TheRetiredFlagCannotSurviveASaveThatSkipsTheRepair() {
+    // 🔴 THE REGRESSION v0.5.4 ALMOST SHIPPED, found by adversarial review and fixed in
+    // ParseConfig rather than in the caller.
+    //
+    // RunVCacheSet (main.cpp) loads the config, edits one field and SAVES IT - with no
+    // ValidateAndRepair anywhere on that path. It dispatches before startup and returns.
+    // Since v0.5.4 the serializer no longer writes `all_games`, so that round trip would have
+    // DROPPED THE FLAG AND KEPT THE EXECUTABLE, and the next launch would have handed the
+    // profile a game the user never chose for it. The old code was safe only by accident: it
+    // wrote the key back out, so the pairing survived until a real repair ran.
+    //
+    // This asserts the fix WITHOUT calling ValidateAndRepair even once, because the whole
+    // point is the path that never calls it.
+    Case("B12d a retired all_games profile cannot carry its stale game through a repair-less save");
+
+    const std::wstring legacy =
+        L"[general]\r\nversion=1\r\n\r\n"
+        L"[masks]\r\nCache=0 1 2 3\r\n\r\n"
+        L"[profile:All Games]\r\n"
+        L"enabled=1\r\n"
+        L"game=Palworld.exe\r\n"
+        L"game_mask=Cache\r\n"
+        L"all_games=1\r\n";
+
+    cd::Config c;
+    std::wstring err;
+    CHECK(cd::ParseConfig(legacy, c, &err));
+    CHECK_EQ(err, L"");
+    CHECK_EQ((int)c.profiles.size(), 1);
+    if (!c.profiles.empty()) {
+        // The flag is seen...
+        CHECK_EQ(c.profiles[0].legacyAllGames, true);
+        // ...and the stale executable is ALREADY gone, before any repair runs.
+        CHECK_EQ(c.profiles[0].game, L"");
+    }
+
+    // EXACTLY WHAT THE HELPER DOES: serialize without repairing.
+    const std::wstring saved = cd::SerializeConfig(c);
+    CHECK(saved.find(L"all_games") == std::wstring::npos);
+    CHECK(saved.find(L"Palworld.exe") == std::wstring::npos);
+
+    cd::Config back;
+    CHECK(cd::ParseConfig(saved, back, &err));
+    CHECK_EQ((int)back.profiles.size(), 1);
+    if (!back.profiles.empty()) {
+        CHECK_EQ(back.profiles[0].legacyAllGames, false);
+        CHECK_EQ(back.profiles[0].game, L"");   // nothing for the engine to match
+    }
+
+    Case("B12d2 and the clear does not depend on the order of keys in the file");
+    {
+        // A hand-edited section can put all_games ABOVE game. config.ini is documented as
+        // hand-editable, so this is reachable - and a clear done inside the parse branch
+        // instead of in a post-pass would be undone by the very next line.
+        const std::wstring reversed =
+            L"[general]\r\nversion=1\r\n\r\n"
+            L"[masks]\r\nCache=0 1 2 3\r\n\r\n"
+            L"[profile:All Games]\r\n"
+            L"enabled=1\r\n"
+            L"all_games=1\r\n"
+            L"game=Palworld.exe\r\n"
+            L"game_mask=Cache\r\n";
+
+        cd::Config r;
+        CHECK(cd::ParseConfig(reversed, r, &err));
+        CHECK_EQ((int)r.profiles.size(), 1);
+        if (!r.profiles.empty()) {
+            CHECK_EQ(r.profiles[0].legacyAllGames, true);
+            CHECK_EQ(r.profiles[0].game, L"");
+        }
+    }
+
+    Case("B12d3 CONTROL - an ordinary profile with no retired flag keeps its game");
+    {
+        // Without this, everything above would pass on a parser that cleared `game` always.
+        const std::wstring ordinary =
+            L"[general]\r\nversion=1\r\n\r\n"
+            L"[masks]\r\nCache=0 1 2 3\r\n\r\n"
+            L"[profile:Palworld]\r\n"
+            L"enabled=1\r\n"
+            L"game=Palworld.exe\r\n"
+            L"game_mask=Cache\r\n";
+
+        cd::Config o;
+        CHECK(cd::ParseConfig(ordinary, o, &err));
+        CHECK_EQ((int)o.profiles.size(), 1);
+        if (!o.profiles.empty()) {
+            CHECK_EQ(o.profiles[0].legacyAllGames, false);
+            CHECK_EQ(o.profiles[0].game, L"Palworld.exe");
+        }
     }
 }
 
@@ -1407,6 +1541,17 @@ void Test_B13_MarkProfileUsed() {
     Case("B13 MarkProfileUsed stamps the named profile and is a no-op for an unknown name");
     cd::Topology t = MakeReference(false);
     cd::Config c = cd::DefaultConfig(t);
+    // A SECOND PROFILE, CONSTRUCTED HERE RATHER THAN BORROWED. This case proves "only the
+    // named one moved", which needs a second profile to be silent about. The default used
+    // to ship one (All Games) and no longer does, so the control is built. Its masks come
+    // from the same topology, so the config stays valid.
+    {
+        cd::Profile second;
+        second.name = L"Second";
+        second.gameMask = t.defaultGameMask;
+        second.heavyMask = t.defaultHeavyMask;
+        c.profiles.push_back(second);
+    }
     CHECK_EQ((int)c.profiles.size(), 2);
 
     CHECK_EQ(c.profiles[0].lastUsed, 0ull);
@@ -4076,12 +4221,16 @@ void Test_V6_TopologyChangedPreservedSentence() {
     CHECK(three.find(L"3 custom masks") != std::wstring::npos);
 
     // Pinned wording. The sentence is appended to a MessageBox nobody can assert on.
+    // v0.5.6: the tab it sends the user to is labelled "CPU Core Map" now, so the sentence names it that way.
+    // Read from the tab labels as well, so renaming the tab without these sentences fails here.
+    CHECK(one.find(cd::kSettingsPageLabels[1]) != std::wstring::npos &&
+          three.find(cd::kSettingsPageLabels[1]) != std::wstring::npos);
     CHECK_EQ(one, std::wstring(L"1 custom mask you created was kept, but the processor "
                                L"numbers inside it may now refer to different cores - open "
-                               L"the Core map and check it."));
+                               L"the CPU Core Map and check it."));
     CHECK_EQ(three, std::wstring(L"3 custom masks you created were kept, but the processor "
                                  L"numbers inside them may now refer to different cores - "
-                                 L"open the Core map and check each one."));
+                                 L"open the CPU Core Map and check each one."));
 }
 
 // ===========================================================================
@@ -4965,7 +5114,7 @@ void Test_Z1_DefaultIsOff() {
 
     cd::Topology t = MakeReference(false);
     cd::Config c = cd::DefaultConfig(t);
-    CHECK(c.profiles.size() >= 2);
+    CHECK(c.profiles.size() >= 1);
     for (size_t i = 0; i < c.profiles.size(); ++i) CHECK_EQ(c.profiles[i].extremeMode, false);
 }
 
@@ -4973,6 +5122,16 @@ void Test_Z2_RoundTripAndOldConfigs() {
     Case("Z2 extreme_mode survives a save/load round trip, both ways");
     cd::Topology t = MakeReference(false);
     cd::Config c = cd::DefaultConfig(t);
+    // TWO profiles, because the claim is that true and false survive INDEPENDENTLY - one
+    // profile could not tell a working round trip from a parser that returns a constant.
+    // The default ships one since the All Games profile stopped shipping, so this is built.
+    {
+        cd::Profile second;
+        second.name = L"Second";
+        second.gameMask = t.defaultGameMask;
+        second.heavyMask = t.defaultHeavyMask;
+        c.profiles.push_back(second);
+    }
     c.profiles[0].extremeMode = true;
     c.profiles[1].extremeMode = false;
 
@@ -5275,7 +5434,8 @@ void Test_Z12_InfoIconTooltipWording() {
              L"the background mask until the game exits. The list above tags them AUTO.");
     CHECK_EQ(cd::ExtremeModeInfoTipText(),
              L"Not only the busy ones and not only the ones you named - everything except "
-             L"the game and the exclusion list.");
+             L"the game and the exclusion list. Background apps can also be moved to another "
+             L"GPU on the GPU Assignment tab.");
 
     Case("Z12b the AUTO legend survived the move - it lives nowhere else now");
     // The heavy list tags rows AUTO and the caption that explained the tag was this
@@ -5310,6 +5470,24 @@ void Test_Z12_InfoIconTooltipWording() {
         for (size_t b = 0; b < sizeof(banned) / sizeof(banned[0]); ++b)
             CHECK(all[i].find(cd::ToLower(banned[b])) == std::wstring::npos);
     }
+
+    Case("Z12e the (i) names the tab it points to, and carries no number");
+    // Operator instruction 2026-09-12: "statement remain in circle i". The sentence is the
+    // only place the page says where GPUs are assigned, so it must NAME that place - a
+    // tooltip that says "some apps can move" without saying where leaves the user hunting.
+    // v0.5.6: the place is the GPU Assignment TAB. The button the sentence used to name was
+    // renamed and moved ABOVE this check box, which made both its name and its "below" false -
+    // so the sentence carries no direction word and no "second GPU" (the tab also offers the
+    // main GPU), and those are checked here so a later rewording cannot bring them back.
+    // Read from the tab labels themselves, so renaming the tab without the sentence fails here.
+    CHECK(tip.find(cd::kSettingsPageLabels[2]) != std::wstring::npos);
+    CHECK(tip.find(L"below") == std::wstring::npos && tip.find(L"above") == std::wstring::npos &&
+          tip.find(L"second GPU") == std::wstring::npos);
+    // AND NO DIGIT. The string is registered once as a process-lifetime static, so a count
+    // written into it would be frozen at whatever it was when the window first opened.
+    // ONE assertion, not one per character. A per-character CHECK loop added ~175 entries to
+    // the suite total for a single claim, which inflates the tally without adding coverage.
+    CHECK(tip.find_first_of(L"0123456789") == std::wstring::npos);
 }
 
 void Test_Z11_VCacheActiveRow() {
@@ -6855,8 +7033,26 @@ void Test_AA10_OneGameRunningIsByteIdenticalToBefore() {
     }
 }
 
-void Test_AA11_ASpecificProfileStillBeatsAllGamesAtOnce() {
-    Case("AA11 an All Games incumbent yields to a specific profile IMMEDIATELY");
+void Test_AA11_AMigratedLegacyProfileGovernsNothing() {
+    // 🔴 WHAT THIS SLOT USED TO HOLD, AND WHY IT COULD NOT BE SAVED. AA11 asserted that an
+    // All Games incumbent yielded to a specific profile IMMEDIATELY, with no dwell. That was
+    // a property of Rule 1b and ONLY of Rule 1b: an All Games profile joined the candidate
+    // list only while the list was empty, so the instant a specific game matched, the
+    // incumbent vanished from the candidates and ChooseProfile reported Released.
+    //
+    // v0.5.4 deleted Rule 1b. Two ordinary profiles are BOTH candidates, so the incumbent
+    // stays in the list and the three-second dwell applies exactly as it should. Rewriting
+    // the old assertion in terms of ordinary profiles produced a test that FAILED, and it
+    // deserved to - it was asserting a rule this build does not have. The half of the claim
+    // that survives, "a profile whose game exited releases at once", is already covered by
+    // AA9 and again at the ChooseProfile level by AA13, so restating it here would buy
+    // nothing.
+    //
+    // WHAT REPLACES IT IS THE END-TO-END HALF OF THE MIGRATION, which nothing else tests:
+    // config.cpp rule 6b clears a legacy profile's stale `game`, and the point of clearing
+    // it is that the profile must not start governing an executable the user never chose for
+    // it. B12b proves the field is cleared; this proves the ENGINE agrees.
+    Case("AA11 a migrated legacy All Games profile governs nothing, even with its old game up");
     cd::Topology t = MakeReference(false);
     cd::Config c;
     c.version = 1;
@@ -6871,32 +7067,49 @@ void Test_AA11_ASpecificProfileStillBeatsAllGamesAtOnce() {
     ow.heavyMask = L"Freq";
     c.profiles.push_back(ow);
 
-    cd::Profile all;
-    all.name = L"All Games";
-    all.enabled = true;
-    all.isAllGames = true;
-    // The watcher fills this pipe-separated list in; a test simply sets it. See Rule 1b.
-    all.game = L"Palworld.exe";
-    all.gameMask = L"Cache no SMT";
-    all.heavyMask = L"Freq";
-    c.profiles.push_back(all);
-    CHECK(c.AllGamesProfile() != nullptr);
+    // As an OLD config would load it: the retired flag set, and a stale executable in the
+    // field the engine used to overwrite on every tick. ENABLED, so nothing but the cleared
+    // game can be what stops it.
+    cd::Profile legacy;
+    legacy.name = L"All Games";
+    legacy.enabled = true;
+    legacy.legacyAllGames = true;
+    legacy.game = L"Palworld.exe";
+    legacy.gameMask = L"Cache no SMT";
+    legacy.heavyMask = L"Freq";
+    c.profiles.push_back(legacy);
 
-    // Only Palworld is up, so nothing specific matches and All Games governs it.
+    // FAILURE-BEFORE-FIX CONTROL. Before the repair runs, that stale field IS live - this is
+    // precisely the hazard rule 6b exists to close, and asserting it here is what stops the
+    // test below from passing vacuously on a build that never set the game at all.
     cd::ProcessSnapshot pal;
     AddProc(pal, 500, 400, L"explorer.exe", 100, 0, 0.0);
     AddProc(pal, 1000, 500, L"Palworld.exe", 200, 0, 0.0);
-    cd::ProfileSelection sel;
-    CHECK_EQ(TickWinner(pal, c, 1000, sel, nullptr), std::wstring(L"All Games"));
-    CHECK_EQ(sel.reason, cd::SelectReason::First);
+    {
+        cd::ProfileSelection sel;
+        CHECK_EQ(TickWinner(pal, c, 1000, sel, nullptr), std::wstring(L"All Games"));
+    }
 
-    // Overwatch starts. A specific profile outranks All Games however long the All Games
-    // profile has been governing, and it must NOT have to serve a dwell to do it.
-    cd::ProcessSnapshot both = MakeTwoGameSnapshot();
-    std::map<DWORD, std::wstring> res;
-    CHECK_EQ(TickWinner(both, c, 1000, sel, &res), std::wstring(L"Overwatch 2"));
-    CHECK_EQ(sel.reason, cd::SelectReason::Released);
-    CHECK_EQ(MaskOf(res, 2000), std::wstring(L"Cache no SMT"));
+    // Now load it the way the app does.
+    const std::vector<std::wstring> rep = cd::ValidateAndRepair(c, t);
+    CHECK(AnyContains(rep, L"All Games"));
+
+    // Palworld is still running. The migrated profile must govern NOTHING.
+    {
+        cd::ProfileSelection sel;
+        std::map<DWORD, std::wstring> res;
+        CHECK_EQ(TickWinner(pal, c, 1000, sel, &res), std::wstring());
+        CHECK(res.empty());
+    }
+
+    // And the ordinary profile beside it is untouched: Overwatch still governs when it runs.
+    {
+        cd::ProcessSnapshot ow2;
+        AddProc(ow2, 500, 400, L"explorer.exe", 100, 0, 0.0);
+        AddProc(ow2, 2000, 500, L"Overwatch.exe", 200, 0, 0.0);
+        cd::ProfileSelection sel;
+        CHECK_EQ(TickWinner(ow2, c, 2000, sel, nullptr), std::wstring(L"Overwatch 2"));
+    }
 }
 
 void Test_AA12_EveryReasonHasItsOwnWords() {
@@ -6950,11 +7163,11 @@ void Test_AA13_OneCandidateIgnoresTheForegroundEntirely() {
 }
 
 void Test_AB1_TheShippedVersionFormatsAsTheOperatorNamesIt() {
-    Case("AB1 0,4,4,0 in the resource reads 'v0.4.4' on screen");
+    Case("AB1 0,5,5,0 in the resource reads 'v0.5.5' on screen");
     // ms = (major<<16)|minor, ls = (patch<<16)|build - the VS_FIXEDFILEINFO packing.
     // Tracks src\GameOptimizer.rc: a version bump that leaves this vector behind makes the
     // case NAME a lie while the assertion still passes, which is the quiet half of a stale test.
-    CHECK_EQ(cd::FormatVersionLabel(0x00000004u, 0x00040000u), std::wstring(L"v0.4.4"));
+    CHECK_EQ(cd::FormatVersionLabel(0x00000005u, 0x00050000u), std::wstring(L"v0.5.5"));
 }
 
 void Test_AB2_AFourthFieldIsShownOnlyWhenItSaysSomething() {
@@ -6978,6 +7191,2241 @@ void Test_AB4_TheLabelIsNeverSomethingElse() {
     CHECK(v.find(L"..") == std::wstring::npos);
     CHECK(v.size() < 32);   // it shares a row with the OK button; it is not a paragraph
 }
+
+// ===========================================================================
+// == AG. Auto-Isolate GPU - pure decision logic ==
+// ===========================================================================
+
+void Test_AG1_AdapterKeyFromPnpId() {
+    Case("AG1 PnP ID parsing extracts VEN&DEV&SUBSYS, uppercase");
+    std::wstring input = L"PCI\\VEN_10DE&DEV_2684&SUBSYS_40BF1458&REV_A1\\4&15A5C264&0&000B";
+    CHECK_EQ(cd::AdapterKeyFromPnpId(input), std::wstring(L"10DE&2684&40BF1458"));
+
+    // Lowercase input should give uppercase output
+    std::wstring lowercaseInput = L"pci\\ven_10de&dev_2684&subsys_40bf1458&rev_a1\\4&15a5c264&0&000b";
+    CHECK_EQ(cd::AdapterKeyFromPnpId(lowercaseInput), std::wstring(L"10DE&2684&40BF1458"));
+
+    // Invalid input gives empty
+    CHECK_EQ(cd::AdapterKeyFromPnpId(std::wstring(L"not a pnp id")), std::wstring());
+    CHECK_EQ(cd::AdapterKeyFromPnpId(std::wstring()), std::wstring());
+}
+
+void Test_AG2_FormatAndParsePreferenceValue() {
+    Case("AG2 FormatPreferenceValue and AdapterKeyFromPreferenceValue round-trip");
+    std::wstring key = L"10DE&2684&40BF1458";
+    std::wstring formatted = cd::FormatPreferenceValue(key);
+    CHECK_EQ(formatted, std::wstring(L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=1073741824;"));
+    CHECK_EQ(cd::AdapterKeyFromPreferenceValue(formatted), key);
+
+    Case("AG2b reversed key order still parses");
+    std::wstring reversed = L"GpuPreference=1073741824;SpecificAdapter=10DE&2684&40BF1458;";
+    CHECK_EQ(cd::AdapterKeyFromPreferenceValue(reversed), key);
+
+    Case("AG2c missing trailing semicolon parses");
+    std::wstring noTrailingSemi = L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=1073741824";
+    CHECK_EQ(cd::AdapterKeyFromPreferenceValue(noTrailingSemi), key);
+
+    Case("AG2d non-SpecificAdapter value gives empty");
+    CHECK_EQ(cd::AdapterKeyFromPreferenceValue(std::wstring(L"GpuPreference=2;")), std::wstring());
+}
+
+void Test_AG3_PlanGpuIsolation() {
+    Case("AG3a empty adapter list gives both empty");
+    std::vector<cd::GpuAdapter> empty;
+    cd::GpuPlan plan = cd::PlanGpuIsolation(empty);
+    CHECK(plan.gameKey.empty());
+    CHECK(plan.backgroundKey.empty());
+
+    Case("AG3b one adapter gives both empty");
+    std::vector<cd::GpuAdapter> one;
+    cd::GpuAdapter a1;
+    a1.name = L"RTX 4090";
+    a1.adapterKey = L"10DE&2684&40BF1458";
+    a1.hasDisplay = true;
+    a1.vram = 24ull * 1024 * 1024 * 1024;
+    one.push_back(a1);
+    plan = cd::PlanGpuIsolation(one);
+    CHECK(plan.gameKey.empty());
+    CHECK(plan.backgroundKey.empty());
+
+    Case("AG3c two adapters, one with display: game on display, background on other");
+    std::vector<cd::GpuAdapter> two;
+    cd::GpuAdapter a_display;
+    a_display.name = L"RTX 4090";
+    a_display.adapterKey = L"10DE&2684&40BF1458";
+    a_display.hasDisplay = true;
+    a_display.vram = 24ull * 1024 * 1024 * 1024;
+    two.push_back(a_display);
+
+    cd::GpuAdapter a_noDisplay;
+    a_noDisplay.name = L"RTX 3060";
+    a_noDisplay.adapterKey = L"10DE&2060&40BF1458";
+    a_noDisplay.hasDisplay = false;
+    a_noDisplay.vram = 12ull * 1024 * 1024 * 1024;
+    two.push_back(a_noDisplay);
+
+    plan = cd::PlanGpuIsolation(two);
+    CHECK_EQ(plan.gameKey, std::wstring(L"10DE&2684&40BF1458"));
+    CHECK_EQ(plan.backgroundKey, std::wstring(L"10DE&2060&40BF1458"));
+
+    Case("AG3d two adapters both with display: distinct non-empty");
+    std::vector<cd::GpuAdapter> bothDisplay;
+    a_display.vram = 24ull * 1024 * 1024 * 1024;
+    bothDisplay.push_back(a_display);
+
+    cd::GpuAdapter a2_display;
+    a2_display.name = L"RTX 5090";
+    a2_display.adapterKey = L"10DE&2B85&53021462";
+    a2_display.hasDisplay = true;
+    a2_display.vram = 32ull * 1024 * 1024 * 1024;
+    bothDisplay.push_back(a2_display);
+
+    plan = cd::PlanGpuIsolation(bothDisplay);
+    CHECK(!plan.gameKey.empty());
+    CHECK(!plan.backgroundKey.empty());
+    CHECK_NE(plan.gameKey, plan.backgroundKey);
+
+    Case("AG3e two adapters neither with display: both empty");
+    std::vector<cd::GpuAdapter> noneDisplay;
+    cd::GpuAdapter no1;
+    no1.name = L"GPU1";
+    no1.adapterKey = L"1234&5678&9ABC";
+    no1.hasDisplay = false;
+    no1.vram = 8ull * 1024 * 1024 * 1024;
+    noneDisplay.push_back(no1);
+
+    cd::GpuAdapter no2;
+    no2.name = L"GPU2";
+    no2.adapterKey = L"ABCD&EF01&2345";
+    no2.hasDisplay = false;
+    no2.vram = 12ull * 1024 * 1024 * 1024;
+    noneDisplay.push_back(no2);
+
+    plan = cd::PlanGpuIsolation(noneDisplay);
+    CHECK(plan.gameKey.empty());
+    CHECK(plan.backgroundKey.empty());
+
+    Case("AG3f two adapters both with display, different vram: larger vram wins game");
+    std::vector<cd::GpuAdapter> twoWithDiffVram;
+    cd::GpuAdapter small;
+    small.name = L"Small VRAM";
+    small.adapterKey = L"AAAA&BBBB&CCCC";
+    small.hasDisplay = true;
+    small.vram = 8ull * 1024 * 1024 * 1024;
+    twoWithDiffVram.push_back(small);
+
+    cd::GpuAdapter large;
+    large.name = L"Large VRAM";
+    large.adapterKey = L"DDDD&EEEE&FFFF";
+    large.hasDisplay = true;
+    large.vram = 24ull * 1024 * 1024 * 1024;
+    twoWithDiffVram.push_back(large);
+
+    plan = cd::PlanGpuIsolation(twoWithDiffVram);
+    CHECK_EQ(plan.gameKey, std::wstring(L"DDDD&EEEE&FFFF"));  // larger vram adapter
+    CHECK_EQ(plan.backgroundKey, std::wstring(L"AAAA&BBBB&CCCC"));
+
+    Case("AG3g TWO IDENTICAL CARDS SHARE ONE ADAPTER KEY, and the plan must REFUSE");
+    {
+        // 🔴 THE CASE AG3d ONLY LOOKED LIKE IT COVERED. That case asserts
+        // CHECK_NE(gameKey, backgroundKey) on two adapters the TEST gave different keys, so it
+        // passes for a reason unrelated to the code and could never have caught this.
+        //
+        // The adapter key is built from VendorId, DeviceId and SubSysId. Two identical cards -
+        // a dual-4090 box, exactly the machine this feature is for - match on all three and
+        // therefore produce ONE key. PlanGpuIsolation separates adapters by POINTER, so before
+        // the guard it returned gameKey == backgroundKey, every row ticked, every registry
+        // write succeeded, and the dialog reported N apps moved onto the card the game was
+        // already on. Nothing anywhere disagreed.
+        std::vector<cd::GpuAdapter> twins;
+        cd::GpuAdapter t1;
+        t1.name = L"RTX 4090";
+        t1.adapterKey = L"10DE&2684&40BF1458";
+        t1.hasDisplay = true;
+        t1.vram = 24ull * 1024 * 1024 * 1024;
+        twins.push_back(t1);
+
+        cd::GpuAdapter t2 = t1;          // a SECOND physical card, same model, same key
+        t2.hasDisplay = false;           // and no display, so it looks like an ideal background
+        twins.push_back(t2);
+
+        cd::GpuPlan twinPlan = cd::PlanGpuIsolation(twins);
+        CHECK(twinPlan.gameKey.empty());
+        CHECK(twinPlan.backgroundKey.empty());
+        // and it SAYS why, because an empty plan with no reason is indistinguishable from a
+        // machine that simply has one GPU.
+        CHECK(!twinPlan.why.empty());
+        CHECK(twinPlan.why.find(L"same adapter id") != std::wstring::npos);
+
+        // CONTROL: change ONE character of the second key and the plan must succeed again,
+        // so the guard cannot be passing by refusing everything.
+        twins[1].adapterKey = L"10DE&2684&40BF1459";
+        cd::GpuPlan okPlan = cd::PlanGpuIsolation(twins);
+        CHECK_EQ(okPlan.gameKey, std::wstring(L"10DE&2684&40BF1458"));
+        CHECK_EQ(okPlan.backgroundKey, std::wstring(L"10DE&2684&40BF1459"));
+    }
+}
+
+void Test_AG4_ClassifyGpuPref() {
+    Case("AG4a Correct: want=stored=running");
+    cd::GpuPrefState state = cd::ClassifyGpuPref(
+        std::wstring(L"10DE&2684&40BF1458"),
+        std::wstring(L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=1073741824;"),
+        std::wstring(L"10DE&2684&40BF1458"));
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::Correct));
+
+    Case("AG4b Missing: no stored value");
+    state = cd::ClassifyGpuPref(
+        std::wstring(L"10DE&2684&40BF1458"),
+        std::wstring(),
+        std::wstring(L"10DE&2684&40BF1458"));
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::Missing));
+
+    Case("AG4c WrongAdapter: stored value is incorrect");
+    state = cd::ClassifyGpuPref(
+        std::wstring(L"10DE&2684&40BF1458"),
+        std::wstring(L"SpecificAdapter=AAAA&BBBB&CCCC;GpuPreference=1073741824;"),
+        std::wstring(L"10DE&2684&40BF1458"));
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::WrongAdapter));
+
+    Case("AG4d StaleNotApplied: stored is correct but process on different adapter");
+    state = cd::ClassifyGpuPref(
+        std::wstring(L"10DE&2684&40BF1458"),
+        std::wstring(L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=1073741824;"),
+        std::wstring(L"DDDD&EEEE&FFFF"));  // different from want
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::StaleNotApplied));
+
+    Case("AG4e Unknown: want or running is empty");
+    state = cd::ClassifyGpuPref(
+        std::wstring(),  // empty want
+        std::wstring(L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=1073741824;"),
+        std::wstring(L"10DE&2684&40BF1458"));
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::Unknown));
+
+    Case("AG4f StaleNotApplied vs WrongAdapter are distinct");
+    // StaleNotApplied: stored value IS correct, but process is elsewhere
+    cd::GpuPrefState stale = cd::ClassifyGpuPref(
+        std::wstring(L"10DE&2684&40BF1458"),
+        std::wstring(L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=1073741824;"),
+        std::wstring(L"OTHER&ADAPTER&KEY"));
+    // WrongAdapter: stored value itself is wrong
+    cd::GpuPrefState wrong = cd::ClassifyGpuPref(
+        std::wstring(L"10DE&2684&40BF1458"),
+        std::wstring(L"SpecificAdapter=WRONG&ADAPT&KEY;GpuPreference=1073741824;"),
+        std::wstring(L"10DE&2684&40BF1458"));
+    CHECK_EQ(static_cast<int>(stale), static_cast<int>(cd::GpuPrefState::StaleNotApplied));
+    CHECK_EQ(static_cast<int>(wrong), static_cast<int>(cd::GpuPrefState::WrongAdapter));
+    CHECK_NE(static_cast<int>(stale), static_cast<int>(wrong));
+}
+
+void Test_AG5_ConfigRoundTripPreservesUnknownKey() {
+    Case("AG5 config round-trip preserves unknown keys in [gpus] section");
+    std::wstring configText = L"[general]\r\n"
+        L"version=1\r\n"
+        L"start_with_windows=0\r\n"
+        L"poll_ms=250\r\n"
+        L"notifications=0\r\n"
+        L"paused=0\r\n"
+        L"vcache_original_start=-1\r\n"
+        L"first_run_done=0\r\n"
+        L"show_vcache_warning=1\r\n"
+        L"\r\n"
+        L"[masks]\r\n"
+        L"\r\n"
+        L"[topology]\r\n"
+        L"signature=\r\n"
+        L"\r\n"
+        L"[exclusions]\r\n"
+        L"names=\r\n"
+        L"\r\n"
+        L"[gpus]\r\n"
+        L"auto_isolate=1\r\n"
+        L"game_gpu=\r\n"
+        L"background_gpu=\r\n"
+        L"unknown_future_key=future_value\r\n";
+
+    cd::Config c;
+    std::wstring error;
+    CHECK(cd::ParseConfig(configText, c, &error));
+
+    std::wstring serialized = cd::SerializeConfig(c);
+    CHECK(serialized.find(L"unknown_future_key=future_value") != std::wstring::npos);
+}
+
+void Test_AH1_FormatRowGpu() {
+    Case("AH1a FormatRowGpu: assigned == running, show one name");
+    auto nameFor = [](const std::wstring& key) {
+        if (key == L"10DE&2B85&53021462") return std::wstring(L"RTX 5090");
+        if (key == L"10DE&2684&40BF1458") return std::wstring(L"RTX 4090");
+        return std::wstring(L"unknown GPU");
+    };
+
+    cd::GpuRow row;
+    row.exeName = L"game.exe";
+    row.exePath = L"C:\\game\\game.exe";
+    row.assignedKey = L"10DE&2B85&53021462";
+    row.runningKey = L"10DE&2B85&53021462";
+    row.isProfileGame = false;
+    row.selected = false;
+
+    std::wstring result = cd::FormatRowGpu(row, nameFor);
+    CHECK_EQ(result, std::wstring(L"RTX 5090"));
+
+    Case("AH1b FormatRowGpu: assigned != running, show both with arrow");
+    row.assignedKey = L"10DE&2B85&53021462";
+    row.runningKey = L"10DE&2684&40BF1458";
+    result = cd::FormatRowGpu(row, nameFor);
+    CHECK(result.find(L"RTX 5090") != std::wstring::npos);
+    CHECK(result.find(L"RTX 4090") != std::wstring::npos);
+    CHECK(result.find(L"->") != std::wstring::npos);
+
+    Case("AH1c FormatRowGpu: empty assignedKey shows 'not assigned'");
+    row.assignedKey = L"";
+    row.runningKey = L"10DE&2684&40BF1458";
+    result = cd::FormatRowGpu(row, nameFor);
+    CHECK(result.find(L"not assigned") != std::wstring::npos);
+
+    Case("AH1d FormatRowGpu: unknown key shows 'unknown GPU'");
+    row.assignedKey = L"UNKNOWN&KEY&HERE";
+    row.runningKey = L"10DE&2684&40BF1458";
+    result = cd::FormatRowGpu(row, nameFor);
+    CHECK(result.find(L"unknown GPU") != std::wstring::npos);
+
+    Case("AH1e FormatRowGpu: an UNMEASURED runningKey is not a mismatch - no arrow");
+    // Nothing in the product fills runningKey. Before the fix every assigned row in the
+    // Isolate GPU window read "RTX 4090 -> running on unknown GPU" - a disagreement nobody
+    // measured, on every row. The earlier cases all set runningKey, so none of them saw it.
+    row.assignedKey = L"10DE&2684&40BF1458";
+    row.runningKey = L"";
+    result = cd::FormatRowGpu(row, nameFor);
+    CHECK_EQ(result, std::wstring(L"RTX 4090"));
+    CHECK(result.find(L"->") == std::wstring::npos);
+    CHECK(result.find(L"unknown GPU") == std::wstring::npos);
+    // and with nothing assigned either, it still says so plainly
+    row.assignedKey = L"";
+    result = cd::FormatRowGpu(row, nameFor);
+    CHECK_EQ(result, std::wstring(L"not assigned"));
+}
+
+void Test_AH2_RowState() {
+    Case("AH2a RowState: Correct - want==stored==running");
+    cd::GpuRow row;
+    row.exeName = L"app.exe";
+    row.exePath = L"C:\\app\\app.exe";
+    row.assignedKey = L"10DE&2B85&53021462";
+    row.runningKey = L"10DE&2B85&53021462";
+    row.isProfileGame = false;
+    row.selected = false;
+
+    cd::GpuPrefState state = cd::RowState(row, L"10DE&2B85&53021462");
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::Correct));
+
+    Case("AH2b RowState: Missing - no assignedKey");
+    row.assignedKey = L"";
+    row.runningKey = L"10DE&2B85&53021462";
+    state = cd::RowState(row, L"10DE&2B85&53021462");
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::Missing));
+
+    Case("AH2c RowState: WrongAdapter - assignedKey is wrong");
+    row.assignedKey = L"AAAA&BBBB&CCCC";
+    row.runningKey = L"10DE&2B85&53021462";
+    state = cd::RowState(row, L"10DE&2B85&53021462");
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::WrongAdapter));
+
+    Case("AH2d RowState: StaleNotApplied - stored correct but running elsewhere");
+    row.assignedKey = L"10DE&2B85&53021462";
+    row.runningKey = L"DIFFERENT&KEY&HERE";
+    state = cd::RowState(row, L"10DE&2B85&53021462");
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::StaleNotApplied));
+
+    Case("AH2e RowState: Unknown - runningKey is empty");
+    row.assignedKey = L"10DE&2B85&53021462";
+    row.runningKey = L"";
+    state = cd::RowState(row, L"10DE&2B85&53021462");
+    CHECK_EQ(static_cast<int>(state), static_cast<int>(cd::GpuPrefState::Unknown));
+
+    Case("AH2f RowState: StaleNotApplied vs WrongAdapter are distinct");
+    cd::GpuRow staleRow;
+    staleRow.assignedKey = L"10DE&2B85&53021462";
+    staleRow.runningKey = L"OTHER&ADAPTER&KEY";
+    cd::GpuPrefState stale = cd::RowState(staleRow, L"10DE&2B85&53021462");
+
+    cd::GpuRow wrongRow;
+    wrongRow.assignedKey = L"WRONG&ADAPT&KEY";
+    wrongRow.runningKey = L"10DE&2B85&53021462";
+    cd::GpuPrefState wrong = cd::RowState(wrongRow, L"10DE&2B85&53021462");
+
+    CHECK_EQ(static_cast<int>(stale), static_cast<int>(cd::GpuPrefState::StaleNotApplied));
+    CHECK_EQ(static_cast<int>(wrong), static_cast<int>(cd::GpuPrefState::WrongAdapter));
+    CHECK_NE(static_cast<int>(stale), static_cast<int>(wrong));
+}
+
+void Test_AH3_SelectForBackground() {
+    Case("AH3a SelectForBackground: isProfileGame=true is NEVER selected");
+    std::vector<cd::GpuRow> rows;
+    cd::GpuRow row1;
+    row1.exeName = L"profile_game.exe";
+    row1.assignedKey = L"10DE&2684&40BF1458";
+    row1.runningKey = L"10DE&2684&40BF1458";
+    row1.isProfileGame = true;
+    row1.selected = false;
+    rows.push_back(row1);
+
+    std::vector<cd::GpuRow> result = cd::SelectForBackground(rows, L"10DE&2B85&53021462");
+    CHECK_EQ(result[0].selected, false);
+
+    Case("AH3b SelectForBackground: already correct on both keys is not selected");
+    rows.clear();
+    cd::GpuRow row2;
+    row2.exeName = L"background_app.exe";
+    row2.assignedKey = L"10DE&2B85&53021462";
+    row2.runningKey = L"10DE&2B85&53021462";
+    row2.isProfileGame = false;
+    row2.selected = false;
+    rows.push_back(row2);
+
+    result = cd::SelectForBackground(rows, L"10DE&2B85&53021462");
+    CHECK_EQ(result[0].selected, false);
+
+    Case("AH3c SelectForBackground: wrong row IS selected");
+    rows.clear();
+    cd::GpuRow row3;
+    row3.exeName = L"wrong_app.exe";
+    row3.assignedKey = L"10DE&2684&40BF1458";
+    row3.runningKey = L"10DE&2684&40BF1458";
+    row3.isProfileGame = false;
+    row3.selected = false;
+    rows.push_back(row3);
+
+    result = cd::SelectForBackground(rows, L"10DE&2B85&53021462");
+    CHECK_EQ(result[0].selected, true);
+
+    Case("AH3d SelectForBackground: empty backgroundKey selects nothing");
+    rows.clear();
+    row3.exeName = L"any_app.exe";
+    row3.assignedKey = L"10DE&2684&40BF1458";
+    row3.runningKey = L"10DE&2684&40BF1458";
+    row3.isProfileGame = false;
+    row3.selected = false;
+    rows.push_back(row3);
+
+    result = cd::SelectForBackground(rows, L"");
+    CHECK_EQ(result[0].selected, false);
+
+    Case("AH3e runningKey UNKNOWN and already assigned to the background GPU: NOT re-selected");
+    // 🔴 The skip used to require runningKey == backgroundKey too, and runningKey has no
+    // producer in this product, so the bulk action re-selected - and Apply rewrote - every app
+    // that was already where it should be. Every earlier case here set runningKey.
+    const std::wstring bg = L"10DE&2B85&53021462";
+    rows.clear();
+    cd::GpuRow onBg;
+    onBg.exeName = L"already_moved.exe";
+    onBg.assignedKey = bg;
+    onBg.runningKey = L"";
+    rows.push_back(onBg);
+    result = cd::SelectForBackground(rows, bg);
+    CHECK_EQ(result[0].selected, false);
+
+    Case("AH3f runningKey unknown, assigned ELSEWHERE: selected");
+    rows.clear();
+    cd::GpuRow elsewhere = onBg;
+    elsewhere.exeName = L"on_game_gpu.exe";
+    elsewhere.assignedKey = L"10DE&2684&40BF1458";
+    rows.push_back(elsewhere);
+    result = cd::SelectForBackground(rows, bg);
+    CHECK_EQ(result[0].selected, true);
+
+    Case("AH3g runningKey unknown, NOTHING assigned: selected");
+    rows.clear();
+    cd::GpuRow bare = onBg;
+    bare.exeName = L"never_assigned.exe";
+    bare.assignedKey = L"";
+    rows.push_back(bare);
+    result = cd::SelectForBackground(rows, bg);
+    CHECK_EQ(result[0].selected, true);
+
+    Case("AH3h CONTROL - runningKey KNOWN and different: selected even though assigned is right");
+    // Without this, AH3e would pass on a rule that ignored runningKey altogether. When the
+    // running adapter IS a measured fact, registry and process must both agree, as before.
+    rows.clear();
+    cd::GpuRow stale = onBg;
+    stale.exeName = L"stale.exe";
+    stale.assignedKey = bg;
+    stale.runningKey = L"10DE&2684&40BF1458";
+    rows.push_back(stale);
+    result = cd::SelectForBackground(rows, bg);
+    CHECK_EQ(result[0].selected, true);
+}
+
+// ===========================================================================
+// == AJ. GPU assignment policy - every case here was FOUND on the operator's real machine ==
+// ===========================================================================
+//
+// A read-only probe of the feature's data path, run on 2026-09-12 before the Isolate GPU window
+// existed, returned four adapters (RTX 5090 with display, AMD Radeon iGPU 2 GB, RTX 4090, and a
+// SECOND RTX 5090 entry with the same key), 16 registry preferences all pointing at the 4090, and
+// three "orphans" of which one was a different application. None of the 2800 tests that existed
+// at the time could see any of it, because every one of them used adapters and paths the test
+// author invented. These use the machine's real shapes.
+
+std::vector<cd::GpuAdapter> RealMachineAdapters() {
+    // 🔴 `a` IS REUSED, SO EVERY FIELD IS SET ON EVERY ENTRY - kind included, or an entry silently inherits the
+    // previous entry's. Kinds as measured by igpuprobe (DXCore IsIntegrated by LUID): the second RTX 5090 entry is
+    // not known to DXCore at all.
+    std::vector<cd::GpuAdapter> v;
+    cd::GpuAdapter a;
+    a.name = L"NVIDIA GeForce RTX 5090";   a.adapterKey = L"10DE&2B85&53021462";
+    a.hasDisplay = true;  a.vram = 31ull << 30;  a.kind = cd::GpuKind::Discrete;    v.push_back(a);
+    a.name = L"AMD Radeon(TM) Graphics";   a.adapterKey = L"1002&13C0&88771043";
+    a.hasDisplay = false; a.vram = 2ull << 30;   a.kind = cd::GpuKind::Integrated;  v.push_back(a);
+    a.name = L"NVIDIA GeForce RTX 4090";   a.adapterKey = L"10DE&2684&40BF1458";
+    a.hasDisplay = false; a.vram = 22ull << 30;  a.kind = cd::GpuKind::Discrete;    v.push_back(a);
+    a.name = L"NVIDIA GeForce RTX 5090";   a.adapterKey = L"10DE&2B85&53021462";
+    a.hasDisplay = false; a.vram = 31ull << 30;  a.kind = cd::GpuKind::Unknown;     v.push_back(a);
+    return v;
+}
+
+// A registry and a restore file for RunGpuEdits, held in memory. Every call is logged in the order it was made,
+// so a test can see that a row is recorded before the next row is written.
+struct FakeGpuEdits {
+    std::map<std::wstring, std::wstring> reg;
+    std::set<std::wstring> unreadableNow;                                // every read of these fails
+    std::set<std::wstring> unreadableAfterWrite;                         // reads fail once written
+    std::map<std::wstring, cd::GuardedWriteResult> result;               // a forced write result
+    std::map<std::wstring, unsigned long> error;                         // ...and its error code
+    std::map<std::wstring, std::wstring> otherProgram;                   // written by "another program" as the forced result happens
+    std::set<std::wstring> recordFails;
+    std::map<std::wstring, std::wstring> afterWrite;                     // what reads back after a write lands
+    std::vector<std::wstring> log;
+    std::vector<cd::GpuPreferenceBefore> recorded;
+    std::set<std::wstring> written;
+
+    cd::GpuEditOps Ops() {
+        cd::GpuEditOps ops;
+        ops.write = [this](const std::wstring& path, bool expectPresent, const std::wstring& expectValue, bool del,
+                           const std::wstring& value, unsigned long& err) {
+            log.push_back(L"write " + path + (del ? std::wstring(L" delete") : L" set " + value));
+            err = 0;
+            const std::map<std::wstring, cd::GuardedWriteResult>::const_iterator forced = result.find(path);
+            if (forced != result.end()) {
+                const std::map<std::wstring, std::wstring>::const_iterator o = otherProgram.find(path);
+                if (o != otherProgram.end()) reg[path] = o->second;
+                const std::map<std::wstring, unsigned long>::const_iterator e = error.find(path);
+                if (e != error.end()) err = e->second;
+                return forced->second;
+            }
+            // otherwise the guard's own rule: nothing is written unless the value is still as read
+            const std::map<std::wstring, std::wstring>::const_iterator cur = reg.find(path);
+            const bool present = cur != reg.end();
+            if (present != expectPresent || (present && cur->second != expectValue)) return cd::GuardedWriteResult::Changed;
+            if (del) reg.erase(path); else reg[path] = value;
+            const std::map<std::wstring, std::wstring>::const_iterator ov = afterWrite.find(path);
+            if (ov != afterWrite.end()) reg[path] = ov->second;   // another program, the same instant
+            written.insert(path);
+            return cd::GuardedWriteResult::Written;
+        };
+        ops.read = [this](const std::wstring& path, std::wstring& value, bool& unreadable) {
+            log.push_back(L"read " + path);
+            value.clear();
+            unreadable = unreadableNow.count(path) != 0 ||
+                         (written.count(path) != 0 && unreadableAfterWrite.count(path) != 0);
+            if (unreadable) return false;
+            const std::map<std::wstring, std::wstring>::const_iterator cur = reg.find(path);
+            if (cur == reg.end()) return false;
+            value = cur->second;
+            return true;
+        };
+        ops.record = [this](const cd::GpuPreferenceBefore& row) {
+            log.push_back(L"record " + row.exePath);
+            if (recordFails.count(row.exePath)) return false;
+            recorded.push_back(row);
+            return true;
+        };
+        return ops;
+    }
+
+    std::vector<cd::GpuEditItem> Items(const std::vector<std::wstring>& paths) const {
+        std::vector<cd::GpuEditItem> items;
+        for (size_t i = 0; i < paths.size(); ++i) {
+            cd::GpuEditItem it;
+            it.exePath = paths[i];
+            const std::map<std::wstring, std::wstring>::const_iterator cur = reg.find(paths[i]);
+            it.present = cur != reg.end();
+            if (it.present) it.existing = cur->second;
+            items.push_back(it);
+        }
+        return items;
+    }
+
+    // Position of the first log line starting with `prefix`, or the log's size.
+    size_t At(const std::wstring& prefix) const {
+        for (size_t i = 0; i < log.size(); ++i)
+            if (log[i].compare(0, prefix.size(), prefix) == 0) return i;
+        return log.size();
+    }
+};
+
+void Test_AJ_GpuPolicy() {
+    Case("AJ1 the plan never picks a SECOND entry of the game GPU as background");
+    {
+        // DXGI lists the operator's 5090 twice. With the duplicate enumerated BEFORE any other
+        // display-less adapter, a pointer-only skip picked it, and the plan either pinned apps
+        // to the game's own card or refused outright. Order is DXGI's choice, not ours.
+        std::vector<cd::GpuAdapter> v = RealMachineAdapters();
+        std::vector<cd::GpuAdapter> dupFirst;
+        dupFirst.push_back(v[0]); dupFirst.push_back(v[3]);
+        dupFirst.push_back(v[1]); dupFirst.push_back(v[2]);
+        const cd::GpuPlan p = cd::PlanGpuIsolation(dupFirst);
+        CHECK_EQ(p.gameKey, std::wstring(L"10DE&2B85&53021462"));
+        CHECK(!p.backgroundKey.empty());
+        CHECK_NE(p.backgroundKey, p.gameKey);
+
+        // and with ONLY the game card plus its own duplicate, it refuses and names why
+        std::vector<cd::GpuAdapter> onlyDup;
+        onlyDup.push_back(v[0]); onlyDup.push_back(v[3]);
+        const cd::GpuPlan q = cd::PlanGpuIsolation(onlyDup);
+        CHECK(q.backgroundKey.empty());
+        CHECK(q.why.find(L"same adapter id") != std::wstring::npos);
+    }
+
+    Case("AJ2 candidates exclude the game GPU by KEY, so its duplicate is never offered");
+    {
+        const std::vector<cd::GpuAdapter> v = RealMachineAdapters();
+        const cd::GpuPlan p = cd::PlanGpuIsolation(v);
+        const std::vector<std::wstring> c = cd::CandidateBackgroundKeys(v, p);
+        CHECK_EQ((int)c.size(), 2);
+        if (c.size() == 2) {
+            CHECK_EQ(c[0], std::wstring(L"1002&13C0&88771043"));
+            CHECK_EQ(c[1], std::wstring(L"10DE&2684&40BF1458"));
+        }
+        cd::GpuPlan undecidable;
+        CHECK(cd::CandidateBackgroundKeys(v, undecidable).empty());
+    }
+
+    Case("AJ3 the default background GPU follows the user's own pins, not DXGI order");
+    {
+        // The plan's first display-less adapter is the 2 GB iGPU. Every preference the operator
+        // set by hand is on the 4090. The default must be the 4090.
+        const std::vector<cd::GpuAdapter> v = RealMachineAdapters();
+        const cd::GpuPlan p = cd::PlanGpuIsolation(v);
+        CHECK_EQ(p.backgroundKey, std::wstring(L"1002&13C0&88771043"));   // the plan alone picks the iGPU
+        std::vector<std::pair<std::wstring, std::wstring> > reg;
+        reg.push_back(std::make_pair(std::wstring(L"C:\\a\\claude.exe"), std::wstring(L"10DE&2684&40BF1458")));
+        reg.push_back(std::make_pair(std::wstring(L"C:\\b\\obs64.exe"), std::wstring(L"10DE&2684&40BF1458")));
+        reg.push_back(std::make_pair(std::wstring(L"C:\\c\\x.exe"), std::wstring(L"")));
+        CHECK_EQ(cd::ChooseBackgroundKey(v, p, reg), std::wstring(L"10DE&2684&40BF1458"));
+
+        // CONTROL: no history at all keeps the plan's own pick
+        std::vector<std::pair<std::wstring, std::wstring> > none;
+        CHECK_EQ(cd::ChooseBackgroundKey(v, p, none), std::wstring(L"1002&13C0&88771043"));
+
+        // CONTROL: a pin to the GAME gpu is not a vote for a background gpu
+        std::vector<std::pair<std::wstring, std::wstring> > gamePins;
+        gamePins.push_back(std::make_pair(std::wstring(L"C:\\g\\game.exe"), std::wstring(L"10DE&2B85&53021462")));
+        CHECK_EQ(cd::ChooseBackgroundKey(v, p, gamePins), std::wstring(L"1002&13C0&88771043"));
+
+        // CONTROL: a TIE keeps the plan's pick rather than flipping on noise
+        std::vector<std::pair<std::wstring, std::wstring> > tie;
+        tie.push_back(std::make_pair(std::wstring(L"C:\\1\\a.exe"), std::wstring(L"10DE&2684&40BF1458")));
+        tie.push_back(std::make_pair(std::wstring(L"C:\\2\\b.exe"), std::wstring(L"1002&13C0&88771043")));
+        CHECK_EQ(cd::ChooseBackgroundKey(v, p, tie), std::wstring(L"1002&13C0&88771043"));
+
+        // and an undecidable plan stays undecidable whatever the registry says
+        cd::GpuPlan undecidable;
+        CHECK(cd::ChooseBackgroundKey(v, undecidable, reg).empty());
+    }
+
+    Case("AJ4 Windows binaries are recognised, and look-alike folders are not");
+    {
+        CHECK(cd::IsWindowsImagePath(L"C:\\Windows\\System32\\dwm.exe"));
+        CHECK(cd::IsWindowsImagePath(L"c:\\windows\\explorer.exe"));
+        CHECK(cd::IsWindowsImagePath(L"D:\\WINDOWS\\SystemApps\\x.exe"));
+        CHECK(!cd::IsWindowsImagePath(L"C:\\WindowsApps\\x.exe"));
+        CHECK(!cd::IsWindowsImagePath(L"C:\\Users\\u\\AppData\\Local\\AnthropicClaude\\app-1.52386.3\\claude.exe"));
+        CHECK(!cd::IsWindowsImagePath(L"C:\\Program Files\\OBS\\obs64.exe"));
+        CHECK(!cd::IsWindowsImagePath(L""));
+    }
+
+    Case("AJ5 same install root: two versions of one app yes, two apps sharing a file name no");
+    {
+        const std::wstring stale = L"C:\\Users\\u\\AppData\\Local\\AnthropicClaude\\app-1.49585.0\\claude.exe";
+        const std::wstring desktop = L"C:\\Users\\u\\AppData\\Local\\AnthropicClaude\\app-1.52386.3\\claude.exe";
+        const std::wstring cli = L"C:\\Users\\u\\AppData\\Roaming\\Claude\\claude-code\\2.1.266\\claude.exe";
+        CHECK(cd::SameInstallRoot(stale, desktop));
+        CHECK(!cd::SameInstallRoot(stale, cli));
+        CHECK(cd::SameInstallRoot(L"C:\\P\\EdgeWebView\\Application\\152.0.4191.62\\msedgewebview2.exe",
+                                  L"C:\\P\\EdgeWebView\\Application\\152.0.4191.66\\msedgewebview2.exe"));
+        CHECK(!cd::SameInstallRoot(L"x.exe", L"x.exe"));   // too shallow to have a root
+    }
+
+    Case("AJ6 the orphan detector on the machine's real data: Claude Code is NOT an orphan");
+    {
+        // The exact shape the probe returned. Before the fix the detector reported THREE
+        // orphans, one of them pairing Claude Desktop's old folder with Claude Code's binary.
+        const std::wstring root = L"C:\\Users\\u\\AppData\\Local\\AnthropicClaude\\";
+        const std::wstring cli = L"C:\\Users\\u\\AppData\\Roaming\\Claude\\claude-code\\2.1.266\\claude.exe";
+        const std::wstring edgeOld = L"C:\\P\\EdgeWebView\\Application\\152.0.4191.62\\msedgewebview2.exe";
+        const std::wstring edgeNew = L"C:\\P\\EdgeWebView\\Application\\152.0.4191.66\\msedgewebview2.exe";
+        std::vector<std::pair<std::wstring, std::wstring> > reg;
+        reg.push_back(std::make_pair(root + L"claude.exe", std::wstring(L"10DE&2684&40BF1458")));
+        reg.push_back(std::make_pair(root + L"app-1.24012.9\\claude.exe", std::wstring(L"10DE&2684&40BF1458")));
+        reg.push_back(std::make_pair(root + L"app-1.26832.0\\claude.exe", std::wstring(L"10DE&2684&40BF1458")));
+        reg.push_back(std::make_pair(root + L"app-1.49585.0\\claude.exe", std::wstring(L"10DE&2684&40BF1458")));
+        reg.push_back(std::make_pair(edgeOld, std::wstring(L"10DE&2684&40BF1458")));
+        std::vector<std::wstring> running;
+        running.push_back(root + L"app-1.52386.3\\claude.exe");
+        running.push_back(cli);
+        running.push_back(edgeNew);
+        const std::wstring launcher = root + L"claude.exe";
+        const std::vector<cd::OrphanedAssignment> o = cd::FindOrphanedAssignments(
+            reg, running,
+            [&](const std::wstring& p) {
+                return cd::WcsIcmp(p, launcher) || cd::WcsIcmp(p, running[0]) ||
+                       cd::WcsIcmp(p, cli) || cd::WcsIcmp(p, edgeNew);
+            });
+        CHECK_EQ((int)o.size(), 2);
+        bool desktop = false, edge = false, cliFlagged = false;
+        for (size_t i = 0; i < o.size(); ++i) {
+            if (cd::WcsIcmp(o[i].livePath, running[0])) desktop = true;
+            if (cd::WcsIcmp(o[i].livePath, edgeNew)) edge = true;
+            if (cd::WcsIcmp(o[i].livePath, cli)) cliFlagged = true;
+        }
+        CHECK(desktop);
+        CHECK(edge);
+        CHECK(!cliFlagged);
+    }
+
+    Case("AJ7 driver components are protected by the SHIPPED exclusions, not only the user's list");
+    {
+        // FAILURE-BEFORE-FIX CONTROL, built from the operator's real list. [M] Their config.ini names
+        // 23 exclusions and neither amdow.exe nor AMDRSSrcExt.exe - both joined the defaults after
+        // that config was written - so "Game Optimize for GPU" ticked two AMD driver components.
+        cd::Config theirs;
+        const wchar_t* names[] = { L"EasyAntiCheat.exe", L"audiodg.exe", L"dwm.exe", L"csrss.exe",
+                                   L"NVDisplay.Container.exe", L"nvcontainer.exe", L"AMDRSServ.exe",
+                                   L"RadeonSoftware.exe", L"GameOptimizer.exe" };
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) theirs.exclusions.push_back(names[i]);
+        CHECK(!theirs.IsExcluded(L"amdow.exe"));        // the user's own list misses it...
+        CHECK(!theirs.IsExcluded(L"AMDRSSrcExt.exe"));
+        CHECK(cd::IsDefaultExcluded(L"amdow.exe"));      // ...the shipped list does not
+        CHECK(cd::IsDefaultExcluded(L"AMDRSSrcExt.exe"));
+        CHECK(cd::IsDefaultExcluded(L"AMDRSSRCEXT.EXE"));      // case-insensitive, as Windows is
+        CHECK(cd::IsDefaultExcluded(L"amd3dvcacheSvc.exe"));   // a trailing-* prefix entry
+        // CONTROL: ordinary applications are not protected, so the check is not refusing everything
+        CHECK(!cd::IsDefaultExcluded(L"claude.exe"));
+        CHECK(!cd::IsDefaultExcluded(L"firefox.exe"));
+    }
+
+    Case("AJ8 two rows with one file name are told apart by their folders");
+    {
+        // The window showed claude.exe twice - Claude Desktop and Claude Code - as identical lines.
+        // A backslash is BUILT here rather than typed, because every tool that has edited this file
+        // today has mangled a typed one at least once.
+        const std::wstring B(1, wchar_t(92));
+        const std::wstring desktop = L"C:" + B + L"Users" + B + L"u" + B + L"AppData" + B + L"Local" +
+                                     B + L"AnthropicClaude" + B + L"app-1.52386.3" + B + L"claude.exe";
+        const std::wstring cli = L"C:" + B + L"Users" + B + L"u" + B + L"AppData" + B + L"Roaming" +
+                                 B + L"Claude" + B + L"claude-code" + B + L"2.1.266" + B + L"claude.exe";
+        CHECK_EQ(cd::ParentFoldersOf(desktop, 2), L"AnthropicClaude" + B + L"app-1.52386.3");
+        CHECK_EQ(cd::ParentFoldersOf(cli, 2), L"claude-code" + B + L"2.1.266");
+        CHECK(cd::ParentFoldersOf(desktop, 2) != cd::ParentFoldersOf(cli, 2));   // the whole point
+        CHECK_EQ(cd::ParentFoldersOf(L"C:" + B + L"a" + B + L"x.exe", 1), std::wstring(L"a"));
+        // too shallow for the levels asked: empty, never a truncated or wrong fragment
+        CHECK_EQ(cd::ParentFoldersOf(L"C:" + B + L"x.exe", 2), std::wstring());
+        CHECK_EQ(cd::ParentFoldersOf(L"x.exe", 1), std::wstring());
+    }
+
+    Case("AJ9 Apply keeps every field of the existing value it does not own");
+    {
+        // Found by adversarial review: Apply wrote over the WHOLE value, destroying any other field
+        // Windows keeps for that application in the same string.
+        const std::wstring key = L"10DE&2684&40BF1458";
+        const std::wstring existing = L"SwapEffectUpgradeEnable=1;GpuPreference=2;AutoHDREnable=2097;";
+        const std::wstring merged = cd::MergeGpuPreferenceValue(existing, key);
+        CHECK(merged.find(L"SpecificAdapter=10DE&2684&40BF1458;") == 0);
+        CHECK(merged.find(L"GpuPreference=1073741824;") != std::wstring::npos);
+        CHECK(merged.find(L"SwapEffectUpgradeEnable=1;") != std::wstring::npos);
+        CHECK(merged.find(L"AutoHDREnable=2097;") != std::wstring::npos);
+        // the old choice is REPLACED, not left beside the new one
+        CHECK(merged.find(L"GpuPreference=2;") == std::wstring::npos);
+        // an absent value gives exactly what the feature always wrote
+        CHECK_EQ(cd::MergeGpuPreferenceValue(L"", key), cd::FormatPreferenceValue(key));
+        // re-applying is idempotent - no second SpecificAdapter
+        CHECK_EQ(cd::MergeGpuPreferenceValue(merged, key), merged);
+        // a different card replaces the first rather than adding to it
+        const std::wstring moved = cd::MergeGpuPreferenceValue(merged, L"1002&13C0&88771043");
+        CHECK(moved.find(L"10DE&2684&40BF1458") == std::wstring::npos);
+        CHECK(moved.find(L"AutoHDREnable=2097;") != std::wstring::npos);
+    }
+
+    Case("AJ10 Remove strips only the GPU fields, and empties only when nothing else is there");
+    {
+        CHECK_EQ(cd::StripGpuAssignment(
+                     L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=1073741824;AutoHDREnable=2097;"),
+                 std::wstring(L"AutoHDREnable=2097;"));
+        // the value the feature itself writes strips to nothing, so Remove deletes it
+        CHECK_EQ(cd::StripGpuAssignment(cd::FormatPreferenceValue(L"10DE&2684&40BF1458")), std::wstring());
+        CHECK_EQ(cd::StripGpuAssignment(L"specificadapter=X;GPUPREFERENCE=1;"), std::wstring());
+        CHECK_EQ(cd::StripGpuAssignment(L""), std::wstring());
+        // a last field with no trailing ';' still survives, written back terminated
+        CHECK_EQ(cd::StripGpuAssignment(L"GpuPreference=2;AutoHDREnable=2097"),
+                 std::wstring(L"AutoHDREnable=2097;"));
+        // the helper drops fragments that are not name=value - which is exactly why Apply and Remove
+        // never hand it such a value: IsEditablePreferenceValue refuses it first (AJ16)
+        CHECK_EQ(cd::StripGpuAssignment(L";;=5;junk;GpuPreference=1;"), std::wstring());
+    }
+
+    Case("AJ11 a failed display query refuses the plan instead of guessing");
+    {
+        // Found by adversarial review: every EnumOutputs error used to count as a display, which
+        // could make the wrong card the game GPU.
+        std::vector<cd::GpuAdapter> v = RealMachineAdapters();
+        CHECK(!cd::PlanGpuIsolation(v).backgroundKey.empty());      // control: answers normally
+        v[2].displayUnknown = true;                                   // the 4090 could not answer
+        const cd::GpuPlan p = cd::PlanGpuIsolation(v);
+        CHECK(p.gameKey.empty());
+        CHECK(p.backgroundKey.empty());
+        CHECK(p.why.find(L"NVIDIA GeForce RTX 4090") != std::wstring::npos);
+    }
+
+    Case("AJ12 sibling installs sharing a root and an exe name are not one app");
+    {
+        // Found by adversarial review: a shared install root alone was taken as "same app".
+        CHECK(!cd::SameInstallRoot(L"C:\\Program Files\\OldApp\\helper.exe",
+                                   L"C:\\Program Files\\OtherApp\\helper.exe"));
+        CHECK(!cd::SameInstallRoot(L"C:\\Users\\U\\AppData\\Local\\Discord\\Update.exe",
+                                   L"C:\\Users\\U\\AppData\\Local\\Slack\\Update.exe"));
+        CHECK(!cd::SameInstallRoot(L"C:\\A\\x.exe", L"C:\\B\\x.exe"));            // drive-root installs
+        CHECK(!cd::SameInstallRoot(L"C:\\P\\app-1.2\\x.exe", L"C:\\P\\tools\\x.exe"));  // version vs plain
+        CHECK(!cd::SameInstallRoot(L"C:\\P\\app-1.2\\x.exe", L"C:\\P\\beta-1.3\\x.exe")); // two products
+        // controls: real version moves still match
+        CHECK(cd::SameInstallRoot(L"C:\\P\\app-1.9\\x.exe", L"C:\\P\\App-1.10\\x.exe"));
+        CHECK(cd::SameInstallRoot(L"C:\\P\\2.1.266\\x.exe", L"C:\\P\\2.1.270\\x.exe"));
+
+        const auto missing = [](const std::wstring&) { return false; };
+        std::vector<std::pair<std::wstring, std::wstring> > reg;
+        reg.push_back({L"C:\\Program Files\\OldApp\\helper.exe", L"10DE&2684&40BF1458"});
+        const std::vector<std::wstring> live = {L"C:\\Program Files\\OtherApp\\helper.exe"};
+        CHECK(cd::FindOrphanedAssignments(reg, live, missing).empty());
+    }
+
+    Case("AJ13 the newest stale version is chosen by number, and ruled-out entries touch no disk");
+    {
+        const auto missing = [](const std::wstring&) { return false; };
+        std::vector<std::pair<std::wstring, std::wstring> > reg;
+        reg.push_back({L"C:\\P\\app-10\\x.exe", L"10DE&2684&40BF1458"});
+        reg.push_back({L"C:\\P\\app-9\\x.exe", L"1002&13C0&88771043"});
+        const std::vector<std::wstring> live = {L"C:\\P\\app-11\\x.exe"};
+        const std::vector<cd::OrphanedAssignment> o = cd::FindOrphanedAssignments(reg, live, missing);
+        CHECK_EQ((int)o.size(), 1);
+        if (o.size() == 1) {
+            // plain string order would have picked app-9, and with it the WRONG lost GPU
+            CHECK_EQ(o[0].stalePath, std::wstring(L"C:\\P\\app-10\\x.exe"));
+            CHECK_EQ(o[0].lostKey, std::wstring(L"10DE&2684&40BF1458"));
+        }
+        CHECK(cd::NaturalPathLess(L"app-9", L"app-10"));
+        CHECK(!cd::NaturalPathLess(L"app-10", L"app-9"));
+        CHECK(!cd::NaturalPathLess(L"APP-1", L"app-1"));
+        CHECK(!cd::NaturalPathLess(L"app-1", L"APP-1"));
+
+        // A disk probe can block for seconds on an offline share, so none is made for an entry
+        // whose exe name or install root already rules it out.
+        int probes = 0;
+        const auto counting = [&probes](const std::wstring&) { ++probes; return false; };
+        std::vector<std::pair<std::wstring, std::wstring> > many;
+        for (int i = 0; i < 20; ++i)
+            many.push_back({L"\\\\server\\share\\tool" + std::to_wstring(i) + L"\\other.exe",
+                            L"10DE&2684&40BF1458"});
+        many.push_back({L"\\\\server\\share\\app-3\\x.exe", L"10DE&2684&40BF1458"});  // same name, other root
+        const std::vector<std::wstring> running = {L"C:\\P\\app-11\\x.exe"};
+        CHECK(cd::FindOrphanedAssignments(many, running, counting).empty());
+        CHECK_EQ(probes, 0);
+        // control: a genuine candidate IS probed, exactly once
+        many.push_back({L"C:\\P\\app-10\\x.exe", L"10DE&2684&40BF1458"});
+        CHECK_EQ((int)cd::FindOrphanedAssignments(many, running, counting).size(), 1);
+        CHECK_EQ(probes, 1);
+    }
+
+    Case("AJ14 the adapter key comes from the whole SpecificAdapter field only, and is validated");
+    {
+        // Found by adversarial review: a substring search let NotSpecificAdapter= count, refused a
+        // last field with no ';', and accepted any text with two '&' in it.
+        const std::wstring k = L"10DE&2684&40BF1458";
+        CHECK_EQ(cd::AdapterKeyFromPreferenceValue(L"AutoHDREnable=1;SpecificAdapter=10DE&2684&40BF1458"), k);
+        CHECK_EQ(cd::AdapterKeyFromPreferenceValue(L"NotSpecificAdapter=10DE&2684&40BF1458;"), std::wstring());
+        CHECK_EQ(cd::AdapterKeyFromPreferenceValue(L"SpecificAdapter=10de&2684&40bf1458;"), k);
+        CHECK_EQ(cd::AdapterKeyFromPreferenceValue(L"SpecificAdapter=10DE&2684;"), std::wstring());
+        CHECK_EQ(cd::AdapterKeyFromPreferenceValue(L"SpecificAdapter=ZZZZ&2684&40BF1458;"), std::wstring());
+        CHECK_EQ(cd::AdapterKeyFromPreferenceValue(L"SpecificAdapter=10DE&&2684&40BF145;"), std::wstring());
+        CHECK_EQ(cd::AdapterKeyFromPreferenceValue(L"SpecificAdapter=a&b&c;"), std::wstring());
+    }
+
+    Case("AJ15 Windows' own GPU settings are seen and named, not shown as 'not assigned'");
+    {
+        CHECK_EQ(cd::PreferenceChoiceKey(L"GpuPreference=2;"), cd::WindowsHighPerformanceKey());
+        CHECK_EQ(cd::PreferenceChoiceKey(L"SwapEffectUpgradeEnable=1;GpuPreference=1;"), cd::WindowsPowerSavingKey());
+        CHECK_EQ(cd::PreferenceChoiceKey(L"SwapEffectUpgradeEnable=0;GpuPreference=0;"), std::wstring());
+        CHECK_EQ(cd::PreferenceChoiceKey(L"AppStatus=1;AutoHDREnable=2097;"), std::wstring());
+        CHECK_EQ(cd::PreferenceChoiceKey(cd::FormatPreferenceValue(L"10DE&2684&40BF1458")),
+                 std::wstring(L"10DE&2684&40BF1458"));
+        CHECK(cd::IsWindowsModeKey(cd::WindowsHighPerformanceKey()));
+        CHECK(cd::IsWindowsModeKey(cd::WindowsPowerSavingKey()));
+        CHECK(!cd::IsWindowsModeKey(L"10DE&2684&40BF1458"));
+        CHECK(!cd::IsWindowsModeKey(L""));
+        // a row on a Windows setting is not on the target, so the selector still offers to move it...
+        std::vector<cd::GpuRow> rows(1);
+        rows[0].exeName = L"x.exe";
+        rows[0].exePath = L"C:\\P\\app-1\\x.exe";
+        rows[0].assignedKey = cd::WindowsHighPerformanceKey();
+        const std::vector<cd::GpuRow> picked = cd::SelectForBackground(rows, L"10DE&2684&40BF1458");
+        CHECK(picked.size() == 1 && picked[0].selected);
+        // ...and Remove takes the setting away while keeping Windows' other fields
+        CHECK_EQ(cd::StripGpuAssignment(L"SwapEffectUpgradeEnable=1;GpuPreference=2;"),
+                 std::wstring(L"SwapEffectUpgradeEnable=1;"));
+    }
+
+    Case("AJ16 only plain name=value; fields are edited; anything else is left exactly as it is");
+    {
+        CHECK(cd::IsEditablePreferenceValue(L""));
+        CHECK(cd::IsEditablePreferenceValue(L"AppStatus=1;AutoHDREnable=2097;"));
+        CHECK(cd::IsEditablePreferenceValue(
+            L"SpecificAdapter=1002&13C0&88771043;GpuPreference=1073741824;SwapEffectUpgradeEnable=1;AutoHDREnable=4147;"));
+        CHECK(cd::IsEditablePreferenceValue(L"Odd=a=b;"));
+        CHECK(!cd::IsEditablePreferenceValue(L"AppStatus=1"));
+        CHECK(!cd::IsEditablePreferenceValue(L"FutureFlag;GpuPreference=2;"));
+        CHECK(!cd::IsEditablePreferenceValue(L";;=5;junk;GpuPreference=1;"));
+        CHECK(!cd::IsEditablePreferenceValue(L"=5;"));
+        CHECK(!cd::IsEditablePreferenceValue(L";"));
+        // for an editable value, merge and strip keep every other field byte for byte and in order
+        const std::wstring v = L"AppStatus=1;Odd=a=b;GpuPreference=2;AutoHDREnable=2097;";
+        CHECK(cd::IsEditablePreferenceValue(v));
+        CHECK_EQ(cd::StripGpuAssignment(v), std::wstring(L"AppStatus=1;Odd=a=b;AutoHDREnable=2097;"));
+        CHECK_EQ(cd::MergeGpuPreferenceValue(v, L"10DE&2684&40BF1458"),
+                 std::wstring(L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=1073741824;AppStatus=1;Odd=a=b;AutoHDREnable=2097;"));
+    }
+
+    Case("AJ17 the restore file puts every value back, and deletes the ones that were absent");
+    {
+        std::vector<cd::GpuPreferenceBefore> before(2);
+        before[0].exePath = L"C:\\P\\app-1\\x.exe";
+        before[0].present = true;
+        before[0].value = L"AppStatus=1;Q=\"q\";";
+        before[1].exePath = L"C:\\P\\y.exe";
+        before[1].present = false;
+        const std::wstring expected =
+            L"Windows Registry Editor Version 5.00\r\n\r\n"
+            L"[HKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences]\r\n"
+            L"\"C:\\\\P\\\\app-1\\\\x.exe\"=\"AppStatus=1;Q=\\\"q\\\";\"\r\n"
+            L"\"C:\\\\P\\\\y.exe\"=-\r\n";
+        CHECK_EQ(cd::FormatRegRestoreFile(before), expected);
+        CHECK_EQ(cd::FormatRegRestoreFile(std::vector<cd::GpuPreferenceBefore>()),
+                 std::wstring(L"Windows Registry Editor Version 5.00\r\n\r\n"
+                              L"[HKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences]\r\n"));
+    }
+
+    Case("AJ18 a card counts only beside its own mode, and control characters are never edited");
+    {
+        // Found by adversarial review, round 3.
+        CHECK_EQ(cd::PreferenceChoiceKey(L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=2;"),
+                 cd::WindowsHighPerformanceKey());
+        CHECK_EQ(cd::PreferenceChoiceKey(L"SpecificAdapter=10DE&2684&40BF1458;"), std::wstring());
+        CHECK_EQ(cd::PreferenceChoiceKey(L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=0;"), std::wstring());
+        CHECK_EQ(cd::PreferenceChoiceKey(L"GpuPreference=1073741824;SpecificAdapter=10DE&2684&40BF1458;"),
+                 std::wstring(L"10DE&2684&40BF1458"));
+        CHECK_EQ(cd::PreferenceChoiceKey(L"GpuPreference=1073741824;"), std::wstring());
+        CHECK(!cd::IsEditablePreferenceValue(std::wstring(L"AppStatus=1;") + wchar_t(10) + L"X=1;"));
+        CHECK(!cd::IsEditablePreferenceValue(std::wstring(L"A=") + wchar_t(9) + L";"));
+        CHECK(!cd::IsEditablePreferenceValue(std::wstring(L"A=1") + wchar_t(0) + L";"));
+        CHECK(!cd::IsEditablePreferenceValue(std::wstring(L"A=1") + wchar_t(0x7F) + L";"));
+        // quotes and backslashes are escaped in the restore file, so they stay editable
+        CHECK(cd::IsEditablePreferenceValue(L"Q=\"a\\b\";"));
+    }
+
+    Case("AJ19 a lost assignment is told to take the GPU chosen in the window, never promised its old one");
+    {
+        // Found by adversarial review, round 3: "assign them again" read as a promise of the old GPU,
+        // while Apply writes whatever the picker shows.
+        const std::wstring one = cd::FormatGpuIsolateStatusLine(7, 2, 1);
+        const std::wstring many = cd::FormatGpuIsolateStatusLine(7, 2, 2);
+        CHECK(one.find(L"tick it and Apply to put it on the GPU chosen above") != std::wstring::npos);
+        CHECK(many.find(L"tick them and Apply to put them on the GPU chosen above") != std::wstring::npos);
+        CHECK(one.find(L"again") == std::wstring::npos);
+        CHECK(many.find(L"again") == std::wstring::npos);
+    }
+
+    Case("AJ20 the classifier reads a stored value exactly as the window does");
+    {
+        // Found by adversarial review, round 4: the classifier still took a card without its mode.
+        const std::wstring k = L"10DE&2684&40BF1458";
+        CHECK(cd::ClassifyGpuPref(k, L"SpecificAdapter=10DE&2684&40BF1458;GpuPreference=2;", k) ==
+              cd::GpuPrefState::WrongAdapter);
+        CHECK(cd::ClassifyGpuPref(k, L"SpecificAdapter=10DE&2684&40BF1458;", k) == cd::GpuPrefState::WrongAdapter);
+        CHECK(cd::ClassifyGpuPref(k, cd::FormatPreferenceValue(k), k) == cd::GpuPrefState::Correct);
+        CHECK(!cd::IsWindowsModeKey(cd::UnreadableChoiceKey()));
+        CHECK(cd::UnreadableChoiceKey() != cd::PreferenceChoiceKey(cd::FormatPreferenceValue(k)));
+    }
+
+    Case("AJ21 Apply: a row is recorded right after its change, and only a changed row is ever recorded");
+    {
+        // Found by adversarial review, round 5: the restore file listed every planned row until the last write,
+        // a refused row kept a stale label, and a no-op was counted as a change.
+        const std::wstring gpu = L"10DE&2684&40BF1458";
+        const std::wstring own = L"AppStatus=1;AutoHDREnable=2097;";
+        const std::wstring a = L"C:\\A\\a.exe", b = L"C:\\B\\b.exe", c = L"C:\\C\\c.exe", dd = L"C:\\D\\d.exe",
+                           e = L"C:\\E\\e.exe";
+        FakeGpuEdits f;
+        f.reg[a] = own;                                     // another program changes it: refused
+        f.reg[b] = own;                                     // an ordinary change
+        f.reg[c] = cd::MergeGpuPreferenceValue(own, gpu);   // already exactly so: nothing to do
+        f.unreadableAfterWrite.insert(dd);                  // absent; changed, but the read-back fails
+        f.reg[e] = own;                                     // Windows cancels the commit
+        f.result[a] = cd::GuardedWriteResult::Changed;
+        f.otherProgram[a] = L"SpecificAdapter=1002&13C0&88771043;GpuPreference=1073741824;";
+        f.result[e] = cd::GuardedWriteResult::NotCommitted;
+        f.error[e] = 6704;
+        std::vector<std::wstring> paths;
+        paths.push_back(a); paths.push_back(b); paths.push_back(c); paths.push_back(dd); paths.push_back(e);
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(f.Items(paths), false, gpu, f.Ops());
+        CHECK(r.size() == 5);
+
+        CHECK(r[0].outcome == cd::GpuEditOutcome::Refused);
+        CHECK(r[0].reason.find(L"changed after it was read") != std::wstring::npos);
+        CHECK_EQ(r[0].choiceKey, std::wstring(L"1002&13C0&88771043"));   // what the other program wrote, not the old label
+        CHECK(!r[0].recorded);
+        CHECK_EQ(f.reg[a], std::wstring(L"SpecificAdapter=1002&13C0&88771043;GpuPreference=1073741824;"));
+
+        CHECK(r[1].outcome == cd::GpuEditOutcome::Done);
+        CHECK_EQ(r[1].choiceKey, gpu);
+        CHECK(r[1].recorded);
+        CHECK_EQ(f.reg[b], cd::MergeGpuPreferenceValue(own, gpu));
+
+        CHECK(r[2].outcome == cd::GpuEditOutcome::AlreadyDone);
+        CHECK(f.At(L"write " + c) == f.log.size());   // never written
+        CHECK(!r[2].recorded);
+        CHECK_EQ(r[2].choiceKey, gpu);
+
+        CHECK(r[3].outcome == cd::GpuEditOutcome::Unconfirmed);
+        CHECK(r[3].reason.find(L"could not be read back") != std::wstring::npos);
+        CHECK_EQ(r[3].choiceKey, cd::UnreadableChoiceKey());
+        CHECK(r[3].recorded);   // it was committed, so it can be put back
+
+        CHECK(r[4].outcome == cd::GpuEditOutcome::Refused);
+        CHECK(r[4].reason.find(L"6704") != std::wstring::npos);
+        CHECK(r[4].reason.find(L"most likely") != std::wstring::npos);
+        CHECK_EQ(r[4].choiceKey, std::wstring());
+        CHECK(!r[4].recorded);
+
+        // exactly the two committed rows are in the restore file, with the values pass one read
+        CHECK(f.recorded.size() == 2);
+        CHECK(f.recorded.size() == 2 && f.recorded[0].exePath == b && f.recorded[0].present && f.recorded[0].value == own);
+        CHECK(f.recorded.size() == 2 && f.recorded[1].exePath == dd && !f.recorded[1].present);
+        // and each is recorded BEFORE the next row is written
+        CHECK(f.At(L"record " + b) < f.At(L"write " + dd));
+        CHECK(f.At(L"record " + dd) < f.At(L"write " + e));
+        CHECK(f.At(L"write " + b) < f.At(L"record " + b));
+    }
+
+    Case("AJ22 a change the restore file cannot record stops every change after it");
+    {
+        const std::wstring gpu = L"10DE&2684&40BF1458";
+        const std::wstring own = L"AppStatus=1;";
+        const std::wstring x = L"C:\\X\\x.exe", y = L"C:\\Y\\y.exe", z = L"C:\\Z\\z.exe";
+        FakeGpuEdits f;
+        f.reg[y] = own;
+        f.reg[z] = own;
+        f.recordFails.insert(x);
+        std::vector<std::wstring> paths;
+        paths.push_back(x); paths.push_back(y); paths.push_back(z);
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(f.Items(paths), false, gpu, f.Ops());
+        CHECK(r.size() == 3);
+        CHECK(r[0].outcome == cd::GpuEditOutcome::Done && !r[0].recorded);   // it changed; the caller must say it is missing
+        CHECK(r[1].outcome == cd::GpuEditOutcome::NotAttempted);
+        CHECK(r[2].outcome == cd::GpuEditOutcome::NotAttempted);
+        CHECK(r[1].reason.find(L"not tried") != std::wstring::npos);
+        CHECK(f.At(L"write " + y) == f.log.size());
+        CHECK(f.At(L"write " + z) == f.log.size());
+        CHECK_EQ(f.reg[y], own);
+        CHECK_EQ(f.reg[z], own);
+    }
+
+    Case("AJ23 Remove: nothing to remove is not a removal, and a value created meanwhile is left alone");
+    {
+        const std::wstring gpu = L"10DE&2684&40BF1458";
+        const std::wstring own = L"AppStatus=1;AutoHDREnable=2097;";
+        const std::wstring r1 = L"C:\\R1\\r1.exe", r2 = L"C:\\R2\\r2.exe", r3 = L"C:\\R3\\r3.exe", r4 = L"C:\\R4\\r4.exe",
+                           r5 = L"C:\\R5\\r5.exe";
+        FakeGpuEdits f;
+        f.reg[r3] = own;                                     // no GPU fields at all
+        f.reg[r4] = cd::FormatPreferenceValue(gpu);          // only this feature's fields: deleted
+        f.reg[r5] = cd::MergeGpuPreferenceValue(own, gpu);   // stripped back to Windows' own fields
+        std::vector<std::wstring> paths;
+        paths.push_back(r1); paths.push_back(r2); paths.push_back(r3); paths.push_back(r4); paths.push_back(r5);
+        std::vector<cd::GpuEditItem> items = f.Items(paths);
+        f.reg[r2] = L"SpecificAdapter=1002&13C0&88771043;GpuPreference=1073741824;";   // created after pass one read r2 as absent
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(items, true, std::wstring(), f.Ops());
+        CHECK(r.size() == 5);
+        CHECK(r[0].outcome == cd::GpuEditOutcome::AlreadyDone);
+        CHECK(r[0].reason.find(L"no GPU assignment to remove") != std::wstring::npos);
+        CHECK(r[1].outcome == cd::GpuEditOutcome::Refused);
+        CHECK_EQ(r[1].choiceKey, std::wstring(L"1002&13C0&88771043"));
+        CHECK(r[2].outcome == cd::GpuEditOutcome::AlreadyDone);
+        CHECK(f.At(L"write " + r1) == f.log.size());
+        CHECK(f.At(L"write " + r2) == f.log.size());
+        CHECK(f.At(L"write " + r3) == f.log.size());
+        CHECK(r[3].outcome == cd::GpuEditOutcome::Done);
+        CHECK(f.At(L"write " + r4 + L" delete") < f.log.size());
+        CHECK(f.reg.find(r4) == f.reg.end());
+        CHECK(r[4].outcome == cd::GpuEditOutcome::Done);
+        CHECK_EQ(f.reg[r5], own);
+        CHECK_EQ(r[4].choiceKey, std::wstring());
+        CHECK(f.recorded.size() == 2);
+        CHECK(f.recorded.size() == 2 && f.recorded[0].exePath == r4 && f.recorded[1].exePath == r5);
+        CHECK_EQ(f.reg[r2], std::wstring(L"SpecificAdapter=1002&13C0&88771043;GpuPreference=1073741824;"));
+    }
+
+    Case("AJ24 a guarded write that did not happen is described by what was observed, not by a guess");
+    {
+        using G = cd::GuardedWriteResult;
+        CHECK(cd::GuardedReason(G::Changed, 0) != cd::GuardedReason(G::CheckUnreadable, 0));
+        CHECK(cd::GuardedReason(G::CheckUnreadable, 0).find(L"could not be read again") != std::wstring::npos);
+        CHECK(cd::GuardedReason(G::NotCommitted, 6704).find(L"(error 6704)") != std::wstring::npos);
+        CHECK(cd::GuardedReason(G::NotCommitted, 5).find(L"(error 5)") != std::wstring::npos);
+        CHECK(cd::GuardedReason(G::NotCommitted, 5).find(L"another program") == std::wstring::npos);
+        CHECK(cd::GuardedReason(G::Unavailable, 0).find(L"(error") == std::wstring::npos);
+        CHECK(cd::GuardedReason(G::Failed, 87).find(L"(error 87)") != std::wstring::npos);
+        CHECK(cd::GuardedReason(G::Written, 0).empty());
+    }
+
+    Case("AJ25 the record kept while a change runs cannot be imported; the .reg is its heading plus its rows");
+    {
+        std::vector<cd::GpuPreferenceBefore> rows(2);
+        rows[0].exePath = L"C:\\A\\a.exe";
+        rows[0].present = true;
+        rows[0].value = L"Q=\"x\\y\";";
+        rows[1].exePath = L"C:\\B\\b.exe";
+        rows[1].present = false;
+        const std::wstring reg = cd::FormatRegRestoreFile(rows);
+        CHECK_EQ(reg, cd::FormatRegRestoreHeader() + cd::FormatRegRestoreRow(rows[0]) + cd::FormatRegRestoreRow(rows[1]));
+        CHECK(reg.compare(0, 36, L"Windows Registry Editor Version 5.00") == 0);
+        CHECK_EQ(cd::FormatRegRestoreRow(rows[0]), std::wstring(L"\"C:\\\\A\\\\a.exe\"=\"Q=\\\"x\\\\y\\\";\"\r\n"));
+        CHECK_EQ(cd::FormatRegRestoreRow(rows[1]), std::wstring(L"\"C:\\\\B\\\\b.exe\"=-\r\n"));
+        const std::wstring pending = cd::FormatPendingRestoreFile(rows);
+        CHECK(pending.compare(0, 23, L"Windows Registry Editor") != 0);
+        CHECK(pending.compare(0, 8, L"REGEDIT4") != 0);
+        CHECK(pending.find(L"Windows Registry Editor Version 5.00") == std::wstring::npos);
+        CHECK(pending.find(L"NOT A RESTORE FILE") != std::wstring::npos);
+        CHECK(pending.find(cd::FormatRegRestoreRow(rows[0])) != std::wstring::npos);
+        CHECK(pending.find(cd::FormatRegRestoreRow(rows[1])) != std::wstring::npos);
+        // round 6: every value line is a comment, so even a copy with regedit's heading pasted on imports nothing
+        CHECK(pending.find(L"; " + cd::FormatRegRestoreRow(rows[0])) != std::wstring::npos);
+        CHECK(pending.find(L"; " + cd::FormatRegRestoreRow(rows[1])) != std::wstring::npos);
+        CHECK(pending.find(L"\r\n\"") == std::wstring::npos);
+        CHECK(pending.compare(0, 1, L"\"") != 0);
+    }
+
+    Case("AJ26 a list item that cannot be tied to its row, and cannot be taken back, breaks the control");
+    {
+        std::vector<long long> added;
+        std::vector<long long> removed;
+        const auto add = [&added](size_t i) { added.push_back(static_cast<long long>(i)); return static_cast<long long>(added.size() - 1); };
+        const cd::PopulateResult ok = cd::PopulateControl(3, add, [](long long, size_t) { return true; },
+                                                          [](long long) { return true; });
+        CHECK(!ok.broken && ok.shown.size() == 3 && ok.shown[0] && ok.shown[1] && ok.shown[2]);
+
+        const cd::PopulateResult noInsert = cd::PopulateControl(
+            3, [](size_t i) { return i == 1 ? -1LL : static_cast<long long>(i); },
+            [](long long, size_t) { return true; }, [](long long) { return true; });
+        CHECK(!noInsert.broken && noInsert.shown[0] && !noInsert.shown[1] && noInsert.shown[2]);
+
+        const cd::PopulateResult untied = cd::PopulateControl(
+            3, [](size_t i) { return static_cast<long long>(i); },
+            [](long long, size_t i) { return i != 2; },
+            [&removed](long long at) { removed.push_back(at); return true; });
+        CHECK(!untied.broken && untied.shown[0] && untied.shown[1] && !untied.shown[2]);
+        CHECK(removed.size() == 1 && removed[0] == 2);
+
+        const cd::PopulateResult stuck = cd::PopulateControl(
+            3, [](size_t i) { return static_cast<long long>(i); },
+            [](long long, size_t i) { return i != 0; }, [](long long) { return false; });
+        CHECK(stuck.broken && !stuck.shown[0] && !stuck.shown[1] && !stuck.shown[2]);
+
+        size_t index = 99;
+        CHECK(!cd::VisibleCandidate(-1, 0, 3, index));
+        CHECK(!cd::VisibleCandidate(0, -1, 3, index));
+        CHECK(!cd::VisibleCandidate(0, 3, 3, index));
+        CHECK(cd::VisibleCandidate(1, 2, 3, index) && index == 2);
+    }
+
+    Case("AJ27 two rows with one file name never read the same, however shallow or alike their folders");
+    {
+        std::vector<std::pair<std::wstring, std::wstring> > rows;
+        rows.push_back(std::make_pair(std::wstring(L"x.exe"), std::wstring(L"C:\\Alpha\\x.exe")));
+        rows.push_back(std::make_pair(std::wstring(L"X.EXE"), std::wstring(L"D:\\Beta\\x.exe")));
+        rows.push_back(std::make_pair(std::wstring(L"claude.exe"),
+                                      std::wstring(L"C:\\Users\\u\\AppData\\Local\\AnthropicClaude\\app-1.2\\claude.exe")));
+        rows.push_back(std::make_pair(std::wstring(L"claude.exe"),
+                                      std::wstring(L"C:\\Users\\u\\AppData\\Roaming\\Claude\\claude-code\\2.1\\claude.exe")));
+        rows.push_back(std::make_pair(std::wstring(L"y.exe"), std::wstring(L"C:\\One\\tools\\bin\\y.exe")));
+        rows.push_back(std::make_pair(std::wstring(L"y.exe"), std::wstring(L"D:\\Two\\tools\\bin\\y.exe")));
+        rows.push_back(std::make_pair(std::wstring(L"solo.exe"), std::wstring(L"C:\\Solo\\solo.exe")));
+        const std::vector<std::wstring> w = cd::DisambiguatingFolders(rows);
+        CHECK(w.size() == 7);
+        CHECK_EQ(w[0], std::wstring(L"C:\\Alpha"));
+        CHECK_EQ(w[1], std::wstring(L"D:\\Beta"));
+        CHECK_EQ(w[2], std::wstring(L"AnthropicClaude\\app-1.2"));
+        CHECK_EQ(w[3], std::wstring(L"claude-code\\2.1"));
+        CHECK_EQ(w[4], std::wstring(L"C:\\One\\tools\\bin"));
+        CHECK_EQ(w[5], std::wstring(L"D:\\Two\\tools\\bin"));
+        CHECK_EQ(w[6], std::wstring());
+    }
+
+    Case("AJ28 a preference that could not be read is never reported as a lost assignment");
+    {
+        std::vector<std::wstring> running(1, L"C:\\Apps\\Tool\\app-1.1\\tool.exe");
+        const auto missing = [](const std::wstring&) { return false; };
+        std::vector<std::pair<std::wstring, std::wstring> > reg(
+            1, std::make_pair(std::wstring(L"C:\\Apps\\Tool\\app-1.0\\tool.exe"), cd::UnreadableChoiceKey()));
+        CHECK(cd::FindOrphanedAssignments(reg, running, missing).empty());
+        // control: the same shape with a real card IS reported, so the check above can fail
+        reg[0].second = L"10DE&2684&40BF1458";
+        CHECK(cd::FindOrphanedAssignments(reg, running, missing).size() == 1);
+    }
+
+    Case("AJ29 the notice for a change that did not finish names only files that exist");
+    {
+        // Found by adversarial review, round 6: it always spoke of "the .reg restore file it saved".
+        CHECK(cd::FormatUnfinishedNotice(std::vector<cd::UnfinishedRecord>()).empty());
+
+        std::vector<cd::UnfinishedRecord> noReg(1);
+        noReg[0].pendingPath = L"C:\\D\\gpu-preferences-before-20260912-154408-546.pending";
+        const std::wstring a = cd::FormatUnfinishedNotice(noReg);
+        CHECK(a.find(L"An earlier GPU change left its record behind") == 0);
+        CHECK(a.find(L"It wrote no restore file") != std::wstring::npos);
+        CHECK(a.find(noReg[0].pendingPath) != std::wstring::npos);
+        CHECK(a.find(L".reg") == std::wstring::npos);
+
+        std::vector<cd::UnfinishedRecord> withReg(1);
+        withReg[0].pendingPath = L"C:\\D\\gpu-preferences-before-20260912-154642-024.pending";
+        withReg[0].regExists = true;
+        withReg[0].regValid = true;
+        const std::wstring b = cd::FormatUnfinishedNotice(withReg);
+        CHECK(b.find(L"C:\\D\\gpu-preferences-before-20260912-154642-024.reg") != std::wstring::npos);
+        CHECK(b.find(withReg[0].pendingPath) != std::wstring::npos);
+        CHECK(b.find(L"may be missing from that file") != std::wstring::npos);
+        CHECK(b.find(L"It wrote no restore file") == std::wstring::npos);
+
+        std::vector<cd::UnfinishedRecord> five(5);
+        for (size_t i = 0; i < five.size(); ++i)
+            five[i].pendingPath = L"C:\\D\\gpu-preferences-before-2026091" + std::to_wstring(i) + L".pending";
+        const std::wstring c = cd::FormatUnfinishedNotice(five);
+        CHECK(c.find(L"5 earlier GPU changes left their records behind") == 0);
+        CHECK(c.find(L"and 2 more in the same folder") != std::wstring::npos);
+        CHECK(c.find(five[4].pendingPath) != std::wstring::npos);   // the newest is named
+        CHECK(c.find(five[0].pendingPath) == std::wstring::npos);   // the oldest is counted, not named
+    }
+
+    Case("AJ30 a restore file that does not read as complete is never recommended");
+    {
+        // Found by adversarial review, round 6: existence was the only check.
+        std::vector<cd::UnfinishedRecord> torn(1);
+        torn[0].pendingPath = L"C:\\D\\gpu-preferences-before-20260912-160915-401.pending";
+        torn[0].regExists = true;
+        const std::wstring n = cd::FormatUnfinishedNotice(torn);
+        CHECK(n.find(L"could not be checked as complete, so do not open it") != std::wstring::npos);
+        CHECK(n.find(L"C:\\D\\gpu-preferences-before-20260912-160915-401.reg") != std::wstring::npos);
+        CHECK(n.find(L"open it to put those values back") == std::wstring::npos);
+        CHECK(n.find(L"do not rename it") != std::wstring::npos);
+
+        std::vector<cd::GpuPreferenceBefore> rows(2);
+        rows[0].exePath = L"C:\\A\\a.exe";
+        rows[0].present = true;
+        rows[0].value = L"Q=\"x\\y\";";
+        rows[1].exePath = L"C:\\B\\b.exe";
+        rows[1].present = false;
+        const std::wstring whole = cd::FormatRegRestoreFile(rows);
+        CHECK(cd::IsCompleteRegRestoreText(whole));
+        CHECK(!cd::IsCompleteRegRestoreText(cd::FormatRegRestoreHeader()));             // no row at all
+        CHECK(!cd::IsCompleteRegRestoreText(whole.substr(0, whole.size() - 2)));        // no final line break
+        CHECK(!cd::IsCompleteRegRestoreText(whole.substr(0, whole.size() - 9)));        // cut inside the last name
+        const std::wstring first = cd::FormatRegRestoreHeader() + cd::FormatRegRestoreRow(rows[0]);
+        CHECK(cd::IsCompleteRegRestoreText(first));                                     // quotes and backslashes escaped
+        CHECK(!cd::IsCompleteRegRestoreText(first.substr(0, first.size() - 5)));        // cut after an escape
+        CHECK(!cd::IsCompleteRegRestoreText(whole + L"junk\r\n"));
+        CHECK(!cd::IsCompleteRegRestoreText(cd::FormatPendingRestoreFile(rows)));
+    }
+
+    Case("AJ31 Apply through every failure the guarded write, the read-back and the record can report");
+    {
+        const std::wstring gpu = L"10DE&2684&40BF1458";
+        const std::wstring amd = L"SpecificAdapter=1002&13C0&88771043;GpuPreference=1073741824;";
+        const std::wstring own = L"AppStatus=1;";
+        const std::wstring u = L"C:\\U\\u.exe", fl = L"C:\\F\\f.exe", dv = L"C:\\V\\v.exe", g1 = L"C:\\G1\\g1.exe",
+                           g2 = L"C:\\G2\\g2.exe", g3 = L"C:\\G3\\g3.exe";
+        FakeGpuEdits f;
+        f.reg[u] = own; f.reg[fl] = own; f.reg[dv] = own; f.reg[g1] = own; f.reg[g2] = own; f.reg[g3] = own;
+        f.result[u] = cd::GuardedWriteResult::Unavailable;
+        f.error[u] = 1234;
+        f.result[fl] = cd::GuardedWriteResult::Failed;
+        f.error[fl] = 87;
+        f.afterWrite[dv] = amd + own;          // another program's value is what reads back
+        f.recordFails.insert(g2);
+        std::vector<std::wstring> paths;
+        paths.push_back(u); paths.push_back(fl); paths.push_back(dv); paths.push_back(g1); paths.push_back(g2); paths.push_back(g3);
+        const std::vector<cd::GpuEditItem> items = f.Items(paths);
+        f.reg[g3] = amd;                        // changed after pass one read it
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(items, false, gpu, f.Ops());
+        CHECK(r.size() == 6);
+        CHECK(r[0].outcome == cd::GpuEditOutcome::Refused && !r[0].recorded);
+        CHECK(r[0].reason.find(L"could not start a protected change (error 1234)") != std::wstring::npos);
+        CHECK(r[1].outcome == cd::GpuEditOutcome::Refused && !r[1].recorded);
+        CHECK(r[1].reason.find(L"(error 87)") != std::wstring::npos);
+        CHECK(f.At(L"record " + u) == f.log.size() && f.At(L"record " + fl) == f.log.size());
+        CHECK(r[2].outcome == cd::GpuEditOutcome::Unconfirmed && r[2].recorded);
+        CHECK(r[2].reason.find(L"different value reads back") != std::wstring::npos);
+        CHECK_EQ(r[2].choiceKey, std::wstring(L"1002&13C0&88771043"));
+        CHECK(r[3].outcome == cd::GpuEditOutcome::Done && r[3].recorded);
+        CHECK(r[4].outcome == cd::GpuEditOutcome::Done && !r[4].recorded);   // a LATER record fails
+        CHECK(r[5].outcome == cd::GpuEditOutcome::NotAttempted);
+        CHECK(f.At(L"write " + g3) == f.log.size());
+        CHECK(f.At(L"read " + g3) < f.log.size());
+        CHECK_EQ(r[5].choiceKey, std::wstring(L"1002&13C0&88771043"));      // what is there now, not the snapshot
+        CHECK(f.recorded.size() == 2);
+    }
+
+    Case("AJ32 Remove through a failed record, an unreadable read-back and a cancelled commit");
+    {
+        const std::wstring gpu = L"10DE&2684&40BF1458";
+        const std::wstring own = L"AppStatus=1;";
+        const std::wstring a = L"C:\\RA\\a.exe", b = L"C:\\RB\\b.exe", c = L"C:\\RC\\c.exe", dd = L"C:\\RD\\d.exe";
+        FakeGpuEdits f;
+        f.reg[a] = cd::MergeGpuPreferenceValue(own, gpu);
+        f.reg[b] = cd::MergeGpuPreferenceValue(own, gpu);
+        f.recordFails.insert(a);
+        std::vector<std::wstring> p1;
+        p1.push_back(a); p1.push_back(b);
+        const std::vector<cd::GpuEditResult> r1 = cd::RunGpuEdits(f.Items(p1), true, std::wstring(), f.Ops());
+        CHECK(r1.size() == 2);
+        CHECK(r1[0].outcome == cd::GpuEditOutcome::Done && !r1[0].recorded);
+        CHECK(r1[1].outcome == cd::GpuEditOutcome::NotAttempted);
+        CHECK(f.At(L"write " + b) == f.log.size());
+        CHECK_EQ(f.reg[b], cd::MergeGpuPreferenceValue(own, gpu));
+        CHECK_EQ(r1[1].choiceKey, gpu);
+
+        FakeGpuEdits g;
+        g.reg[c] = cd::FormatPreferenceValue(gpu);
+        g.reg[dd] = cd::MergeGpuPreferenceValue(own, gpu);
+        g.unreadableAfterWrite.insert(c);
+        g.result[dd] = cd::GuardedWriteResult::NotCommitted;
+        g.error[dd] = 6704;
+        std::vector<std::wstring> p2;
+        p2.push_back(c); p2.push_back(dd);
+        const std::vector<cd::GpuEditResult> r2 = cd::RunGpuEdits(g.Items(p2), true, std::wstring(), g.Ops());
+        CHECK(r2.size() == 2);
+        CHECK(r2[0].outcome == cd::GpuEditOutcome::Unconfirmed && r2[0].recorded);
+        CHECK_EQ(r2[0].choiceKey, cd::UnreadableChoiceKey());
+        CHECK(r2[1].outcome == cd::GpuEditOutcome::Refused && !r2[1].recorded);
+        CHECK(r2[1].reason.find(L"6704") != std::wstring::npos);
+        CHECK_EQ(r2[1].choiceKey, gpu);
+    }
+
+    Case("AJ33 a result names a restore file only when one was written");
+    {
+        const std::wstring reg = L"C:\\D\\x.reg", pend = L"C:\\D\\x.pending";
+        const std::wstring done = cd::FormatRestoreLines(true, reg, pend, false, std::wstring(), true);
+        CHECK(done.find(reg) != std::wstring::npos && done.find(pend) == std::wstring::npos);
+        const std::wstring noFile = cd::FormatRestoreLines(false, reg, pend, true, L"\r\n    a.exe", false);
+        CHECK(noFile.find(L"No restore file could be written") != std::wstring::npos);
+        CHECK(noFile.find(reg) == std::wstring::npos);
+        CHECK(noFile.find(L"Missing from that file") == std::wstring::npos);
+        CHECK(noFile.find(pend) != std::wstring::npos && noFile.find(L"named just above is in it") != std::wstring::npos);
+        const std::wstring missing = cd::FormatRestoreLines(true, reg, pend, true, L"\r\n    b.exe", false);
+        CHECK(missing.find(L"Missing from that file") != std::wstring::npos && missing.find(reg) != std::wstring::npos);
+        const std::wstring leftover = cd::FormatRestoreLines(true, reg, pend, false, std::wstring(), false);
+        CHECK(leftover.find(L"Delete it once you no longer need it") != std::wstring::npos);
+        CHECK(cd::FormatRestoreLines(false, reg, pend, false, std::wstring(), true).empty());
+    }
+
+    Case("AJ34 the picker offers the main GPU first and once, and nothing on an undecidable plan");
+    {
+        // v0.5.6: removing an assignment does not put an application on the main GPU, so the picker must offer
+        // it. DXGI lists the operator's RTX 5090 twice, and the second entry must never add a second row.
+        const std::vector<cd::GpuAdapter> v = RealMachineAdapters();
+        const cd::GpuPlan p = cd::PlanGpuIsolation(v);
+        std::vector<std::wstring> want;
+        want.push_back(L"10DE&2B85&53021462");
+        want.push_back(L"1002&13C0&88771043");
+        want.push_back(L"10DE&2684&40BF1458");
+        CHECK_EQ(cd::PickerTargetKeys(v, p), want);
+
+        // the same three when the duplicate is enumerated before every other adapter
+        std::vector<cd::GpuAdapter> dupFirst;
+        dupFirst.push_back(v[0]); dupFirst.push_back(v[3]);
+        dupFirst.push_back(v[1]); dupFirst.push_back(v[2]);
+        CHECK_EQ(cd::PickerTargetKeys(dupFirst, cd::PlanGpuIsolation(dupFirst)), want);
+
+        // the main GPU still FIRST when another card is enumerated before it - both fixtures above list it first, so
+        // "every distinct key in enumeration order" passed them
+        std::vector<cd::GpuAdapter> mainLater;
+        mainLater.push_back(v[1]); mainLater.push_back(v[2]);
+        mainLater.push_back(v[0]); mainLater.push_back(v[3]);
+        CHECK_EQ(cd::PickerTargetKeys(mainLater, cd::PlanGpuIsolation(mainLater)), want);
+
+        // twin cards plus a third GPU: the plan is decidable and the shared main-GPU key is offered first and once
+        // (gpu_policy.h's second ceiling - which twin Windows picks for that key is unmeasured)
+        std::vector<cd::GpuAdapter> twinsPlus(2, v[2]);
+        twinsPlus[0].hasDisplay = true;
+        twinsPlus.push_back(v[1]);
+        std::vector<std::wstring> twinWant;
+        twinWant.push_back(L"10DE&2684&40BF1458");
+        twinWant.push_back(L"1002&13C0&88771043");
+        CHECK_EQ(cd::PickerTargetKeys(twinsPlus, cd::PlanGpuIsolation(twinsPlus)), twinWant);
+
+        // nothing for an undecidable plan, for the game card plus only its own duplicate, or for two identical cards
+        CHECK(cd::PickerTargetKeys(v, cd::GpuPlan()).empty());
+        std::vector<cd::GpuAdapter> onlyDup;
+        onlyDup.push_back(v[0]); onlyDup.push_back(v[3]);
+        CHECK(cd::PickerTargetKeys(onlyDup, cd::PlanGpuIsolation(onlyDup)).empty());
+        std::vector<cd::GpuAdapter> twins(2, v[2]);   // two RTX 4090s, one key - the plan refuses (AG3g)
+        twins[0].hasDisplay = true;
+        CHECK(cd::PickerTargetKeys(twins, cd::PlanGpuIsolation(twins)).empty());
+
+        CHECK(cd::IsMainGpuKey(p, L"10DE&2B85&53021462"));
+        CHECK(!cd::IsMainGpuKey(p, L"1002&13C0&88771043"));
+        CHECK(!cd::IsMainGpuKey(p, L"10DE&2684&40BF1458"));
+        CHECK(!cd::IsMainGpuKey(p, L""));
+        CHECK(!cd::IsMainGpuKey(cd::GpuPlan(), L""));   // an undecidable plan names no main GPU
+    }
+
+    Case("AJ35 Auto assign never moves apps onto the main GPU, and never sweeps a main-GPU pin back");
+    {
+        const std::wstring mainKey = L"10DE&2B85&53021462", bgKey = L"10DE&2684&40BF1458";
+        std::vector<cd::GpuRow> rows(2);
+        rows[0].exeName = L"browser.exe";  rows[0].exePath = L"C:\\B\\browser.exe";   // no assignment
+        rows[1].exeName = L"editor.exe";   rows[1].exePath = L"C:\\E\\editor.exe";
+        rows[1].assignedKey = mainKey;                                                // pinned to the main GPU by hand
+
+        // the main GPU as the target: nothing is ticked, not even the unassigned row
+        const std::vector<cd::GpuRow> ontoMain = cd::SelectForBackground(rows, mainKey, mainKey);
+        CHECK(ontoMain.size() == 2 && !ontoMain[0].selected && !ontoMain[1].selected);
+
+        // a background target: the unassigned row is ticked, the main-GPU pin is not
+        const std::vector<cd::GpuRow> toBg = cd::SelectForBackground(rows, bgKey, mainKey);
+        CHECK(toBg.size() == 2 && toBg[0].selected && !toBg[1].selected);
+
+        // CONTROL: without the main GPU's key - every caller before v0.5.6 - the same pin IS ticked
+        const std::vector<cd::GpuRow> before = cd::SelectForBackground(rows, bgKey);
+        CHECK(before.size() == 2 && before[0].selected && before[1].selected);
+
+        // decision 10 switched off: the pin is ticked again, and the main GPU as target is still refused
+        const std::vector<cd::GpuRow> flipped = cd::SelectForBackground(rows, bgKey, mainKey, false);
+        CHECK(flipped.size() == 2 && flipped[0].selected && flipped[1].selected);
+        const std::vector<cd::GpuRow> flippedOntoMain = cd::SelectForBackground(rows, mainKey, mainKey, false);
+        CHECK(flippedOntoMain.size() == 2 && !flippedOntoMain[0].selected && !flippedOntoMain[1].selected);
+
+        // A MAIN-GPU PIN LOST TO AN AUTO-UPDATE: the new path has no value, so assignedKey is empty and only lostKey
+        // remembers the main GPU. It is left alone like a live pin; a pin lost from ANOTHER GPU is still moved.
+        std::vector<cd::GpuRow> orphans(2);
+        orphans[0].exeName = L"claude.exe";  orphans[0].exePath = L"C:\\A\\app-1.2\\claude.exe";
+        orphans[0].lostKey = mainKey;
+        orphans[1].exeName = L"slack.exe";   orphans[1].exePath = L"C:\\S\\app-4.5\\slack.exe";
+        orphans[1].lostKey = L"1002&13C0&88771043";
+        const std::vector<cd::GpuRow> lost = cd::SelectForBackground(orphans, bgKey, mainKey);
+        CHECK(lost.size() == 2 && !lost[0].selected && lost[1].selected);
+        // CONTROLS: decision 10 switched off, and no main-GPU key, both tick the lost main-GPU pin again
+        const std::vector<cd::GpuRow> lostFlipped = cd::SelectForBackground(orphans, bgKey, mainKey, false);
+        CHECK(lostFlipped.size() == 2 && lostFlipped[0].selected && lostFlipped[1].selected);
+        const std::vector<cd::GpuRow> lostBefore = cd::SelectForBackground(orphans, bgKey);
+        CHECK(lostBefore.size() == 2 && lostBefore[0].selected && lostBefore[1].selected);
+    }
+
+    Case("AJ36 a GPU is integrated, discrete or unknown by every entry that shares its key");
+    {
+        const std::vector<cd::GpuAdapter> v = RealMachineAdapters();
+        CHECK(cd::KindForKey(v, L"1002&13C0&88771043") == cd::GpuKind::Integrated);
+        // DXCore does not know the second RTX 5090 entry; the card still reads discrete from the first
+        CHECK(cd::KindForKey(v, L"10DE&2B85&53021462") == cd::GpuKind::Discrete);
+        CHECK(cd::KindForKey(v, L"10DE&2684&40BF1458") == cd::GpuKind::Discrete);
+        // a key whose only entry DXCore could not answer for, and a key no entry has
+        const std::vector<cd::GpuAdapter> onlyUnknown(1, v[3]);
+        CHECK(cd::KindForKey(onlyUnknown, L"10DE&2B85&53021462") == cd::GpuKind::Unknown);
+        CHECK(cd::KindForKey(v, L"8086&A780&00000000") == cd::GpuKind::Unknown);
+        // integrated outranks discrete when two entries with one key disagree - IN BOTH ORDERS, or "the last known kind
+        // wins" would pass on the Discrete-then-Integrated order alone
+        std::vector<cd::GpuAdapter> disagree(2, v[1]);
+        disagree[0].kind = cd::GpuKind::Discrete;
+        CHECK(cd::KindForKey(disagree, L"1002&13C0&88771043") == cd::GpuKind::Integrated);
+        std::vector<cd::GpuAdapter> reversed(2, v[1]);
+        reversed[1].kind = cd::GpuKind::Discrete;
+        CHECK(cd::KindForKey(reversed, L"1002&13C0&88771043") == cd::GpuKind::Integrated);
+        // CONTROL on the fixture: it reuses one struct, so a later entry must not inherit an earlier kind
+        CHECK(v[2].kind == cd::GpuKind::Discrete && v[3].kind == cd::GpuKind::Unknown);
+
+        // THE LOG COUNTS KEYS, NOT ENTRIES (Council review, v0.5.6): the second RTX 5090 entry is Unknown but its key is
+        // not, so this machine writes no "Unknown" line
+        size_t keys = 99;
+        CHECK_EQ(cd::UnknownKindKeyCount(v, &keys), static_cast<size_t>(0));
+        CHECK_EQ(keys, static_cast<size_t>(3));
+        CHECK_EQ(cd::UnknownKindKeyCount(onlyUnknown, &keys), static_cast<size_t>(1));
+        CHECK_EQ(keys, static_cast<size_t>(1));
+        std::vector<cd::GpuAdapter> amdUnknown = v;
+        amdUnknown[1].kind = cd::GpuKind::Unknown;   // an integrated GPU DXCore could not answer for
+        CHECK_EQ(cd::UnknownKindKeyCount(amdUnknown), static_cast<size_t>(1));
+        CHECK_EQ(cd::UnknownKindKeyCount(std::vector<cd::GpuAdapter>(), &keys), static_cast<size_t>(0));
+        CHECK_EQ(keys, static_cast<size_t>(0));
+    }
+
+    Case("AJ37 Apply's question keeps v0.5.5's words and warns only about what is true");
+    {
+        // Copied from v0.5.5's DoApply, byte for byte: the first line, the explanation and both replacing sentences.
+        const std::wstring gap = L"\r\n\r\n";
+        const std::wstring explain = L"This writes Windows' own per-application GPU preference for each one, and keeps "
+                                     L"the previous value of each one it changes in a restore file. It takes effect the "
+                                     L"next time each application starts. Remove assignment later returns an application "
+                                     L"to Windows' default GPU choice.";
+        const std::wstring one = L"1 of them already has another GPU setting; it is replaced.";
+        const std::wstring many = L"2 of them already have another GPU setting; those are replaced.";
+        const std::wstring mainLine = L"NVIDIA GeForce RTX 5090 is the main GPU, where your games run: these "
+                                      L"applications will share it with them.";
+        const std::wstring igpuLine = L"NVIDIA GeForce RTX 5090 is an integrated GPU. Some applications can overload "
+                                      L"it - for example a browser showing a 3D model - and run slowly.";
+
+        cd::AssignConfirm c;
+        c.count = 3;
+        c.targetName = L"NVIDIA GeForce RTX 5090";
+        // neither warning by default
+        CHECK_EQ(cd::FormatAssignConfirm(c), L"Assign 3 applications to NVIDIA GeForce RTX 5090?" + gap + explain);
+        c.count = 1;
+        c.replacing = 1;
+        CHECK_EQ(cd::FormatAssignConfirm(c),
+                 L"Assign 1 application to NVIDIA GeForce RTX 5090?" + gap + explain + gap + one);
+        c.count = 3;
+        c.replacing = 2;
+        CHECK_EQ(cd::FormatAssignConfirm(c),
+                 L"Assign 3 applications to NVIDIA GeForce RTX 5090?" + gap + explain + gap + many);
+
+        // each warning only when its flag is set
+        c.replacing = 0;
+        c.mainGpu = true;
+        CHECK_EQ(cd::FormatAssignConfirm(c),
+                 L"Assign 3 applications to NVIDIA GeForce RTX 5090?" + gap + explain + gap + mainLine);
+        c.mainGpu = false;
+        c.integrated = true;
+        CHECK_EQ(cd::FormatAssignConfirm(c),
+                 L"Assign 3 applications to NVIDIA GeForce RTX 5090?" + gap + explain + gap + igpuLine);
+
+        // both together, with a replacing count: main, integrated, replacing - in that order
+        c.mainGpu = true;
+        c.replacing = 2;
+        CHECK_EQ(cd::FormatAssignConfirm(c), L"Assign 3 applications to NVIDIA GeForce RTX 5090?" + gap + explain +
+                                                 gap + mainLine + gap + igpuLine + gap + many);
+    }
+
+    Case("AJ38 fixed v0.5.6 wording reads exactly as shipped");
+    {
+        // the status line that says why Auto assign is off while the main GPU is the target
+        CHECK_EQ(cd::FormatMainGpuStatusLine(),
+                 std::wstring(L"Auto assign GPU for Gaming is off while the main GPU is chosen - it only moves "
+                              L"background apps off that GPU. Tick applications and Apply to put them on the main GPU."));
+
+        // the Settings tabs, in page order. settings.cpp is not in this build, so settings_pages.h is the only
+        // place a test can see them; the tab bar, its fallback buttons and the page headings all read that array.
+        CHECK_EQ(sizeof(cd::kSettingsPageLabels) / sizeof(cd::kSettingsPageLabels[0]), static_cast<size_t>(4));
+        CHECK_EQ(std::wstring(cd::kSettingsPageLabels[0]), std::wstring(L"Profiles"));
+        CHECK_EQ(std::wstring(cd::kSettingsPageLabels[1]), std::wstring(L"CPU Core Map"));
+        CHECK_EQ(std::wstring(cd::kSettingsPageLabels[2]), std::wstring(L"GPU Assignment"));
+        CHECK_EQ(std::wstring(cd::kSettingsPageLabels[3]), std::wstring(L"Setting"));
+    }
+
+    Case("AJ39 a refresh of the tab keeps a tick only for the same program, GPU and row, and says a leftover record once");
+    {
+        // gpuwindow.cpp is not in this build, so these two rules live in gpu_rows.h; deleting either there used to pass.
+        const std::wstring mainKey = L"10DE&2B85&53021462", bgKey = L"10DE&2684&40BF1458", amdKey = L"1002&13C0&88771043";
+        std::vector<std::wstring> offered;
+        offered.push_back(mainKey); offered.push_back(amdKey); offered.push_back(bgKey);
+        // what a row says, built the way LoadGpuData builds it: the listed choice is the GPU fields of the value it read
+        const auto facts = [&mainKey](const std::wstring& path, const std::wstring& assigned, const std::wstring& lost,
+                                      bool profile) {
+            cd::GpuRow r;
+            r.exePath = path;
+            r.assignedKey = assigned;
+            r.lostKey = lost;
+            r.isProfileGame = profile;
+            return cd::FactsOfRow(r, cd::GpuChoiceText(!assigned.empty(), cd::FormatPreferenceValue(assigned), false),
+                                  mainKey);
+        };
+        typedef std::vector<cd::TickedRowFacts> Facts;
+        Facts ticked;
+        ticked.push_back(facts(L"C:\\B\\Browser.exe", L"", L"", false));
+        ticked.push_back(facts(L"C:\\gone\\exited.exe", L"", L"", false));   // no longer running: no row to keep it on
+        Facts rebuilt;                                                        // a new order, and Windows' casing this time
+        rebuilt.push_back(facts(L"C:\\E\\editor.exe", L"", L"", false));
+        rebuilt.push_back(facts(L"c:\\b\\browser.EXE", L"", L"", false));
+
+        // 🔴 THE ROW AS IT WAS TICKED, NOT ONLY ITS PATH (Council round 2, v0.5.6). (a) the same program and GPU, but pinned to
+        // the main GPU in Windows Settings between the visits: the tick goes - kept, Apply compared the new pin with itself
+        // Every call here reads two complete walks of Windows' GPU preferences (the last two arguments); AJ45 covers the rest.
+        CHECK(!cd::KeptTicks(bgKey, offered, ticked, Facts(1, facts(L"C:\\B\\Browser.exe", mainKey, L"", false)), true,
+                             true)[0]);
+        // ...and so it does for a choice that moved from one card to another, or went
+        const Facts onBg(1, facts(L"C:\\N\\notes.exe", bgKey, L"", false));
+        CHECK(!cd::KeptTicks(bgKey, offered, onBg, Facts(1, facts(L"C:\\N\\notes.exe", amdKey, L"", false)), true, true)[0]);
+        CHECK(!cd::KeptTicks(bgKey, offered, onBg, Facts(1, facts(L"C:\\N\\notes.exe", L"", L"", false)), true, true)[0]);
+        // (b) a deliberate tick on a row pinned to the main GPU, unchanged: kept, whatever the casing
+        const Facts onMain(1, facts(L"C:\\M\\chat.exe", mainKey, L"", false));
+        CHECK(onMain[0].mainGpuPin && !onMain[0].listedChoice.empty());
+        CHECK(cd::KeptTicks(bgKey, offered, onMain, Facts(1, facts(L"c:\\m\\CHAT.exe", mainKey, L"", false)), true, true)[0]);
+        // (c) the program became a profile game between the visits: dropped
+        CHECK(!cd::KeptTicks(bgKey, offered, ticked, Facts(1, facts(L"C:\\B\\Browser.exe", L"", L"", true)), true, true)[0]);
+        // (d) its main-GPU pin was newly found lost to an update: no GPU choice on either read, and still dropped
+        const cd::TickedRowFacts orphaned = facts(L"C:\\B\\Browser.exe", L"", mainKey, false);
+        CHECK(orphaned.listedChoice.empty() && orphaned.mainGpuPin);
+        CHECK(!cd::KeptTicks(bgKey, offered, ticked, Facts(1, orphaned), true, true)[0]);
+        // CONTROL for (a)-(d): the same row, unchanged, keeps its tick
+        CHECK(cd::KeptTicks(bgKey, offered, ticked, Facts(1, facts(L"C:\\B\\Browser.exe", L"", L"", false)), true, true)[0]);
+
+        // the GPU is still offered: the ticked program keeps its tick, whatever order or casing the rows come back in
+        CHECK(cd::KeepsPickedTarget(bgKey, offered));
+        const std::vector<bool> same = cd::KeptTicks(bgKey, offered, ticked, rebuilt, true, true);
+        CHECK(same.size() == 2 && !same[0] && same[1]);
+
+        // the GPU is no longer offered: no tick survives, and the picker goes back to its default
+        std::vector<std::wstring> withoutBg;
+        withoutBg.push_back(mainKey); withoutBg.push_back(amdKey);
+        CHECK(!cd::KeepsPickedTarget(bgKey, withoutBg));
+        const std::vector<bool> dropped = cd::KeptTicks(bgKey, withoutBg, ticked, rebuilt, true, true);
+        CHECK(dropped.size() == 2 && !dropped[0] && !dropped[1]);
+        // CONTROL: no GPU was picked before (the first visit) - nothing is kept either
+        const std::vector<bool> first = cd::KeptTicks(std::wstring(), offered, ticked, rebuilt, true, true);
+        CHECK(first.size() == 2 && !first[0] && !first[1]);
+
+        // the notice: said for a new set of records...
+        std::vector<std::wstring> shown;
+        std::vector<std::wstring> records;
+        records.push_back(L"C:\\Data\\gpu-preferences-before-2.pending");
+        records.push_back(L"C:\\Data\\gpu-preferences-before-1.pending");
+        CHECK(cd::ShouldPostUnfinished(shown, records));
+        // ...and STILL said until it has really been shown: asking records nothing, so a post that failed, or a notice
+        // that arrived while the tab was hidden, is said on the next visit (Council review, v0.5.6)...
+        CHECK(cd::ShouldPostUnfinished(shown, records));
+        CHECK(shown.empty());
+        cd::MarkUnfinishedShown(shown, records);
+        // ...not again, once shown, for the same set in another order and casing (arrowing back onto the tab)...
+        std::vector<std::wstring> sameSet;
+        sameSet.push_back(L"c:\\data\\GPU-PREFERENCES-BEFORE-1.pending");
+        sameSet.push_back(L"C:\\Data\\gpu-preferences-before-2.pending");
+        CHECK(!cd::ShouldPostUnfinished(shown, sameSet));
+        // ...again when a record is added, until that set is shown...
+        sameSet.push_back(L"C:\\Data\\gpu-preferences-before-3.pending");
+        CHECK(cd::ShouldPostUnfinished(shown, sameSet));
+        cd::MarkUnfinishedShown(shown, sameSet);
+        CHECK(!cd::ShouldPostUnfinished(shown, sameSet));
+        // ...never for no records, and again once records come back after they were all gone
+        CHECK(!cd::ShouldPostUnfinished(shown, std::vector<std::wstring>()));
+        CHECK(shown.empty());
+        CHECK(cd::ShouldPostUnfinished(shown, records));
+    }
+
+    Case("AJ40 with nothing to tick, the tab never calls a main-GPU pin already assigned to the chosen GPU");
+    {
+        // no pin: the tab's sentence. Any pin: the pins are named, and why they stay. "Assigned to", never "on": the tab
+        // cannot tell where a running application renders (Council review, v0.5.6).
+        CHECK_EQ(cd::FormatNothingToMoveLine(0),
+                 std::wstring(L"Every application that can be moved is already assigned to that GPU."));
+        const std::wstring pinned = L"Every application that can be moved is already assigned to that GPU or pinned to "
+                                    L"the main GPU. Auto assign GPU for Gaming leaves applications pinned to the main GPU "
+                                    L"where they are.";
+        CHECK(cd::FormatNothingToMoveLine(0).find(L"already on") == std::wstring::npos);
+        CHECK(pinned.find(L"already on") == std::wstring::npos);
+        CHECK_EQ(cd::FormatNothingToMoveLine(1), pinned);
+        CHECK_EQ(cd::FormatNothingToMoveLine(3), pinned);
+
+        // which rows count as a pin - the rows decision 10 skips, and no others
+        const std::wstring mainKey = L"10DE&2B85&53021462", bgKey = L"10DE&2684&40BF1458";
+        cd::GpuRow onMain;     onMain.assignedKey = mainKey;
+        cd::GpuRow lostMain;   lostMain.lostKey = mainKey;                                 // updated into a new folder
+        cd::GpuRow lostButSet; lostButSet.lostKey = mainKey; lostButSet.assignedKey = bgKey;   // holds a value now
+        cd::GpuRow onBg;       onBg.assignedKey = bgKey;
+        cd::GpuRow none;
+        CHECK(cd::IsMainGpuPin(onMain, mainKey));
+        CHECK(cd::IsMainGpuPin(lostMain, mainKey));
+        CHECK(!cd::IsMainGpuPin(lostButSet, mainKey));
+        CHECK(!cd::IsMainGpuPin(onBg, mainKey));
+        CHECK(!cd::IsMainGpuPin(none, mainKey));
+        // CONTROL: with no main GPU known, nothing is a pin - not even a row with no assignment
+        CHECK(!cd::IsMainGpuPin(none, std::wstring()));
+
+        // and the selector reads the same rule: both pins stay unticked for the background GPU, the unassigned row is ticked
+        std::vector<cd::GpuRow> rows;
+        rows.push_back(onMain); rows.push_back(lostMain); rows.push_back(lostButSet); rows.push_back(none);
+        const std::vector<cd::GpuRow> picked = cd::SelectForBackground(rows, bgKey, mainKey);
+        CHECK(picked.size() == 4 && !picked[0].selected && !picked[1].selected && !picked[2].selected &&
+              picked[3].selected);
+    }
+
+    Case("AJ41 Apply and Remove refuse a row whose GPU choice changed after the list was shown, and only that");
+    {
+        const std::wstring mainKey = L"10DE&2B85&53021462", bgKey = L"10DE&2684&40BF1458";
+        const std::wstring mainPin = cd::FormatPreferenceValue(mainKey), bgPin = cd::FormatPreferenceValue(bgKey);
+        typedef cd::GpuPrepareVerdict V;
+
+        // APPLY. Listed with no value, then pinned to the main GPU in Windows Settings before Apply read it: refused, and
+        // the reason says why. A tick Auto assign made and one made by hand are the same row here.
+        const std::wstring listedNone = cd::GpuChoiceText(false, std::wstring(), false);
+        CHECK(listedNone.empty());
+        CHECK(cd::PrepareVerdict(listedNone, true, mainPin + L"AppStatus=1;", false) == V::ChangedSinceListed);
+        CHECK(cd::PrepareRefusalReason(V::ChangedSinceListed).find(L"changed after the list was shown") !=
+              std::wstring::npos);
+        // only Windows' own fields changed - a value with no GPU field appeared, or the fields around a pin changed: proceeds
+        CHECK(cd::PrepareVerdict(listedNone, true, L"AppStatus=1;AutoHDREnable=2097;", false) == V::Ready);
+        const std::wstring listedMain = cd::GpuChoiceText(true, L"AppStatus=1;" + mainPin, false);
+        CHECK_EQ(listedMain, mainPin);
+        CHECK(cd::PrepareVerdict(listedMain, true, mainPin + L"AppStatus=2;AutoHDREnable=2097;", false) == V::Ready);
+        // the same choice: proceeds
+        CHECK(cd::PrepareVerdict(listedNone, false, std::wstring(), false) == V::Ready);
+        CHECK(cd::PrepareVerdict(listedMain, true, mainPin, false) == V::Ready);
+        // Windows' explicit "Let Windows decide" is a choice, although it names no card
+        CHECK(cd::PrepareVerdict(listedNone, true, L"GpuPreference=0;", false) == V::ChangedSinceListed);
+
+        // REMOVE. Listed on the main GPU, then moved to the background GPU, or unassigned, before Remove read it: refused
+        CHECK(cd::PrepareVerdict(listedMain, true, bgPin, false) == V::ChangedSinceListed);
+        CHECK(cd::PrepareVerdict(listedMain, false, std::wstring(), false) == V::ChangedSinceListed);
+        CHECK(cd::PrepareVerdict(listedMain, true, L"AutoHDREnable=2097;", false) == V::ChangedSinceListed);
+
+        // the older refusals keep their words, and their places: unreadable first, an uneditable value only when unchanged
+        CHECK(cd::PrepareVerdict(listedNone, false, std::wstring(), true) == V::Unreadable);
+        CHECK(cd::PrepareVerdict(listedMain, true, mainPin + L"junk", false) == V::NotEditable);
+        CHECK(cd::PrepareVerdict(cd::UnreadableChoiceKey(), true, mainPin, false) == V::ChangedSinceListed);
+        CHECK_EQ(cd::PrepareRefusalReason(V::Unreadable),
+                 std::wstring(L"its current value could not be read, so it was left alone"));
+        CHECK_EQ(cd::PrepareRefusalReason(V::NotEditable),
+                 std::wstring(L"its current value is in a form this does not edit, so it was left alone"));
+        CHECK(cd::PrepareRefusalReason(V::Ready).empty());
+
+        // A ROW THIS TAB CHANGED IS NOT "CHANGED AFTER THE LIST WAS SHOWN" ON THE NEXT APPLY: each result carries the GPU
+        // choice that read back, and the window keeps it as the row's listed choice
+        FakeGpuEdits f;
+        const std::wstring p = L"C:\\T\\tool.exe";
+        f.reg[p] = L"AppStatus=1;";
+        const std::vector<cd::GpuEditResult> r =
+            cd::RunGpuEdits(f.Items(std::vector<std::wstring>(1, p)), false, bgKey, f.Ops());
+        CHECK(r.size() == 1 && r[0].outcome == cd::GpuEditOutcome::Done);
+        CHECK(r.size() == 1 && r[0].choiceText == bgPin);
+        CHECK(r.size() == 1 && cd::PrepareVerdict(r[0].choiceText, true, f.reg[p], false) == V::Ready);
+
+        // 🔴 PASS TWO (Council round 2, v0.5.6). A row it did not finish is unticked when the GPU choice read after the run is
+        // neither the listed one nor the one the run meant to leave - another program changed it meanwhile - and only then.
+        typedef cd::GpuEditOutcome Oc;
+        CHECK(cd::UntickAfterRun(Oc::Refused, listedNone, mainPin, bgPin));
+        CHECK(cd::UntickAfterRun(Oc::Unconfirmed, listedNone, mainPin, bgPin));
+        CHECK(cd::UntickAfterRun(Oc::NotAttempted, listedMain, bgPin, std::wstring()));
+        // the GPU choice unchanged (Windows rewrote AppStatus, say), or what this run meant to write: the tick stays
+        CHECK(!cd::UntickAfterRun(Oc::Refused, listedNone, listedNone, bgPin));
+        CHECK(!cd::UntickAfterRun(Oc::NotAttempted, listedMain, listedMain, std::wstring()));
+        CHECK(!cd::UntickAfterRun(Oc::Unconfirmed, listedNone, bgPin, bgPin));
+        // a read-back that failed is no evidence of a change - and the next Apply refuses a row listed as unreadable
+        CHECK(!cd::UntickAfterRun(Oc::Unconfirmed, listedNone, cd::UnreadableChoiceKey(), bgPin));
+        // Done and AlreadyDone are unticked by their own rule, and never counted as changed
+        CHECK(!cd::UntickAfterRun(Oc::Done, listedNone, bgPin, bgPin));
+        CHECK(!cd::UntickAfterRun(Oc::AlreadyDone, listedNone, mainPin, bgPin));
+        // what a run means to leave: Apply's merged GPU fields; Remove's, none, whether a value is left or deleted
+        cd::GpuEditItem pinnedItem;
+        pinnedItem.exePath = p;
+        pinnedItem.present = true;
+        pinnedItem.existing = mainPin + L"AppStatus=1;";
+        CHECK_EQ(cd::IntendedChoiceText(pinnedItem, false, bgKey), bgPin);
+        CHECK(cd::IntendedChoiceText(pinnedItem, true, std::wstring()).empty());
+        pinnedItem.existing = mainPin;
+        CHECK(cd::IntendedChoiceText(pinnedItem, true, std::wstring()).empty());
+
+        // driven through RunGpuEdits as RunEdits drives it: as each guarded write happens, another program pins one row to the
+        // main GPU, and rewrites only Windows' own fields of the other - both refused
+        FakeGpuEdits g;
+        const std::wstring pinnedPath = L"C:\\T\\pinned.exe", touchedPath = L"C:\\T\\touched.exe";
+        g.reg[pinnedPath] = L"AppStatus=1;";
+        g.reg[touchedPath] = L"AppStatus=1;";
+        g.result[pinnedPath] = cd::GuardedWriteResult::Changed;
+        g.otherProgram[pinnedPath] = mainPin + L"AppStatus=1;";
+        g.result[touchedPath] = cd::GuardedWriteResult::Changed;
+        g.otherProgram[touchedPath] = L"AppStatus=2;";
+        std::vector<std::wstring> both;
+        both.push_back(pinnedPath);
+        both.push_back(touchedPath);
+        const std::vector<cd::GpuEditItem> items = g.Items(both);
+        const std::vector<cd::GpuEditResult> rr = cd::RunGpuEdits(items, false, bgKey, g.Ops());
+        CHECK(rr.size() == 2 && rr[0].outcome == Oc::Refused && rr[1].outcome == Oc::Refused);
+        if (rr.size() == 2 && items.size() == 2) {
+            const std::wstring listed0 = cd::GpuChoiceText(items[0].present, items[0].existing, false);
+            const std::wstring listed1 = cd::GpuChoiceText(items[1].present, items[1].existing, false);
+            CHECK(cd::UntickAfterRun(rr[0].outcome, listed0, rr[0].choiceText, cd::IntendedChoiceText(items[0], false, bgKey)));
+            CHECK(!cd::UntickAfterRun(rr[1].outcome, listed1, rr[1].choiceText, cd::IntendedChoiceText(items[1], false, bgKey)));
+            // CONTROL - why it must be unticked: re-listed at the pin, a retry's pass one finds nothing changed and goes on
+            CHECK(cd::PrepareVerdict(rr[0].choiceText, true, g.reg[pinnedPath], false) == V::Ready);
+        }
+    }
+
+    Case("AJ42 a value that names no GPU is no GPU choice: a main-GPU pin lost to an update stays unticked");
+    {
+        const std::wstring mainKey = L"10DE&2B85&53021462", bgKey = L"10DE&2684&40BF1458";
+        const std::wstring oldPath = L"C:\\Apps\\Chat\\app-1.9\\chat.exe", newPath = L"C:\\Apps\\Chat\\app-1.10\\chat.exe";
+        const std::wstring otherPath = L"C:\\Apps\\Notes\\notes.exe";
+        // what a walk of the key reads: the old version's main-GPU pin, and the value Windows made for the new version
+        std::vector<cd::GpuPreferenceEntry> entries;
+        entries.push_back(cd::MakeGpuPreferenceEntry(oldPath, cd::FormatPreferenceValue(mainKey) + L"AppStatus=1;", false));
+        entries.push_back(cd::MakeGpuPreferenceEntry(newPath, L"AppStatus=1;AutoHDREnable=2097;", false));
+        CHECK(entries[1].choiceKey.empty() && entries[1].choiceText.empty());
+        std::vector<std::wstring> running;
+        running.push_back(newPath);
+        running.push_back(otherPath);
+        const auto exists = [&oldPath](const std::wstring& path) { return path != oldPath; };   // the old version is gone
+
+        // the pairs the tab works from leave the Windows-only value out, so the detector finds the lost pin...
+        const std::vector<std::pair<std::wstring, std::wstring> > reg = cd::GpuChoicePairs(entries);
+        CHECK(reg.size() == 1 && reg[0].first == oldPath && reg[0].second == mainKey);
+        const std::vector<cd::OrphanedAssignment> lost = cd::FindOrphanedAssignments(reg, running, exists);
+        CHECK(lost.size() == 1 && lost[0].livePath == newPath && lost[0].lostKey == mainKey);
+
+        // ...and rows built from both the way the tab builds them - the assigned key from the pairs, the lost key from the
+        // detector - leave the new version unticked, while an application with no value at all is ticked
+        std::vector<cd::GpuRow> rows(2);
+        rows[0].exeName = L"chat.exe";
+        rows[0].exePath = newPath;
+        rows[1].exeName = L"notes.exe";
+        rows[1].exePath = otherPath;
+        for (size_t i = 0; i < rows.size(); ++i) {
+            for (size_t k = 0; k < reg.size(); ++k)
+                if (cd::WcsIcmp(reg[k].first, rows[i].exePath)) rows[i].assignedKey = reg[k].second;
+            for (size_t k = 0; k < lost.size(); ++k)
+                if (cd::WcsIcmp(lost[k].livePath, rows[i].exePath)) rows[i].lostKey = lost[k].lostKey;
+        }
+        const std::vector<cd::GpuRow> picked = cd::SelectForBackground(rows, bgKey, mainKey);
+        CHECK(picked.size() == 2 && !picked[0].selected && picked[1].selected);
+
+        // CONTROL - every value as a pair, as before this fix: the Windows-only value hides the lost pin
+        std::vector<std::pair<std::wstring, std::wstring> > every;
+        for (size_t i = 0; i < entries.size(); ++i) every.push_back(std::make_pair(entries[i].path, entries[i].choiceKey));
+        CHECK(cd::FindOrphanedAssignments(every, running, exists).empty());
+
+        // "GpuPreference=0" at the new path names no GPU either, so the lost pin is still found (Council round 2, v0.5.6: [M]
+        // Windows' own graphics options write it beside SwapEffectUpgradeEnable) - while Apply still compares it (AJ41)...
+        entries[1] = cd::MakeGpuPreferenceEntry(newPath, L"SwapEffectUpgradeEnable=1;GpuPreference=0;", false);
+        CHECK(!entries[1].choiceText.empty() && entries[1].choiceKey.empty());
+        CHECK(cd::GpuChoicePairs(entries).size() == 1);
+        const std::vector<cd::OrphanedAssignment> lostBesideMode0 =
+            cd::FindOrphanedAssignments(cd::GpuChoicePairs(entries), running, exists);
+        CHECK(lostBesideMode0.size() == 1 && lostBesideMode0[0].lostKey == mainKey);
+        // ...while a card, or one of Windows' two modes, at the new path IS a choice, so nothing was lost there
+        entries[1] = cd::MakeGpuPreferenceEntry(newPath, L"GpuPreference=2;AppStatus=1;", false);
+        CHECK(cd::FindOrphanedAssignments(cd::GpuChoicePairs(entries), running, exists).empty());
+        entries[1] = cd::MakeGpuPreferenceEntry(newPath, cd::FormatPreferenceValue(bgKey), false);
+        CHECK(cd::FindOrphanedAssignments(cd::GpuChoicePairs(entries), running, exists).empty());
+        // ...and a value that could not be read is never taken for no value
+        entries[1] = cd::MakeGpuPreferenceEntry(newPath, std::wstring(), true);
+        const std::vector<std::pair<std::wstring, std::wstring> > unread = cd::GpuChoicePairs(entries);
+        CHECK(unread.size() == 2 && unread[1].second == cd::UnreadableChoiceKey());
+        CHECK(cd::FindOrphanedAssignments(unread, running, exists).empty());
+    }
+
+    Case("AJ43 the panel's state outlives every message box open when the panel is destroyed, and is freed once");
+    {
+        // no box open: WM_NCDESTROY frees it at once
+        cd::PanelLifetime idle;
+        CHECK(cd::DetachPanel(idle));
+        // a box open: WM_NCDESTROY leaves it, and the box's return frees it
+        cd::PanelLifetime one;
+        cd::EnterModal(one);
+        CHECK(!cd::DetachPanel(one));
+        CHECK(one.detached);
+        CHECK(cd::LeaveModal(one));
+        // a notice raised inside Apply's question: only the OUTER return frees it, and the inner one already sees `detached`
+        cd::PanelLifetime nested;
+        cd::EnterModal(nested);
+        cd::EnterModal(nested);
+        CHECK(!cd::DetachPanel(nested));
+        CHECK(!cd::LeaveModal(nested) && nested.detached);
+        CHECK(cd::LeaveModal(nested));
+        // CONTROL - never destroyed: no return frees it, nested or not
+        cd::PanelLifetime alive;
+        cd::EnterModal(alive);
+        cd::EnterModal(alive);
+        CHECK(!cd::LeaveModal(alive));
+        CHECK(!cd::LeaveModal(alive));
+        CHECK(!alive.detached && alive.busy == 0);
+    }
+
+    Case("AJ44 with no GPU chosen, a lost assignment is said with no instruction nobody can follow, nor 'no GPU' under GPUs");
+    {
+        CHECK(cd::FormatLostWithoutTargetLine(0, false).empty());
+        CHECK(cd::FormatLostWithoutTargetLine(0, true).empty());
+        // the picker offers nothing
+        CHECK_EQ(cd::FormatLostWithoutTargetLine(1, false),
+                 std::wstring(L"1 app lost its GPU assignment after an update. No GPU is available to assign it to "
+                              L"right now."));
+        CHECK_EQ(cd::FormatLostWithoutTargetLine(2, false),
+                 std::wstring(L"2 apps lost their GPU assignment after an update. No GPU is available to assign them "
+                              L"to right now."));
+        // the picker still offers GPUs, with none chosen - a target that was dropped (Council round 2, v0.5.6)
+        CHECK_EQ(cd::FormatLostWithoutTargetLine(1, true),
+                 std::wstring(L"1 app lost its GPU assignment after an update. Choose a GPU above to assign it again."));
+        CHECK_EQ(cd::FormatLostWithoutTargetLine(2, true),
+                 std::wstring(L"2 apps lost their GPU assignment after an update. Choose a GPU above to assign them "
+                              L"again."));
+        for (int canChoose = 0; canChoose < 2; ++canChoose) {
+            for (size_t n = 1; n <= 2; ++n) {
+                const std::wstring s = cd::FormatLostWithoutTargetLine(n, canChoose != 0);
+                CHECK(s.find(L"Apply") == std::wstring::npos);
+                CHECK(s.find(L"chosen above") == std::wstring::npos);
+                CHECK((s.find(L"No GPU is available") == std::wstring::npos) == (canChoose != 0));
+            }
+        }
+        // CONTROL: the sentence this case used before told the user to Apply to a GPU "chosen above"
+        CHECK(cd::FormatGpuIsolateStatusLine(0, 2, 1).find(L"chosen above") != std::wstring::npos);
+    }
+
+    Case("AJ45 while Windows' GPU preferences could not all be read, Auto assign ticks nothing and a refresh after a "
+         "complete read keeps no tick");
+    {
+        // Council round 2, v0.5.6 (F1): an incomplete walk of the key can leave out the old version's main-GPU pin, and the
+        // new version then reads as an application nobody pinned.
+        const std::wstring mainKey = L"10DE&2B85&53021462", bgKey = L"10DE&2684&40BF1458";
+        const std::wstring oldPath = L"C:\\Apps\\Chat\\app-1.9\\chat.exe", newPath = L"C:\\Apps\\Chat\\app-1.10\\chat.exe";
+        const std::vector<std::wstring> running(1, newPath);
+        const auto exists = [&oldPath](const std::wstring& path) { return path != oldPath; };   // the old version is gone
+        // the new version's row, built from a walk the way the tab builds it: assigned key from the pairs, lost key from the detector
+        const auto rowFrom = [&](const std::vector<cd::GpuPreferenceEntry>& entries) {
+            const std::vector<std::pair<std::wstring, std::wstring> > reg = cd::GpuChoicePairs(entries);
+            cd::GpuRow r;
+            r.exeName = L"chat.exe";
+            r.exePath = newPath;
+            for (size_t k = 0; k < reg.size(); ++k)
+                if (cd::WcsIcmp(reg[k].first, newPath)) r.assignedKey = reg[k].second;
+            const std::vector<cd::OrphanedAssignment> lost = cd::FindOrphanedAssignments(reg, running, exists);
+            for (size_t k = 0; k < lost.size(); ++k)
+                if (cd::WcsIcmp(lost[k].livePath, newPath)) r.lostKey = lost[k].lostKey;
+            return std::vector<cd::GpuRow>(1, r);
+        };
+        const cd::GpuPreferenceEntry oldPin =
+            cd::MakeGpuPreferenceEntry(oldPath, cd::FormatPreferenceValue(mainKey) + L"AppStatus=1;", false);
+        const cd::GpuPreferenceEntry newMeta = cd::MakeGpuPreferenceEntry(newPath, L"AppStatus=1;AutoHDREnable=2097;", false);
+        CHECK(newMeta.choiceKey.empty() && newMeta.choiceText.empty());   // readable, and only Windows' own fields
+
+        // no other version of the application in the walk: Auto assign's AnotherVersionMayHoldMainGpuPin has nothing to see (AJ46)
+        const std::vector<std::pair<std::wstring, std::wstring> > noOtherVersion;
+
+        // INCOMPLETE: the walk read the new path's value and never reached the old pin. Nothing on the row says "pinned"...
+        const std::vector<cd::GpuPreferenceEntry> partialWalk(1, newMeta);
+        const std::vector<cd::GpuRow> partial = rowFrom(partialWalk);
+        CHECK(partial[0].assignedKey.empty() && partial[0].lostKey.empty());
+        // ...so Auto assign, told the walk was incomplete, selects nothing
+        const std::vector<cd::GpuRow> incomplete =
+            cd::SelectForAutoAssign(partial, bgKey, mainKey, false, cd::GpuChoicePairs(partialWalk));
+        CHECK(incomplete.size() == 1 && !incomplete[0].selected);
+        // CONTROL - why it must refuse: the same row through the selector alone, or told the walk was complete, is ticked
+        CHECK(cd::SelectForBackground(partial, bgKey, mainKey)[0].selected);
+        CHECK(cd::SelectForAutoAssign(partial, bgKey, mainKey, true, cd::GpuChoicePairs(partialWalk))[0].selected);
+
+        // COMPLETE, the old pin present: found lost to the update, and skipped through lostKey
+        std::vector<cd::GpuPreferenceEntry> whole;
+        whole.push_back(oldPin);
+        whole.push_back(newMeta);
+        const std::vector<cd::GpuRow> found = rowFrom(whole);
+        CHECK(found[0].assignedKey.empty() && found[0].lostKey == mainKey);
+        CHECK(!cd::SelectForAutoAssign(found, bgKey, mainKey, true, noOtherVersion)[0].selected);
+        // CONTROL - it is the lost key that skips it: the same row without it, and with no other version to see, is ticked
+        std::vector<cd::GpuRow> withoutLost = found;
+        withoutLost[0].lostKey.clear();
+        CHECK(cd::SelectForAutoAssign(withoutLost, bgKey, mainKey, true, noOtherVersion)[0].selected);
+
+        // the rule: both reasons, alone and together; the main GPU as target ticks nothing, complete or not
+        CHECK(cd::AutoAssignAllowed(true, false));
+        CHECK(!cd::AutoAssignAllowed(false, false));
+        CHECK(!cd::AutoAssignAllowed(true, true));
+        CHECK(!cd::AutoAssignAllowed(false, true));
+        CHECK(!cd::SelectForAutoAssign(withoutLost, mainKey, mainKey, true, noOtherVersion)[0].selected);
+        // CONTROL: no main GPU known is not "the main GPU is the target"
+        CHECK(cd::SelectForAutoAssign(withoutLost, bgKey, std::wstring(), true, noOtherVersion)[0].selected);
+
+        // the reason beside the greyed button
+        CHECK_EQ(cd::FormatIncompleteScanStatusLine(),
+                 std::wstring(L"Auto assign GPU for Gaming is off because Windows' GPU settings could not all be read, so "
+                              L"an application pinned to the main GPU might not be recognised. Tick applications by hand "
+                              L"to change them."));
+
+        // A REFRESH WHOSE WALK WAS INCOMPLETE, AFTER ONE THAT WAS COMPLETE, KEEPS NO TICK - not even one whose row did not
+        // change, since Auto assign may have made it on that complete visit
+        std::vector<std::wstring> offered;
+        offered.push_back(mainKey);
+        offered.push_back(bgKey);
+        const std::vector<cd::TickedRowFacts> ticked(1, cd::FactsOfRow(withoutLost[0], std::wstring(), mainKey));
+        CHECK(!cd::KeptTicks(bgKey, offered, ticked, ticked, true, false)[0]);
+        // ...but after an incomplete walk every tick was made by hand - Auto assign ticked nothing - so the usual rules keep an
+        // unchanged row's tick, as on the refresh an Apply asks for after refusing rows (Council round 2 fix check, v0.5.6)...
+        CHECK(cd::KeptTicks(bgKey, offered, ticked, ticked, false, false)[0]);
+        // ...and still drop a row that changed: pinned to the main GPU in Windows Settings meanwhile
+        cd::GpuRow pinnedMeanwhile = withoutLost[0];
+        pinnedMeanwhile.assignedKey = mainKey;
+        const std::vector<cd::TickedRowFacts> nowPinned(
+            1, cd::FactsOfRow(pinnedMeanwhile, cd::GpuChoiceText(true, cd::FormatPreferenceValue(mainKey), false), mainKey));
+        CHECK(!cd::KeptTicks(bgKey, offered, ticked, nowPinned, false, false)[0]);
+        // CONTROL: a complete walk keeps it, after either
+        CHECK(cd::KeptTicks(bgKey, offered, ticked, ticked, true, true)[0]);
+        CHECK(cd::KeptTicks(bgKey, offered, ticked, ticked, false, true)[0]);
+    }
+
+    Case("AJ46 Auto assign leaves an application alone while another version of it may hold a main-GPU pin, lost or not");
+    {
+        // Council round 2 fix check, v0.5.6: a pin is found lost only when Windows says the old path is gone, so an updater
+        // that keeps the previous version folder, an old path that cannot be probed, or an old value that cannot be read left
+        // the new version with no lostKey - and Auto assign, from a complete walk, ticked it for the background GPU.
+        const std::wstring mainKey = L"10DE&2B85&53021462", bgKey = L"10DE&2684&40BF1458";
+        const std::wstring oldPath = L"C:\\Apps\\Chat\\app-1.9\\chat.exe", newPath = L"C:\\Apps\\Chat\\app-1.10\\chat.exe";
+        const std::vector<std::wstring> running(1, newPath);
+        typedef std::vector<std::pair<std::wstring, std::wstring> > Pairs;
+        const cd::GpuPreferenceEntry newMeta = cd::MakeGpuPreferenceEntry(newPath, L"AppStatus=1;AutoHDREnable=2097;", false);
+        // a complete walk holding the old version's value `old` and the new path's own fields
+        const auto walk = [&newMeta](const cd::GpuPreferenceEntry& old) {
+            std::vector<cd::GpuPreferenceEntry> entries;
+            entries.push_back(old);
+            entries.push_back(newMeta);
+            return cd::GpuChoicePairs(entries);
+        };
+        // the new version's row, built the way the tab builds it; `oldExists` is what the disk probe answers for the old path
+        const auto rowFrom = [&](const Pairs& reg, bool oldExists) {
+            cd::GpuRow r;
+            r.exeName = L"chat.exe";
+            r.exePath = newPath;
+            for (size_t k = 0; k < reg.size(); ++k)
+                if (cd::WcsIcmp(reg[k].first, newPath)) r.assignedKey = reg[k].second;
+            const std::vector<cd::OrphanedAssignment> lost = cd::FindOrphanedAssignments(
+                reg, running, [&](const std::wstring& path) { return path != oldPath || oldExists; });
+            for (size_t k = 0; k < lost.size(); ++k)
+                if (cd::WcsIcmp(lost[k].livePath, newPath)) r.lostKey = lost[k].lostKey;
+            return std::vector<cd::GpuRow>(1, r);
+        };
+        const Pairs none;
+
+        // (a) THE OLD VERSION FOLDER IS STILL ON DISK - or could not be probed, which MarkOrphans also answers "exists" - and
+        // its value names the main GPU: nothing on the row says so...
+        const Pairs keptPin = walk(cd::MakeGpuPreferenceEntry(oldPath, cd::FormatPreferenceValue(mainKey), false));
+        const std::vector<cd::GpuRow> kept = rowFrom(keptPin, true);
+        CHECK(kept[0].assignedKey.empty() && kept[0].lostKey.empty() && !cd::IsMainGpuPin(kept[0], mainKey));
+        CHECK(cd::AnotherVersionMayHoldMainGpuPin(kept[0], keptPin, mainKey));
+        // ...and Auto assign leaves it alone
+        CHECK(!cd::SelectForAutoAssign(kept, bgKey, mainKey, true, keptPin)[0].selected);
+        // CONTROL - why it must: the selector alone ticks it, and so does Auto assign shown no other version
+        CHECK(cd::SelectForBackground(kept, bgKey, mainKey)[0].selected);
+        CHECK(cd::SelectForAutoAssign(kept, bgKey, mainKey, true, none)[0].selected);
+
+        // (b) THE OLD VALUE COULD NOT BE READ, and the old folder is gone: no lost assignment is reported, and it is not ticked
+        const Pairs unreadable = walk(cd::MakeGpuPreferenceEntry(oldPath, std::wstring(), true));
+        CHECK(unreadable.size() == 1 && unreadable[0].second == cd::UnreadableChoiceKey());
+        const std::vector<cd::GpuRow> unread = rowFrom(unreadable, false);
+        CHECK(unread[0].assignedKey.empty() && unread[0].lostKey.empty());
+        CHECK(!cd::SelectForAutoAssign(unread, bgKey, mainKey, true, unreadable)[0].selected);
+
+        // CONTROL: the old version on the BACKGROUND GPU, its folder kept or gone, is no reason to leave it alone - ticked
+        const Pairs bgPin = walk(cd::MakeGpuPreferenceEntry(oldPath, cd::FormatPreferenceValue(bgKey), false));
+        CHECK(!cd::AnotherVersionMayHoldMainGpuPin(rowFrom(bgPin, true)[0], bgPin, mainKey));
+        CHECK(cd::SelectForAutoAssign(rowFrom(bgPin, true), bgKey, mainKey, true, bgPin)[0].selected);
+        CHECK(cd::SelectForAutoAssign(rowFrom(bgPin, false), bgKey, mainKey, true, bgPin)[0].selected);
+
+        // CONTROL: a main-GPU pin of ANOTHER application - another install root, or another file name - is not this one's
+        Pairs others;
+        others.push_back(std::make_pair(std::wstring(L"C:\\Apps\\Talk\\app-1.9\\chat.exe"), mainKey));
+        others.push_back(std::make_pair(std::wstring(L"C:\\Apps\\Chat\\app-1.9\\helper.exe"), mainKey));
+        CHECK(!cd::AnotherVersionMayHoldMainGpuPin(kept[0], others, mainKey));
+        CHECK(cd::SelectForAutoAssign(kept, bgKey, mainKey, true, others)[0].selected);
+
+        // CONTROL: an application with a GPU value of its own is judged on that value, as before; no main GPU known, no pin
+        std::vector<cd::GpuRow> onAmd = kept;
+        onAmd[0].assignedKey = L"1002&13C0&88771043";
+        CHECK(!cd::AnotherVersionMayHoldMainGpuPin(onAmd[0], keptPin, mainKey));
+        CHECK(cd::SelectForAutoAssign(onAmd, bgKey, mainKey, true, keptPin)[0].selected);
+        CHECK(!cd::AnotherVersionMayHoldMainGpuPin(kept[0], keptPin, std::wstring()));
+    }
+}
+
+void Test_AH5_StatusLine() {
+    Case("AH5a FormatGpuIsolateStatusLine: gpuCount < 2 returns empty");
+    std::wstring result = cd::FormatGpuIsolateStatusLine(5, 1);
+    CHECK_EQ(result, std::wstring(L""));
+
+    Case("AH5b FormatGpuIsolateStatusLine: movableApps = 0 returns empty");
+    result = cd::FormatGpuIsolateStatusLine(0, 2);
+    CHECK_EQ(result, std::wstring(L""));
+
+    Case("AH5c FormatGpuIsolateStatusLine: 1 app uses singular 'app'");
+    result = cd::FormatGpuIsolateStatusLine(1, 2);
+    CHECK(result.find(L" app ") != std::wstring::npos);
+    CHECK(result.find(L" apps ") == std::wstring::npos);
+
+    Case("AH5d FormatGpuIsolateStatusLine: 7 apps uses plural 'apps'");
+    result = cd::FormatGpuIsolateStatusLine(7, 2);
+    CHECK(result.find(L" apps ") != std::wstring::npos);
+    CHECK(result.find(L"7 background") != std::wstring::npos);
+}
+
+void Test_AH6_RowsNeedingRestart() {
+    Case("AH6a RowsNeedingRestart: returns StaleNotApplied rows only");
+    std::vector<cd::GpuRow> rows;
+
+    cd::GpuRow staleRow;
+    staleRow.exeName = L"stale.exe";
+    staleRow.assignedKey = L"10DE&2B85&53021462";
+    staleRow.runningKey = L"DIFFERENT&KEY&HERE";
+    staleRow.isProfileGame = false;
+    rows.push_back(staleRow);
+
+    cd::GpuRow correctRow;
+    correctRow.exeName = L"correct.exe";
+    correctRow.assignedKey = L"10DE&2B85&53021462";
+    correctRow.runningKey = L"10DE&2B85&53021462";
+    correctRow.isProfileGame = false;
+    rows.push_back(correctRow);
+
+    cd::GpuRow missingRow;
+    missingRow.exeName = L"missing.exe";
+    missingRow.assignedKey = L"";
+    missingRow.runningKey = L"10DE&2B85&53021462";
+    missingRow.isProfileGame = false;
+    rows.push_back(missingRow);
+
+    std::vector<cd::GpuRow> result = cd::RowsNeedingRestart(rows, L"10DE&2B85&53021462");
+    CHECK_EQ(result.size(), (size_t)1);
+    CHECK_EQ(result[0].exeName, std::wstring(L"stale.exe"));
+}
+
+void Test_AI1_FindOrphanedAssignments() {
+    Case("AI1a FindOrphanedAssignments: exact Claude case - three stale, one live without entry");
+
+    // Build the registry: three stale Claude entries, nothing else
+    std::vector<std::pair<std::wstring, std::wstring>> registry;
+    registry.push_back({L"C:\\AnthropicClaude\\app-1.24012.9\\claude.exe", L"10DE&2684&40BF1458"});
+    registry.push_back({L"C:\\AnthropicClaude\\app-1.26832.0\\claude.exe", L"10DE&2684&40BF1458"});
+    registry.push_back({L"C:\\AnthropicClaude\\app-1.49585.0\\claude.exe", L"10DE&2684&40BF1458"});
+
+    // The running process is the live one
+    std::vector<std::wstring> running = {L"C:\\AnthropicClaude\\app-1.52386.3\\claude.exe"};
+
+    // Mock pathExists: all three stale paths do not exist, the live one does
+    auto pathExists = [](const std::wstring& path) {
+        if (path.find(L"app-1.52386.3") != std::wstring::npos) return true;
+        return false;
+    };
+
+    std::vector<cd::OrphanedAssignment> result = cd::FindOrphanedAssignments(registry, running, pathExists);
+
+    CHECK_EQ(result.size(), (size_t)1);
+    CHECK_EQ(result[0].exeName, std::wstring(L"claude.exe"));
+    CHECK_EQ(result[0].livePath, std::wstring(L"C:\\AnthropicClaude\\app-1.52386.3\\claude.exe"));
+    CHECK_EQ(result[0].lostKey, std::wstring(L"10DE&2684&40BF1458"));
+    // The stalePath should be the LAST-SORTING one (most recent version)
+    CHECK_EQ(result[0].stalePath, std::wstring(L"C:\\AnthropicClaude\\app-1.49585.0\\claude.exe"));
+
+    Case("AI1b FindOrphanedAssignments: live path already has entry - no orphan reported");
+    std::vector<std::pair<std::wstring, std::wstring>> registry2;
+    registry2.push_back({L"C:\\AnthropicClaude\\app-1.24012.9\\claude.exe", L"10DE&2684&40BF1458"});
+    registry2.push_back({L"C:\\AnthropicClaude\\app-1.52386.3\\claude.exe", L"10DE&2B85&53021462"});
+
+    std::vector<std::wstring> running2 = {L"C:\\AnthropicClaude\\app-1.52386.3\\claude.exe"};
+
+    auto pathExists2 = [](const std::wstring&) { return false; };
+
+    std::vector<cd::OrphanedAssignment> result2 = cd::FindOrphanedAssignments(registry2, running2, pathExists2);
+    CHECK_EQ(result2.size(), (size_t)0);
+
+    Case("AI1c FindOrphanedAssignments: stale basename no match - not reported");
+    std::vector<std::pair<std::wstring, std::wstring>> registry3;
+    registry3.push_back({L"C:\\OtherApp\\app-1.0\\other.exe", L"10DE&2684&40BF1458"});
+
+    std::vector<std::wstring> running3 = {L"C:\\AnthropicClaude\\app-1.52386.3\\claude.exe"};
+
+    auto pathExists3 = [](const std::wstring&) { return false; };
+
+    std::vector<cd::OrphanedAssignment> result3 = cd::FindOrphanedAssignments(registry3, running3, pathExists3);
+    CHECK_EQ(result3.size(), (size_t)0);
+
+    Case("AI1d FindOrphanedAssignments: stale entry with empty adapter key - not reported");
+    std::vector<std::pair<std::wstring, std::wstring>> registry4;
+    registry4.push_back({L"C:\\AnthropicClaude\\app-1.24012.9\\claude.exe", L""});
+
+    std::vector<std::wstring> running4 = {L"C:\\AnthropicClaude\\app-1.52386.3\\claude.exe"};
+
+    auto pathExists4 = [](const std::wstring&) { return false; };
+
+    std::vector<cd::OrphanedAssignment> result4 = cd::FindOrphanedAssignments(registry4, running4, pathExists4);
+    CHECK_EQ(result4.size(), (size_t)0);
+
+    Case("AI1e FindOrphanedAssignments: stale path still exists on disk - not reported");
+    std::vector<std::pair<std::wstring, std::wstring>> registry5;
+    registry5.push_back({L"C:\\AnthropicClaude\\app-1.24012.9\\claude.exe", L"10DE&2684&40BF1458"});
+
+    std::vector<std::wstring> running5 = {L"C:\\AnthropicClaude\\app-1.52386.3\\claude.exe"};
+
+    auto pathExists5 = [](const std::wstring&) { return true; };
+
+    std::vector<cd::OrphanedAssignment> result5 = cd::FindOrphanedAssignments(registry5, running5, pathExists5);
+    CHECK_EQ(result5.size(), (size_t)0);
+
+    Case("AI1f FindOrphanedAssignments: case-insensitive basename match");
+    std::vector<std::pair<std::wstring, std::wstring>> registry6;
+    registry6.push_back({L"C:\\AnthropicClaude\\app-1.24012.9\\CLAUDE.EXE", L"10DE&2684&40BF1458"});
+
+    std::vector<std::wstring> running6 = {L"C:\\AnthropicClaude\\app-1.52386.3\\claude.exe"};
+
+    auto pathExists6 = [](const std::wstring& path) {
+        if (path.find(L"app-1.52386.3") != std::wstring::npos) return true;
+        return false;
+    };
+
+    std::vector<cd::OrphanedAssignment> result6 = cd::FindOrphanedAssignments(registry6, running6, pathExists6);
+    CHECK_EQ(result6.size(), (size_t)1);
+    CHECK_EQ(result6[0].exeName, std::wstring(L"claude.exe"));
+
+    Case("AI1g FindOrphanedAssignments: empty inputs - empty result");
+    std::vector<std::pair<std::wstring, std::wstring>> emptyRegistry;
+    std::vector<std::wstring> emptyRunning;
+    auto emptyPathExists = [](const std::wstring&) { return false; };
+
+    std::vector<cd::OrphanedAssignment> emptyResult = cd::FindOrphanedAssignments(emptyRegistry, emptyRunning, emptyPathExists);
+    CHECK_EQ(emptyResult.size(), (size_t)0);
+}
+
+void Test_AI2_DriftStatusLine() {
+    Case("AI2a FormatGpuIsolateStatusLine: (7,2,0) returns isolate sentence");
+    std::wstring result = cd::FormatGpuIsolateStatusLine(7, 2, 0);
+    CHECK(result.find(L"background") != std::wstring::npos);
+    // v0.5.6: it names the picker, not "a second GPU" - the picker offers the main GPU too.
+    CHECK_EQ(result, std::wstring(L"7 background apps can be moved to the GPU chosen above."));
+    CHECK(result.find(L"lost") == std::wstring::npos);
+
+    Case("AI2b FormatGpuIsolateStatusLine: (7,2,1) returns drift sentence, singular");
+    result = cd::FormatGpuIsolateStatusLine(7, 2, 1);
+    CHECK(result.find(L"1 app lost") != std::wstring::npos);
+    CHECK(result.find(L"its") != std::wstring::npos);
+    // THE FIX THAT WORKS, NOT "restart it". This case used to PIN the false instruction: the live
+    // path has no registry entry, so a restart reapplies nothing. Caught in the window's screenshot.
+    CHECK(result.find(L"tick it and Apply") != std::wstring::npos);
+    CHECK(result.find(L"restart") == std::wstring::npos);
+    CHECK(result.find(L"isolated") == std::wstring::npos);
+
+    Case("AI2c FormatGpuIsolateStatusLine: (7,2,3) returns drift sentence, plural");
+    result = cd::FormatGpuIsolateStatusLine(7, 2, 3);
+    CHECK(result.find(L"3 apps lost") != std::wstring::npos);
+    CHECK(result.find(L"their") != std::wstring::npos);
+    CHECK(result.find(L"tick them and Apply") != std::wstring::npos);
+    CHECK(result.find(L"restart") == std::wstring::npos);
+    CHECK(result.find(L"isolated") == std::wstring::npos);
+
+    Case("AI2d FormatGpuIsolateStatusLine: (0,1,5) returns empty because gpuCount < 2");
+    result = cd::FormatGpuIsolateStatusLine(0, 1, 5);
+    CHECK_EQ(result, std::wstring(L""));
+
+    Case("AI2e FormatGpuIsolateStatusLine: drift outranks movable - (5,2,1) reports drift");
+    result = cd::FormatGpuIsolateStatusLine(5, 2, 1);
+    CHECK(result.find(L"lost") != std::wstring::npos);
+    CHECK(result.find(L"5 background") == std::wstring::npos);
+}
+
 }  // namespace
 
 // ===========================================================================
@@ -7003,10 +9451,14 @@ int main() {
     Test_B6_UnknownPreserved();
     Test_B7_ValidateAndRepair();
     Test_B8_DefaultConfig();
+    Test_B8b_TheStructDefaultIsTheOneUsersInherit();
+    Test_B8c_TheShippedProfileCarriesTheSameThreshold();
+    Test_B8d_TheNewDefaultIsSelfConsistent();
     Test_B9_IsExcludedCaseInsensitive();
-    Test_B10_AllGamesAndLastUsedRoundTrip();
+    Test_B10_LastUsedRoundTripsAndTheRetiredKeyIsNeverWritten();
     Test_B11_ProfilesForDisplay();
     Test_B12_ValidateAndRepairNewRules();
+    Test_B12d_TheRetiredFlagCannotSurviveASaveThatSkipsTheRepair();
     Test_B13_MarkProfileUsed();
     Test_B14_DefaultExclusionsProtectAtieclxx();
     Test_B15_DefaultExclusionsProtectAtiesrxx();
@@ -7268,7 +9720,7 @@ int main() {
     Test_AA8_TheDwellThroughComputeDesired();
     Test_AA9_TheSelectedGameExitingReleasesAtOnce();
     Test_AA10_OneGameRunningIsByteIdenticalToBefore();
-    Test_AA11_ASpecificProfileStillBeatsAllGamesAtOnce();
+    Test_AA11_AMigratedLegacyProfileGovernsNothing();
     Test_AA12_EveryReasonHasItsOwnWords();
     Test_AA13_OneCandidateIgnoresTheForegroundEntirely();
 
@@ -7306,6 +9758,26 @@ int main() {
     Test_AB2_AFourthFieldIsShownOnlyWhenItSaysSomething();
     Test_AB3_AnUnreadableVersionDrawsNothing();
     Test_AB4_TheLabelIsNeverSomethingElse();
+
+
+    std::printf("\n== AG. Auto-Isolate GPU ==\n");
+    Test_AG1_AdapterKeyFromPnpId();
+    Test_AG2_FormatAndParsePreferenceValue();
+    Test_AG3_PlanGpuIsolation();
+    Test_AG4_ClassifyGpuPref();
+    Test_AG5_ConfigRoundTripPreservesUnknownKey();
+
+    std::printf("\n== AH. GPU Assignment tab rows ==\n");
+    Test_AH1_FormatRowGpu();
+    Test_AH2_RowState();
+    Test_AH3_SelectForBackground();
+    Test_AJ_GpuPolicy();
+    Test_AH5_StatusLine();
+    Test_AH6_RowsNeedingRestart();
+
+    std::printf("\n== AI. Orphaned GPU assignments ==\n");
+    Test_AI1_FindOrphanedAssignments();
+    Test_AI2_DriftStatusLine();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

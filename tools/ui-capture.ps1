@@ -26,10 +26,30 @@
 param(
     [string]$OutDir = "$env:TEMP\gameoptimizer-ui",
     [string]$Tag    = "run",
-    [int]$Pages     = 4
+    # The Settings window has four tabs since v0.5.6. The tab bar stops at the last tab instead of
+    # wrapping, so a larger number only repeats the last capture.
+    [int]$Pages     = 4,
+    # The binary whose running instance is captured. Only a GameOptimizer process started from exactly this path is
+    # used: an installed release of another version would otherwise be captured and labelled as this build.
+    [string]$ExePath = (Join-Path $PSScriptRoot '..\build\GameOptimizer.exe')
 )
 
 $ErrorActionPreference = 'Stop'
+
+# NO RUN ENDS 0 WITH A FAILURE IN IT (v0.5.6). A capture PrintWindow refused printed nothing, a page whose heading could
+# not be read printed "UNKNOWN", a missing page selector printed a line - and each run still exited 0. Each now counts,
+# and the run ends "RESULT: FAIL=<n>", exiting 1 when n > 0. An error stops the run: the trap says what it was and exits
+# 1, which is also what an uncaught Stop error does under -File (measured with a probe of that shape).
+# Exit codes 2-5 below keep their meaning: the app, its message window or Settings could not be found.
+$failures = 0
+function Failure([string]$what) { Write-Output "FAIL  $what"; $script:failures++ }
+trap { Write-Output "FAIL  a PowerShell error stopped the capture: $($_.Exception.Message) (line $($_.InvocationInfo.ScriptLineNumber))"; Write-Output "RESULT: FAIL=$($script:failures + 1)"; exit 1 }
+
+# The tab labels in bar order. The tab bar itself has no window text, but each page's heading reads
+# exactly its tab's label, so the page on screen is proven by which heading is visible - never by
+# counting key presses. Entering GPU Assignment refreshes that tab, and if a GPU change was left
+# unfinished it raises a notice this harness never answers.
+$TabLabels = @('Profiles', 'CPU Core Map', 'GPU Assignment', 'Setting')
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
 
 Add-Type -TypeDefinition @"
@@ -48,6 +68,19 @@ public class CDUi {
   [DllImport("user32.dll")] public static extern IntPtr SendMessageW(IntPtr h, uint m, IntPtr w, IntPtr l);
   [DllImport("user32.dll")] public static extern IntPtr SetFocus(IntPtr h);
   [DllImport("user32.dll")] public static extern bool PrintWindow(IntPtr h, IntPtr dc, uint flags);
+  [DllImport("user32.dll")] public static extern IntPtr GetParent(IntPtr h);
+
+  // The visible DIRECT Static children of `parent` whose text is one of `labels` - the page headings on screen.
+  public static string[] VisibleHeadings(IntPtr parent, string[] labels) {
+    var hits = new System.Collections.Generic.List<string>();
+    EnumChildWindows(parent, (h,l) => {
+      if (GetParent(h) != parent || !IsWindowVisible(h)) return true;
+      var c = new StringBuilder(256); GetClassNameW(h, c, 256);
+      if (!string.Equals(c.ToString(), "Static", StringComparison.OrdinalIgnoreCase)) return true;
+      var t = new StringBuilder(256); GetWindowTextW(h, t, 256);
+      if (Array.IndexOf(labels, t.ToString()) >= 0) hits.Add(t.ToString());
+      return true; }, IntPtr.Zero);
+    return hits.ToArray(); }
 
   public static IntPtr Find(uint pid, string cls) {
     IntPtr f = IntPtr.Zero;
@@ -87,16 +120,26 @@ public class CDUi {
 }
 "@ -Language CSharp -ReferencedAssemblies System.Drawing
 
-$app = Get-Process GameOptimizer -ErrorAction SilentlyContinue | Select-Object -First 1
-if (-not $app) { Write-Output "Game Optimizer is not running - start build\GameOptimizer.exe first"; exit 2 }
+$all = @(Get-Process GameOptimizer -ErrorAction SilentlyContinue)
+if ($all.Count -eq 0) { Write-Output "Game Optimizer is not running - start $ExePath first"; exit 2 }
+# THE PROCESS IS CHOSEN BY ITS PATH, NEVER "THE FIRST ONE" (adversarial review, v0.5.6): an installed v0.5.5 with three
+# tabs was running beside the build under test, and its captures would have carried this build's four tab labels.
+$want = [IO.Path]::GetFullPath($ExePath)
+$app = $all | Where-Object { $_.Path -and [string]::Equals([IO.Path]::GetFullPath($_.Path), $want, [StringComparison]::OrdinalIgnoreCase) } | Select-Object -First 1
+if (-not $app) {
+    Write-Output "no running Game Optimizer was started from $want - running instances:"
+    foreach ($p in $all) { Write-Output "  pid $($p.Id)  $(if ($p.Path) { "$($p.Path)  version $((Get-Item -LiteralPath $p.Path).VersionInfo.FileVersion)" } else { '<path not readable>' })" }
+    exit 5
+}
 $procId = [uint32]$app.Id
-Write-Output "app pid=$procId"
+Write-Output "app pid=$procId  path=$($app.Path)  version=$((Get-Item -LiteralPath $app.Path).VersionInfo.FileVersion)"
 
 # The first-run wizard, if it is up, is worth a capture of its own before we dismiss it.
 $wiz = [CDUi]::Find($procId, "GameOptimizerFirstRun")
 if ($wiz -ne [IntPtr]::Zero) {
     Write-Output "wizard: $([CDUi]::Info($wiz))"
     if ([CDUi]::Shot($wiz, (Join-Path $OutDir "$Tag-wizard.png"))) { Write-Output "captured $Tag-wizard.png" }
+    else { Failure "capture $Tag-wizard.png - PrintWindow produced no image" }
     [CDUi]::PostMessageW($wiz, 0x0010, [IntPtr]::Zero, [IntPtr]::Zero) | Out-Null   # WM_CLOSE
     Start-Sleep -Seconds 3
 } else { Write-Output "no wizard on screen (config already has firstRunDone)" }
@@ -111,28 +154,61 @@ $set = [CDUi]::Find($procId, "GameOptimizerSettings")
 if ($set -eq [IntPtr]::Zero) { Write-Output "Settings window did not open"; exit 4 }
 Write-Output "settings: $([CDUi]::Info($set))"
 
-if ([CDUi]::Shot($set, (Join-Path $OutDir "$Tag-1.png"))) { Write-Output "captured $Tag-1.png" }
+# Each capture is labelled by the ONE visible page heading, read from the window - never by its position in the walk.
+# A Settings window that was already open keeps the tab it was on, so a positional label could be wrong from the start.
+function PageLabel([IntPtr]$window) {
+    $hits = @([CDUi]::VisibleHeadings($window, [string[]]$TabLabels))
+    if ($hits.Count -eq 1) { return $hits[0] }
+    return "UNKNOWN - $($hits.Count) page headings visible"
+}
+# Captures Settings as $name, and counts a capture PrintWindow refused, a page no single heading names, or - when $want is
+# given - any page but $want as a failure. THE PAGE A KEY PRESS REACHED IS CHECKED, NOT ONLY NAMED (fix round, v0.5.6): a
+# tab bar that ignored WM_KEYDOWN gave four captures of one page, each labelled correctly, and the run exited 0.
+function CapturePage([string]$name, [string]$want) {
+    if (-not [CDUi]::Shot($set, (Join-Path $OutDir $name))) { Failure "capture $name - PrintWindow produced no image"; return }
+    $label = PageLabel $set
+    if ($label.StartsWith('UNKNOWN')) { Failure "capture $name - $label" }
+    elseif ($want -and $label -cne $want) { Failure "capture $name shows '$label', expected '$want' - the page selector did not reach that page" }
+    else { Write-Output "captured $name ($label)" }
+}
 
 # Walk the page selector. The UI moved from a left rail to a top tab bar, so try the tab bar
 # first (RIGHT arrow) and fall back to the rail (DOWN arrow) - both notify their parent the
 # same way, and keeping both means this harness still works on either layout.
 $bar = [CDUi]::FindChild($set, "GameOptimizerTabBar")
-$key = 0x27   # VK_RIGHT
+$key = 0x27; $back = 0x25   # VK_RIGHT, VK_LEFT
 if ($bar -eq [IntPtr]::Zero) {
     $bar = [CDUi]::FindChild($set, "GameOptimizerNav")
-    $key = 0x28   # VK_DOWN
+    $key = 0x28; $back = 0x26   # VK_DOWN, VK_UP
     if ($bar -ne [IntPtr]::Zero) { Write-Output "using the left rail (GameOptimizerNav)" }
 } else { Write-Output "using the top tab bar (GameOptimizerTabBar)" }
 
+# Back to the first page before the first capture. The selector stops at both ends, so enough presses land there
+# from wherever it was.
+if ($bar -ne [IntPtr]::Zero) {
+    for ($i = 1; $i -lt [Math]::Max($Pages, $TabLabels.Count); $i++) {
+        [CDUi]::SetFocus($bar) | Out-Null
+        [CDUi]::SendMessageW($bar, 0x0100, [IntPtr]$back, [IntPtr]0) | Out-Null      # WM_KEYDOWN
+        Start-Sleep -Milliseconds 300
+    }
+    Start-Sleep -Milliseconds 500
+}
+
+# Without a selector nothing was rewound, so the first page is only named, not checked.
+CapturePage "$Tag-1.png" $(if ($bar -ne [IntPtr]::Zero) { $TabLabels[0] } else { '' })
+
 if ($bar -eq [IntPtr]::Zero) {
-    Write-Output "NO PAGE SELECTOR FOUND - only one page captured"
+    Failure "NO PAGE SELECTOR FOUND - only one page captured"
 } else {
     for ($i = 2; $i -le $Pages; $i++) {
         [CDUi]::SetFocus($bar) | Out-Null
         [CDUi]::SendMessageW($bar, 0x0100, [IntPtr]$key, [IntPtr]0) | Out-Null      # WM_KEYDOWN
         Start-Sleep -Milliseconds 800
-        if ([CDUi]::Shot($set, (Join-Path $OutDir "$Tag-$i.png"))) { Write-Output "captured $Tag-$i.png" }
+        # Past the last tab the bar stops, so the last label is the one expected again.
+        CapturePage "$Tag-$i.png" ($TabLabels[[Math]::Min($i, $TabLabels.Count) - 1])
     }
 }
 
 Write-Output "done - inspect the PNGs for ghosted controls, smeared text, clipped drawing or a blank core map"
+Write-Output "RESULT: FAIL=$failures"
+exit ([int]($failures -gt 0))

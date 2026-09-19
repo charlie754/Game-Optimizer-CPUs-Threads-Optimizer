@@ -45,7 +45,11 @@ Explicitly not aimed at: per-thread micro-placement, servers, or laptops on batt
 
 ## 3. Non-goals for v1
 
-- GPU affinity, NUMA placement, encoder/NVENC placement. Stated out of scope up front.
+- NUMA placement, encoder/NVENC placement, and thread-level GPU affinity. Stated out of scope
+  up front. v0.5.6 adds one narrower GPU feature: per-application GPU *preference* assignment,
+  written through Windows' own per-application setting, which picks the GPU an application
+  uses the next time it starts. It places no threads. See "GPU Assignment" in the
+  [README](../../README.md#gpu-assignment).
 - Priority classes, I/O priority, power plans. CPU Sets only.
 - Any call to `SetProcessAffinityMask`. Never called — a hard product rule, not a
   preference. Rationale in [architecture §4](02-architecture.md).

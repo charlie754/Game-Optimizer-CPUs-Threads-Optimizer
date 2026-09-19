@@ -89,7 +89,7 @@ struct EngineStatus {
 // each pid end up with? An empty mask name means "clear".
 //
 // Rules, in order:
-//   1. EVERY enabled specific profile whose `game` matches a live process is a CANDIDATE,
+//   1. EVERY enabled profile whose `game` matches a live process is a CANDIDATE,
 //      and the one that owns the FOREGROUND wins - see profile_select.h for the whole of
 //      that decision, including the three-second dwell that stops alt-tabbing from
 //      re-pinning the machine twice a second. If none matches, the result is empty and the

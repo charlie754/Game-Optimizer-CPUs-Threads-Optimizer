@@ -5,10 +5,7 @@
 //
 //   * ComputeDesired and BuildTooltip are PURE. No Win32, no globals, no I/O. They are the
 //     seam the unit tests drive with synthetic snapshots, which is the only way the
-//     precedence rules get covered without a running game. The All Games profile does NOT
-//     change that: its "is this a game?" answer arrives as DATA in Profile::game (a
-//     pipe-separated candidate list) that the WATCHER refreshes before each call - see
-//     Rule 1b and Engine::Impl::RefreshAllGamesSpec.
+//     precedence rules get covered without a running game.
 //   * The applier is NEVER called while the status mutex is held. OpenProcess on a busy
 //     machine can block for milliseconds; the UI thread reads status under that same mutex
 //     and must never be parked behind a syscall.
@@ -23,7 +20,6 @@
 #include "agent_transition.h"
 #include "applier.h"
 #include "apply_rules.h"
-#include "games.h"
 #include "procwatch.h"
 #include "util.h"
 
@@ -114,21 +110,20 @@ double QpcTicksPerMicro() {
 
 // The candidate executables a profile matches on.
 //
-// A normal profile has exactly one: Profile::game, verbatim (it may be a full path, and a
-// path is never split - '|' is illegal in a Windows filename, which is precisely why
-// config.h uses it as its list separator).
+// A profile has exactly one: Profile::game, verbatim. It may be a full path, and a path is
+// never split - '|' is illegal in a Windows filename, which is why config.h uses it as the
+// separator for its list-valued keys.
 //
-// An ALL GAMES profile (Profile::isAllGames) instead carries a PIPE-SEPARATED list of
-// candidate basenames in the same field. That is not a hack, it is the mechanism that keeps
-// ComputeDesired pure: see the long comment on Rule 1b below.
+// IT STILL RETURNS A VECTOR, AND THAT OUTLIVED ITS CAUSE ON PURPOSE. Until v0.5.4 an All
+// Games profile carried a PIPE-SEPARATED candidate list in this same field, which is why
+// this returns a list and why LowestLiveGamePid loops. The list is gone; the shape stays,
+// because both callers are correct as written and collapsing them to a single spec would be
+// a change with no behavioural benefit and a real chance of breaking the lowest-pid rule.
 std::vector<std::wstring> GameSpecs(const Profile& p) {
     std::vector<std::wstring> specs;
     if (p.game.empty()) return specs;
-    if (!p.isAllGames) {
-        specs.push_back(p.game);
-        return specs;
-    }
-    return Split(p.game, L'|');   // empties dropped
+    specs.push_back(p.game);
+    return specs;
 }
 
 // Lowest live, non-reserved pid matching ANY of the profile's candidates, or false when the
@@ -209,16 +204,12 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
     // config-file order - is exactly the defect this rule was rewritten to fix: on the
     // reference machine Palworld sits above Overwatch 2 in config.ini, so with both games
     // alive Palworld took the V-Cache mask no matter which one was on screen.
-    //
-    // All Games profiles are skipped here and considered only in Rule 1b, so a specific
-    // profile ALWAYS wins over All Games no matter where it sits in the vector.
     std::vector<SelectionCandidate> cands;
     std::vector<const Profile*> candProf;
     std::vector<DWORD> candPid;
     for (size_t i = 0; i < cfg.profiles.size(); ++i) {
         const Profile& p = cfg.profiles[i];
         if (!p.enabled) continue;
-        if (p.isAllGames) continue;
         if (p.game.empty()) continue;
         DWORD pid = 0;
         if (!LowestLiveGamePid(snap, p, pid)) continue;
@@ -230,43 +221,6 @@ std::map<DWORD, std::wstring> ComputeDesired(const ProcessSnapshot& snap,
         candPid.push_back(pid);
     }
 
-    // --- Rule 1b: ONLY if nothing above matched, the All Games profile. ------------------
-    //
-    // READ THIS BEFORE ASSUMING THIS FUNCTION GREW HIDDEN I/O. It did not, and it must not.
-    // ComputeDesired is still PURE: no Win32, no filesystem, no registry, no globals. It is
-    // the seam the unit tests drive with synthetic snapshots.
-    //
-    // "Does this process look like a game?" is inherently an I/O question - it needs the
-    // Steam/Epic/GOG/Xbox scan in games.h. So the answer ARRIVES AS DATA rather than being
-    // computed here: an All Games profile carries a PIPE-SEPARATED list of candidate
-    // executable basenames in its `game` field, and this function does nothing cleverer than
-    // match a live process against that list.
-    //
-    // The WATCHER fills that field in - Engine::Impl::RefreshAllGamesSpec, which may call
-    // Win32 - on its OWN COPY of the Config, immediately before every ComputeDesired call.
-    // The user's on-disk config never carries a generated list, and a test can simply set the
-    // field by hand.
-    //
-    // IT JOINS THE SAME CANDIDATE LIST rather than being chosen separately afterwards, and
-    // that is deliberate. It only ever joins an EMPTY list, so the precedence is unchanged -
-    // a specific profile still always wins. What it buys is that the selection state above
-    // stays honest across the boundary: when a specific game later starts, the incumbent
-    // named in `sel` is not in the new candidate list, so the specific profile takes over at
-    // once (Released) instead of having to serve a three-second dwell it never earned.
-    if (cands.empty()) {
-        const Profile* all = cfg.AllGamesProfile();
-        if (all && all->enabled && !all->game.empty()) {
-            DWORD pid = 0;
-            if (LowestLiveGamePid(snap, *all, pid)) {
-                SelectionCandidate c;
-                c.name = all->name;
-                c.ownsForeground = false;
-                cands.push_back(c);
-                candProf.push_back(all);
-                candPid.push_back(pid);
-            }
-        }
-    }
 
     // WHOSE WINDOW IS ON SCREEN. The foreground window is very often NOT the game process
     // itself - a launcher, a child window, an anti-cheat shim or a second executable the
@@ -683,14 +637,6 @@ struct Engine::Impl {
     // transition and not the state. Starts Never: the first probe of a run is itself news.
     AgentSeen lastAgentSeen = AgentSeen::Never;
 
-    // Known game executables, lowercased basenames, for the All Games profile. Refreshed
-    // lazily and only while an enabled All Games profile actually exists, because
-    // DiscoverGames() walks the filesystem and the registry and costs tens to hundreds of
-    // milliseconds. Tick-local state, so it is guarded by tickMu like everything else here.
-    std::set<std::wstring> knownGameExes;
-    ULONGLONG knownGamesAtMs = 0;
-    bool knownGamesLoaded = false;
-
     // Raised when an apply is rejected as an invalid CPU Set Id, and STICKY for the rest of
     // this run. Sticky on purpose: after the first rejection the pid is recorded blocked and
     // the mask name stops changing, so nothing re-applies and a per-tick flag would clear
@@ -719,76 +665,7 @@ struct Engine::Impl {
     // Returns the pids whose recovery record may now leave the journal: cleared, or gone.
     // A pid whose clear FAILED is not in the list and its record is KEPT - see Stop().
     std::vector<DWORD> ClearAllApplied();   // caller holds tickMu
-    void EnsureKnownGames();  // caller holds tickMu; MAY hit the filesystem and registry
-    void RefreshAllGamesSpec(Config& cfgCopy, const ProcessSnapshot& snap);
 };
-
-// Populate knownGameExes from games.h. Refreshed at most once every 10 minutes: a game
-// installed mid-session should eventually be recognised, but a full launcher scan on every
-// 250 ms tick would be absurd. Never called unless an enabled All Games profile exists.
-void Engine::Impl::EnsureKnownGames() {
-    const ULONGLONG kRefreshMs = 10ULL * 60ULL * 1000ULL;
-    const ULONGLONG now = GetTickCount64();
-    if (knownGamesLoaded && (now - knownGamesAtMs) < kRefreshMs) return;
-
-    std::set<std::wstring> exes;
-    const std::vector<GameEntry> discovered = DiscoverGames();
-    for (size_t i = 0; i < discovered.size(); ++i) {
-        if (discovered[i].exe.empty()) continue;
-        exes.insert(ToLower(discovered[i].exe));
-    }
-    // Bundled as well as discovered: a game launched from a shortcut with no launcher
-    // manifest still deserves to be recognised, and BundledGames() is a static list.
-    const std::vector<GameEntry>& bundled = BundledGames();
-    for (size_t i = 0; i < bundled.size(); ++i) {
-        if (bundled[i].exe.empty()) continue;
-        exes.insert(ToLower(bundled[i].exe));
-    }
-
-    knownGameExes.swap(exes);
-    knownGamesAtMs = now;
-    knownGamesLoaded = true;
-}
-
-// Rewrite the All Games profile's `game` field on the WATCHER'S OWN COPY of the config, from
-// the discovered game list intersected with what is actually running right now. See the long
-// comment on Rule 1b in ComputeDesired: this is the Win32 half, deliberately kept out of the
-// pure function.
-//
-// Only LIVE, non-excluded, known-game basenames go into the list, so the field stays a
-// handful of entries rather than the whole catalogue, and ComputeDesired's per-candidate
-// FindBySpec sweep stays cheap.
-void Engine::Impl::RefreshAllGamesSpec(Config& cfgCopy, const ProcessSnapshot& snap) {
-    Profile* all = nullptr;
-    for (size_t i = 0; i < cfgCopy.profiles.size(); ++i) {
-        if (cfgCopy.profiles[i].isAllGames) { all = &cfgCopy.profiles[i]; break; }
-    }
-    if (!all) return;
-
-    // Whatever was on disk in this field is generated data, never a user's typing. Clearing
-    // first means a disabled All Games profile can never match on a stale list.
-    all->game.clear();
-    if (!all->enabled) return;
-
-    EnsureKnownGames();
-    if (knownGameExes.empty()) return;
-
-    std::vector<std::wstring> live;
-    std::set<std::wstring> seen;
-    const std::map<DWORD, ProcInfo>& procs = snap.All();
-    for (std::map<DWORD, ProcInfo>::const_iterator it = procs.begin(); it != procs.end(); ++it) {
-        if (IsReservedPid(it->first)) continue;
-        const std::wstring& name = it->second.name;
-        if (name.empty()) continue;
-        const std::wstring lower = ToLower(name);
-        if (seen.find(lower) != seen.end()) continue;
-        if (knownGameExes.find(lower) == knownGameExes.end()) continue;
-        if (cfgCopy.IsExcluded(name)) continue;
-        seen.insert(lower);
-        live.push_back(name);
-    }
-    all->game = Join(live, L'|');
-}
 
 // Clears every mask we believe we applied. The journal is rewritten ONCE by the caller with
 // the pids this returns, so no per-pid JournalRemove here - that would rewrite the file once
@@ -912,13 +789,11 @@ int Engine::Impl::Tick() {
         sticky.clear();
         selection = ProfileSelection();
     } else {
-        // The Win32 half of the All Games rule, done HERE and not inside ComputeDesired, so
-        // the decision function stays pure and unit-testable. No-op unless an enabled All
-        // Games profile exists.
-        RefreshAllGamesSpec(cfgCopy, fresh);
-        // GetCurrentProcessId is the other impure half, for the same reason and by the same
-        // route: rule 4 must not pin the app's own sponsor-panel browser subtree, and the
-        // pure function is told which pid is ours rather than asking Win32 itself.
+        // GetCurrentProcessId is the ONE impure input ComputeDesired needs, and it is passed
+        // in rather than asked for: rule 4 must not pin the app's own sponsor-panel browser
+        // subtree, and the pure function is told which pid is ours instead of calling Win32.
+        // Until v0.5.4 a second impure half sat here, refreshing the All Games candidate list
+        // on the watcher's own config copy; it went with the feature.
         desired = ComputeDesired(fresh, cfgCopy, GetForegroundPid(), sticky, &matched,
                                  GetCurrentProcessId(), &autoPinned, &extremeSwept,
                                  &selection);
@@ -1259,10 +1134,12 @@ int Engine::Impl::Tick() {
         st.profileName = matched->name;
         st.gameMaskName = matched->gameMask;
         st.heavyMaskName = matched->heavyMask;
-        // Same matcher ComputeDesired used, so an All Games profile - whose `game` is a
-        // pipe-separated candidate list, not a single spec - reports the same game pid the
-        // masks were actually built around. A raw FindBySpec(matched->game) would match
-        // nothing at all for that profile and silently report gamePid 0.
+        // THE SAME MATCHER ComputeDesired USED, deliberately, and not a raw FindBySpec. This
+        // one skips reserved pids and takes the LOWEST match, so the pid reported here is the
+        // pid the masks were actually built around rather than a second opinion that can
+        // disagree with the first. Its original reason - that an All Games profile carried a
+        // pipe-separated list a raw lookup could not match at all - went in v0.5.4; this one
+        // did not.
         DWORD pid = 0;
         if (LowestLiveGamePid(fresh, *matched, pid)) st.gamePid = pid;
     }

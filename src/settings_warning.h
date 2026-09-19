@@ -133,9 +133,26 @@ inline std::wstring AutoPinInfoTipText() {
 // warning row on this same page already reports when the optimizer is running, which is the
 // thing that parks the mask; the deleted text and the deleted line were both saying that a
 // second and a third time, in another voice.
+//
+// THE GPU SENTENCE LIVES HERE AND NOWHERE ELSE ON THE PAGE - operator instruction, 2026-09-12:
+// "statement remain in circle i". The sentence that points at GPU assignment is hover text on
+// this same (i), not a line on the card.
+//
+// v0.5.6: IT NAMES THE TAB, NOT A BUTTON, AND IT GIVES NO DIRECTION. The button it used to name
+// was renamed "Optimize assignment of GPUs" and moved beside Auto-pin - ABOVE this check box -
+// and the window that button opened became the GPU Assignment tab, so the old sentence's button
+// name and its "below" were both false. A tab name survives the next layout change; a direction
+// word does not. "Another GPU" rather than "a second GPU": the tab now offers the main GPU as a
+// target too.
+//
+// IT CARRIES NO COUNT, AND IT CANNOT. SettingsWindow registers this string ONCE, as a
+// process-lifetime static, because a tooltip keeps the pointer it is handed. A live "3 apps
+// can be moved" would need that storage to change under the tooltip. The number lives on the
+// GPU Assignment tab, where the user is looking when they care about it.
 inline std::wstring ExtremeModeInfoTipText() {
     return L"Not only the busy ones and not only the ones you named - everything except the "
-           L"game and the exclusion list.";
+           L"game and the exclusion list. Background apps can also be moved to another GPU "
+           L"on the GPU Assignment tab.";
 }
 
 // ---- "the AMD optimizer is running right now" -------------------------------------------

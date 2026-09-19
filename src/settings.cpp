@@ -28,12 +28,14 @@
 #include "applier.h"
 #include "config.h"
 #include "engine.h"
+#include "gpuwindow.h"
 #include "irq_policy.h"
 #include "mask_edit.h"
 #include "procwatch.h"
 #include "settings_environment.h"
 #include "settings_heavy_order.h"
 #include "settings_merge.h"
+#include "settings_pages.h"
 #include "settings_warning.h"
 #include "sponsor.h"
 #include "theme.h"
@@ -855,13 +857,20 @@ enum : int {
 // are what WM_COMMAND dispatches on.
 //
 // IDC_NAV_RULES IS GONE. The Rules page no longer exists - the auto-pin rule is per-profile
-// and now lives on the Profiles page - and these three ids must stay contiguous and in page
+// and now lives on the Profiles page - and these ids must stay contiguous and in page
 // order, so the dead id could not simply be left in the middle.
+//
+// IDC_NAV_GPU IS INSERTED BEFORE IDC_NAV_GENERAL, NOT APPENDED AFTER IT (v0.5.6), and
+// IDC_NAV_GENERAL moved from 1403 to 1404 to make room. Every IDC_NAV range test in WM_COMMAND
+// ends at IDC_NAV_GENERAL, so keeping it LAST widens them all by itself; appended after it, the
+// GPU Assignment tab would sit outside every range and silently do nothing. No file other than
+// this one names these ids. The static_assert under the PAGE enum holds the order in place.
 enum : int {
     IDC_NAV = 1400,
     IDC_NAV_PROFILES,     // page ids must stay contiguous and in page order
     IDC_NAV_COREMAP,
-    IDC_NAV_GENERAL
+    IDC_NAV_GPU,
+    IDC_NAV_GENERAL       // LAST: the range tests in WM_COMMAND end here
 };
 
 // Controls added this round. A separate block so nothing above it can shift.
@@ -907,7 +916,36 @@ enum : int { IDC_AUTOINFO = 1901, IDC_EXTREMEINFO = 1902 };
 // it by id rather than by walking the children and guessing from their text.
 enum : int { IDC_EXTREME_STATUS = 1903 };
 
-enum : int { PAGE_PROFILES = 0, PAGE_COREMAP, PAGE_GENERAL, PAGE_COUNT };
+// The "Optimize assignment of GPUs" button, beside Auto-pin on the Profiles page. Same block,
+// next value, above every id WM_COMMAND already dispatches on, so nothing existing shifts.
+// THE IDENTIFIER STILL SAYS ISOLATE_GPU, and hIsolateGpu keeps its name, for the same reason
+// IDC_NAV_GENERAL kept its name under "Setting": v0.5.6 renamed and moved the button on screen
+// (operator request) and no user ever reads an id. It switches to the GPU Assignment tab rather
+// than growing this card, because what that tab shows is a list of every running application
+// and this card has no room for one.
+enum : int { IDC_ISOLATE_GPU = 1904 };
+
+// The GPU Assignment tab's content: ONE child window (gpuwindow.cpp, CreateGpuPanel) holding
+// every control of that tab, not a set of controls of this window. Its own id, next value in the
+// same block, so the panel's Cancel notification (GPUN_CANCEL) cannot be mistaken for anything
+// else WM_COMMAND receives. The PAGE is IDC_NAV_GPU / PAGE_GPU; this is only the control.
+enum : int { IDC_GPU_PANEL = 1905 };
+
+enum : int { PAGE_PROFILES = 0, PAGE_COREMAP, PAGE_GPU, PAGE_GENERAL, PAGE_COUNT };
+
+// settings.cpp is not in the unit-test build, so a compile-time check is the only thing that can
+// fail when the tab ids, the pages and the labels drift apart. The IDC_NAV_GENERAL / PAGE_COUNT
+// clause is the one a plain reorder check would miss: a new page appended after GENERAL in BOTH
+// enums keeps every "id - IDC_NAV_PROFILES == page" true while every IDC_NAV range test in
+// WM_COMMAND excludes the new id.
+static_assert(PAGE_COUNT == 4 &&
+                  IDC_NAV_COREMAP - IDC_NAV_PROFILES == PAGE_COREMAP &&
+                  IDC_NAV_GPU - IDC_NAV_PROFILES == PAGE_GPU &&
+                  IDC_NAV_GENERAL - IDC_NAV_PROFILES == PAGE_GENERAL &&
+                  IDC_NAV_GENERAL - IDC_NAV_PROFILES == PAGE_COUNT - 1,
+              "IDC_NAV_* and PAGE_* must stay contiguous, in the same order, with GENERAL last");
+static_assert(ARRAYSIZE(kSettingsPageLabels) == PAGE_COUNT,
+              "settings_pages.h must hold exactly one label per page");
 
 const wchar_t kSettingsClass[] = L"GameOptimizerSettings";
 const UINT_PTR kStatusTimer = 1;
@@ -1002,8 +1040,11 @@ struct SettingsState {
     // window rather than the left rail. Operator decision: menu on top, no side panel. The
     // contract is identical apart from the notification code, so nothing else here changed.
     HWND hNav = nullptr;
-    HWND hNavBtn[PAGE_COUNT] = { nullptr, nullptr, nullptr };
+    HWND hNavBtn[PAGE_COUNT] = { nullptr, nullptr, nullptr, nullptr };
     int  page = PAGE_PROFILES;
+    // The page the user was on when the GPU Assignment tab was entered, so that tab's own Cancel
+    // can hand them back to it (chair's call, v0.5.6). Set by SwitchPage on the way in only.
+    int  pageBeforeGpu = PAGE_PROFILES;
 
     // ---- Profile list ordering and filtering --------------------------------
     // One entry per VISIBLE listbox row, holding the index into work.profiles. The list is
@@ -1164,6 +1205,11 @@ struct SettingsState {
     // It takes height only while it has something to say, exactly as hVCacheActive does, so a
     // profile with extreme mode off never pays a blank row for it.
     HWND hExtremeStatus = nullptr;
+    // "OPTIMIZE ASSIGNMENT OF GPUs", on the auto-pin row. The only control the GPU feature puts on
+    // this page - it switches to the GPU Assignment tab, and the sentence that points there is
+    // hover text on hExtremeInfo, by operator instruction. The field keeps its pre-v0.5.6 name;
+    // see IDC_ISOLATE_GPU.
+    HWND hIsolateGpu = nullptr;
     // ONE tooltip control for the whole window, shared by both icons. Created in WM_CREATE,
     // owned by the settings window, so it is destroyed with it. TTF_SUBCLASS makes each icon
     // relay its own mouse messages: no timer, no polling, no per-frame cost.
@@ -1179,6 +1225,11 @@ struct SettingsState {
     // Stand-in shown in the core map's slot when the control could not be created. Exactly
     // one of hMap / hMapFail is ever non-null, and they occupy the same rectangle.
     HWND hMapFail = nullptr;
+    // The GPU Assignment tab: its heading, and ONE child panel (gpuwindow.cpp) that owns every
+    // other control of that tab and lays them out itself. hGpuPanel is null if the panel could not
+    // be created; hGpuFail then says so in the panel's rectangle, exactly as hMapFail does for the
+    // core map - exactly one of the two is ever non-null.
+    HWND hGpuHdr = nullptr, hGpuPanel = nullptr, hGpuFail = nullptr;
     HWND hGenHdr = nullptr, hStartup = nullptr, hNotify = nullptr;
     // The checkbox carries no description paragraph - the operator removed it. Its caption
     // says what it does; the removed text repeated that and added driver detail that misled.
@@ -1562,7 +1613,16 @@ LRESULT CALLBACK SettingsMsgHook(int code, WPARAM wp, LPARAM lp) {
         MSG* m = reinterpret_cast<MSG*>(lp);
         if (m->message >= WM_KEYFIRST && m->message <= WM_KEYLAST &&
             (m->hwnd == g_hSettings || IsChild(g_hSettings, m->hwnd))) {
-            if (IsDialogMessageW(g_hSettings, m)) {
+            // 🔴 THE GPU ASSIGNMENT PANEL IS ASKED FIRST, FOR ENTER AND ESC. Nothing in the panel claims either
+            // key, so IsDialogMessageW turns them into this window's IDOK and IDCANCEL - [M] a probe of this exact
+            // shape (a WS_EX_CONTROLPARENT panel pumped through IsDialogMessageW of its parent) delivered id 1 for
+            // Enter on the list and on an owner-draw button, and id 2 for Esc on the list and the closed picker.
+            // Here IDOK saves config.ini and closes Settings, and IDCANCEL closes it; v0.5.5's own window did
+            // nothing on Enter and closed only itself on Esc. Worse, [M] Esc in the read-only multiline path box
+            // made the edit post WM_CLOSE to the panel, which destroyed it (the tab stays empty until Settings is
+            // reopened). The panel answers both keys as its own Cancel and its focused button. It also takes Tab while
+            // focus is in that path box, where [M] IsDialogMessageW hands Tab to the edit and focus never leaves it.
+            if (GpuPanelKey(GetDlgItem(g_hSettings, IDC_GPU_PANEL), *m) || IsDialogMessageW(g_hSettings, m)) {
                 m->message = WM_NULL;
                 m->wParam = 0;
                 m->lParam = 0;
@@ -2049,7 +2109,13 @@ double AutoPinThreshold(const SettingsState* st) {
     if (st->selProfile >= 0 && st->selProfile < static_cast<int>(st->work.profiles.size()))
         return static_cast<double>(
             st->work.profiles[static_cast<size_t>(st->selProfile)].autoPinPercent);
-    return 8.0;
+    // THE MODEL DEFAULT, ASKED FOR RATHER THAN RESTATED. This is the last resort - nothing
+    // typed in the box AND no profile selected - and it used to read a literal 8.0, which
+    // was a second copy of Profile::autoPinPercent. When that default moved from 8 to 3,
+    // this line would have gone on marking the meter at the OLD threshold, silently,
+    // because nothing here said the two numbers were one fact. Two representations of one
+    // fact drift, so ask the struct.
+    return static_cast<double>(Profile().autoPinPercent);
 }
 
 // One snapshot per timer tick. The FIRST one has no predecessor, so every cpuPercent in it is
@@ -2099,11 +2165,6 @@ double CpuForExe(const SettingsState* st, const std::wstring& exe, bool& running
 // INTENT, and this app has measured Windows accepting an assignment and then ignoring it, and
 // has measured other software holding CPU Set assignments it did not make. A row that showed
 // intent would be right exactly when nobody needed to look at it.
-
-// Defined further down with the rest of the auto-pin state; declared here because an All
-// Games profile names no executable, and the only honest target it can have is the game the
-// engine actually matched - which is worth reporting only while that match is THIS profile.
-bool StatusDescribesProfile(const EngineStatus& s, const Profile& p);
 
 // How many instances of one list entry are read back per tick.
 //
@@ -2182,7 +2243,6 @@ bool RefreshCpuSetStages(SettingsState* st) {
                      st->selProfile < static_cast<int>(st->work.profiles.size());
     if (!has) return was != st->targetStageText;
 
-    const Profile& p = st->work.profiles[static_cast<size_t>(st->selProfile)];
     std::vector<DWORD> gamePids;
     const std::wstring game = Trim(GetText(st->hGame));
     if (!game.empty()) {
@@ -2192,19 +2252,13 @@ bool RefreshCpuSetStages(SettingsState* st) {
         // The GAME ONLY. Its descendants carry the game mask too, but this row is captioned
         // "Game:" and reporting a family under that caption would be answering a question
         // nobody asked with a value that can legitimately differ.
-        gamePids = st->cpuSnap.FindBySpec(game);
-    } else if (p.isAllGames && st->engine) {
-        // An All Games profile names no executable, so the only target it HAS is the one the
-        // engine matched - and only while that match is this profile's doing, or the row
-        // would describe a game some other profile is governing.
         //
-        // This pid comes from the ENGINE's snapshot, not ours, so it is looked up in ours
-        // below to pick up a creation time we recorded ourselves. A game that started in the
-        // few milliseconds between the two snapshots is not in ours yet and waits for the
-        // next tick, which is a beat of "-" rather than a mask read off a pid nothing here
-        // can vouch for.
-        const EngineStatus s = st->engine->GetStatus();
-        if (s.gamePid != 0 && StatusDescribesProfile(s, p)) gamePids.push_back(s.gamePid);
+        // AND THERE IS NO ELSE BRANCH ANY MORE. Until v0.5.4 an All Games profile named no
+        // executable at all, so this asked the engine which game it had matched. Every
+        // profile now names its own game, so an empty field means there is genuinely no
+        // target to read a stage off, and the row correctly stays "-". The `p` binding this
+        // function used to take went with that branch - it had no other reader.
+        gamePids = st->cpuSnap.FindBySpec(game);
     }
     st->targetStage = ReadCpuSetStage(ObservedFromSnapshot(st->cpuSnap, gamePids),
                                       masks, kStageProbePerEntry);
@@ -2256,11 +2310,11 @@ bool GameOwnsForeground(const EngineStatus& s) {
     return false;
 }
 
-// The exe this profile's rule waits on, for the sentence. An All Games profile carries a
-// pipe-separated candidate list rather than one executable, so it is described rather than
-// quoted - printing that list would be worse than useless.
+// The exe this profile's rule waits on, for the sentence. A profile that names no game has
+// nothing to wait on, and "the game" is the honest placeholder - the status line above
+// already says in as many words that the rule can never match. Until v0.5.4 there was a
+// third answer, "a detected game", for the All Games profile; nothing can produce it now.
 std::wstring AutoPinGameLabel(const Profile& p) {
-    if (p.isAllGames) return L"a detected game";
     const std::wstring g = BaseName(Trim(p.game));
     return g.empty() ? std::wstring(L"the game") : g;
 }
@@ -2477,7 +2531,7 @@ bool RefreshAutoPinStatus(SettingsState* st) {
         } else if (!IsChecked(st->hEnabled)) {
             want = AutoPinState::Waiting;
             line = L"Waiting - this profile is turned off, so the rule never runs.";
-        } else if (!p.isAllGames && Trim(p.game).empty()) {
+        } else if (Trim(p.game).empty()) {
             want = AutoPinState::Waiting;
             line = L"Waiting - no game executable is set for this profile, so the rule can "
                    L"never match anything.";
@@ -3456,8 +3510,13 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
     Put(st->hNav, 0, 0, cw, TABH);
     if (!st->hNav) {
         // Fallback switcher, used only when the bar class could not be created. Without it
-        // two of the three pages would be unreachable. Laid out horizontally so the fallback
+        // three of the four pages would be unreachable. Laid out horizontally so the fallback
         // occupies the same strip the bar would have.
+        //
+        // Dp(120) STILL FITS THE LONGEST LABEL. [M] v0.5.6, GetTextExtentPoint32W on Font::UiBody:
+        // "GPU Assignment" is 88 px at 96 dpi (89 in the Segoe UI fallback) against a 100 px text
+        // rect (120 less DrawButton's Dp(10) a side), and 109/133/177 px at 120/144/192 dpi
+        // against 124/150/200. Four buttons need 510 px of the 880 minimum at 96 dpi.
         int bx = GAP;
         const int fbw = theme::Dp(120, dpi);
         for (int i = 0; i < PAGE_COUNT; ++i) {
@@ -3793,6 +3852,10 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
                                // deleted, so neither reserves a row here any more - but the
                                // SWEEP READOUT below the box does, while it is up.
                                GT + ROW +
+                               // NO ROW FOR THE GPU BUTTON ANY MORE. v0.5.6 moved it onto the
+                               // auto-pin row, which is already counted above, and its own
+                               // GT + ROW went in the same edit - a reservation left here with
+                               // nothing placed in it is a blank band that no test can see.
                                (showExtremeRow ? GT + extremeStatusH : 0);
             int heavyH = minHeavy;
             int slack = bottom - ry - fixedR - minHeavy -
@@ -3878,12 +3941,40 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
                 // words, which is the behaviour a user expects from a check box and not a
                 // regression: clicking 200 px of empty card to the right of a label and
                 // having a setting change is the surprising version.
+                //
+                // "OPTIMIZE ASSIGNMENT OF GPUs" SHARES THIS ROW, one GT to the right of the (i) -
+                // operator request, v0.5.6. The (i) stays exactly where the caption ends; the
+                // button is what gives. It is sized to its own caption plus DrawButton's Dp(10)
+                // padding a side and a Dp(8) margin, and the check box is capped so it can never
+                // run under the button. [M] v0.5.6, GetTextExtentPoint32W on Font::UiBody at the
+                // MINIMUM client width Dp(880), where iw is 487 / 609 / 731 / 974 px:
+                //   dpi   box+caption  (i) ends  button  button ends  spare
+                //    96        222         240     183         429       58
+                //   120        276         299     232         539       70
+                //   144        336         363     279         651       80
+                //   192        446         482     373         867      107
+                // (captions 197/244/298/396 and 155/196/237/317 px; the Segoe UI fallback face
+                // measures the button caption 2 px wider at 96 dpi and the same elsewhere.) The
+                // cap is never reached at any of those sizes: 280 / 346 / 416 / 553.
                 const int side = InfoIconSide(dpi);
                 const int lead = theme::Dp(4, dpi);
-                const int capW =
-                    CheckBoxContentWidth(st->hAutoPin, measureDc, dpi, iw - side - lead);
+                // MEASURED ONLY WHEN THERE IS A DC. theme::MeasureText returns {0,0} without one,
+                // which would size the button to its padding and ellipsize the whole caption.
+                // Dp(190) is the 96 dpi need plus a margin; with it the check box takes the rest
+                // of the row and the button ends flush with the card's inner edge.
+                const int btnW =
+                    measureDc
+                        ? static_cast<int>(theme::MeasureText(measureDc, GetText(st->hIsolateGpu),
+                                                              theme::Font::UiBody, dpi).cx) +
+                              2 * theme::Dp(10, dpi) + theme::Dp(8, dpi)
+                        : theme::Dp(190, dpi);
+                const int capW = CheckBoxContentWidth(st->hAutoPin, measureDc, dpi,
+                                                      iw - side - lead - GT - btnW);
                 Put(st->hAutoPin, ix, iy, capW, ROW);
                 Put(st->hAutoInfo, ix + capW + lead, iy + (ROW - side) / 2, side, side);
+                // NOT part of the auto-pin group: SyncAutoPinEnable never greys it, because it
+                // does not depend on the rule beside it.
+                Put(st->hIsolateGpu, ix + capW + lead + side + GT, iy, btnW, ROW);
             }
             iy += ROW + GT;
             const int indent = theme::Dp(20, dpi);
@@ -4120,7 +4211,35 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hMap, ix, iy, iw, mapH);
         Put(st->hMapFail, ix, iy, iw, mapH);   // only ever one of the two exists
         y = c.bottom + GAP;
-    } else {
+    } else if (st->page == PAGE_GPU) {
+        // ONE CARD from the top of the page down to `bottom`: the heading at its top, and the GPU
+        // Assignment panel filling the rest, inset by the card padding. The panel is one child
+        // window that lays out its own controls (gpuwindow.cpp), so this branch sizes a
+        // rectangle and nothing else - 1 of 8 cards, 0 of 28 text items.
+        //
+        // THE HEADING IS INSIDE THE CARD, exactly as on the CPU Core Map and Setting pages, and that
+        // is not styling: every STATIC here erases to cardBg (WM_CTLCOLORSTATIC), so a heading
+        // on the bare window background would paint a card-coloured box around its own text.
+        //
+        // BOTH WINDOW SIZERS WERE CHECKED FOR THIS PAGE AND NEITHER CHANGED. The panel takes
+        // whatever height the page offers, and the smallest offer is the Setting page's floor:
+        // WM_GETMINMAXINFO records about 750 px of Setting content clearing its minimum by about
+        // 14 px at 96 dpi, which leaves this panel roughly 824 x 700 px - above the Dp(760) x
+        // Dp(460) minimum the old separate window enforced on ITSELF, frame included. That height
+        // is derived from those recorded figures, not measured on screen.
+        const int iw = W - 2 * PAD;
+        int panelH = bottom - y - (2 * PAD + HH + GT);
+        if (panelH < 0) panelH = 0;
+        RECT c = AddCard(y, 2 * PAD + HH + GT + panelH, x0, W);
+        const int ix = c.left + PAD, iy = c.top + PAD;
+        Put(st->hGpuHdr, ix, iy, iw, HH);
+        Put(st->hGpuPanel, ix, iy + HH + GT, iw, panelH);
+        Put(st->hGpuFail, ix, iy + HH + GT, iw, panelH);   // only ever one of the two exists
+        y = c.bottom + GAP;
+    } else if (st->page == PAGE_GENERAL) {
+        // EXPLICIT, NOT A BARE else. A bare else handed ANY page without its own branch the
+        // Setting page's cards and headings - which is exactly what the GPU Assignment tab would
+        // have shown before its branch above existed, with none of those cards' controls visible.
         int iw = W - 2 * PAD;
         // The startup warning preference is independent of stopping the optimizer, so it
         // gets its own row. Reserve that row in the card too, or the poll field spills out.
@@ -4304,7 +4423,7 @@ void OverdrawSearchChrome(SettingsState* st, HWND hwnd) {
 // The two owner-drawn list boxes
 //
 // Both are drawn here rather than by theme::DrawListBoxItem because both carry more than a
-// string: the profile list carries the All Games tag and the recently-used divider, and the
+// string: the profile list carries the governing tag and the recently-used divider, and the
 // heavy list carries a live CPU meter. The generic helper still handles every other list.
 // ---------------------------------------------------------------------------
 
@@ -4358,17 +4477,18 @@ BOOL DrawProfileItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
     // profile to look at it. This tag is what keeps the answer visible in that state, and it
     // is the reason the follow can be suppressed without the feature disappearing.
     //
-    // DRAWN FIRST, so it takes the rightmost slot and the ALL tag - which a governing All
-    // Games profile also carries - sits to its left rather than fighting it for the same
-    // pixels. `good` rather than `accent`: accent is this window's "selected / chosen by the
-    // app" colour and would read as a second selection bar on a row that may not be selected
-    // at all.
+    // DRAWN FIRST, and since v0.5.4 it is the ONLY pill on this row: the ALL tag that used
+    // to sit beside it went with the All Games profile. It still takes the rightmost slot
+    // and still advances `t.right`, so a pill added later lands to its left rather than
+    // fighting it for the same pixels. `good` rather than `accent`: accent is this window's
+    // "selected / chosen by the app" colour and would read as a second selection bar on a
+    // row that may not be selected at all.
     if (p && st->governingProfile >= 0 &&
         data == static_cast<LRESULT>(st->governingProfile)) {
-        // MEASURED, NOT A CONSTANT. [M] Dp(40) - one more than the ALL tag beside it - drew
-        // "NO..." on the reference machine: "NOW" is a wider word than "ALL" in this face and
-        // a fixed width cannot know that. The AUTO pill in the heavy list already measures;
-        // this is the same expression, so the two tags cannot drift into different sizes.
+        // MEASURED, NOT A CONSTANT. [M] A fixed Dp(40) drew "NO..." on the reference machine:
+        // "NOW" is a wider word than the three-letter tag that width was copied from, and a
+        // constant cannot know that. The AUTO pill in the heavy list already measures; this
+        // is the same expression, so the two tags cannot drift into different sizes.
         // DrawPill consumes Dp(8) per side, and Dp(20) covers that Dp(16) plus slack.
         const int pw =
             theme::MeasureText(di->hDC, L"NOW", theme::Font::UiSmall, dpi).cx +
@@ -4383,19 +4503,6 @@ BOOL DrawProfileItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
         }
     }
 
-    // The All Games profile matches ANY game rather than one executable, so it must not read
-    // as just another row in the list. A small accent tag on the right says so at a glance.
-    if (p && p->isAllGames) {
-        const int pw = theme::Dp(36, dpi);
-        const int ph = theme::Dp(15, dpi);
-        const int mid = (di->rcItem.top + di->rcItem.bottom) / 2;
-        RECT pill;
-        SetRect(&pill, t.right - pw, mid - ph / 2, t.right, mid - ph / 2 + ph);
-        if (pill.left > t.left) {
-            theme::DrawPill(di->hDC, pill, L"ALL", dpi, pal.accent, pal.textOnAccent);
-            t.right = pill.left - theme::Dp(6, dpi);
-        }
-    }
 
     if (p && t.right > t.left) {
         const std::wstring label = (p->enabled ? L"[x] " : L"[ ] ") + p->name;
@@ -4547,8 +4654,8 @@ BOOL DrawHeavyItem(SettingsState* st, const DRAWITEMSTRUCT* di) {
     // WHICH KIND OF ROW IS THIS. The two are the same shape and carry the same three columns,
     // so without a mark the user cannot tell an entry they chose from one the app chose - and
     // the whole point of showing the second kind is that they are different things. An accent
-    // pill is this window's existing idiom for exactly that: the profile list marks its All
-    // Games row the same way, in the same place, in the same colours.
+    // pill is this window's existing idiom for exactly that: the profile list marks the
+    // profile the engine is governing the same way, in the same place, with the same sizing.
     //
     // Anchored to the RIGHT edge of the name column, which is a fixed x for every row, so the
     // pills line up in a column and the names stay left-aligned. A leading badge would have
@@ -4835,7 +4942,8 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
                         st->hHeavyMaskLbl, st->hHeavyMask, st->hHeavyMaskWarn,
                         st->hAutoPin, st->hAutoInfo, st->hPctLbl, st->hPct,
                         st->hAutoStatus, st->hVCacheActive,
-                        st->hExtreme, st->hExtremeInfo, st->hExtremeStatus };
+                        st->hExtreme, st->hExtremeInfo, st->hExtremeStatus,
+                        st->hIsolateGpu };
     HWND coremap[]  = { st->hMapHdr, st->hTopoText, st->hMapMaskLbl, st->hMapMask,
                         st->hMapReset, st->hMapAdd, st->hMapRemove, st->hMap, st->hMapFail };
     HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify,
@@ -4844,13 +4952,21 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
                         st->hVCacheEffect,
                         st->hBlocked, st->hInspect,
                         st->hIrqLine, st->hIrqOpen };
+    // The panel is ONE window: showing or hiding it shows or hides every control of the tab. hGpuFail
+    // stands in for it when it could not be created; at most one of the two exists.
+    HWND gpu[]      = { st->hGpuHdr, st->hGpuPanel, st->hGpuFail };
 
     const HWND* src = nullptr;
     int count = 0;
     switch (page) {
         case PAGE_PROFILES: src = profiles; count = ARRAYSIZE(profiles); break;
         case PAGE_COREMAP:  src = coremap;  count = ARRAYSIZE(coremap);  break;
-        default:            src = general;  count = ARRAYSIZE(general);  break;
+        case PAGE_GPU:      src = gpu;      count = ARRAYSIZE(gpu);      break;
+        case PAGE_GENERAL:  src = general;  count = ARRAYSIZE(general);  break;
+        // NOTHING, never the Setting list. That list used to be the default, so a page without
+        // its own case was shown the Setting controls and then had them hidden again by the
+        // PAGE_GENERAL pass - a blank page with a flicker, and no error anywhere.
+        default:            return;
     }
     for (int i = 0; i < count; ++i)
         if (src[i]) out[n++] = src[i];
@@ -4890,11 +5006,16 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
     HFONT mono = theme::GetFont(theme::Font::MonoBody, dpi);
     HFONT monoSmall = theme::GetFont(theme::Font::MonoSmall, dpi);
 
+    // EnumChildWindows RECURSES, so this also reaches every control inside the GPU Assignment
+    // panel. That is harmless and was checked: it hands them Font::UiBody at this window's dpi,
+    // which is the same cached handle the panel gives its own controls (gpuwindow.cpp, st->font).
     FontApply fa;
     fa.f = body;
     EnumChildWindows(hwnd, ApplyFontProc, reinterpret_cast<LPARAM>(&fa));
 
-    HWND heads[] = { st->hProfHdr, st->hEditHdr, st->hMapHdr, st->hGenHdr };
+    // hGpuHdr is in this list AND in WM_CTLCOLORSTATIC's heading list. Either one alone gives
+    // the tab a heading in the wrong font or the wrong colour.
+    HWND heads[] = { st->hProfHdr, st->hEditHdr, st->hMapHdr, st->hGpuHdr, st->hGenHdr };
     for (HWND h : heads)
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(head), TRUE);
 
@@ -4912,7 +5033,7 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
                       st->hTopoText, st->hMapMaskLbl,
                       st->hPollLbl, st->hVCacheRestoreHint,
                       st->hVCacheEffect,
-                      st->hBlocked, st->hMapFail, st->hIrqLine };
+                      st->hBlocked, st->hMapFail, st->hGpuFail, st->hIrqLine };
     for (HWND h : smalls)
         if (h) SendMessageW(h, WM_SETFONT, reinterpret_cast<WPARAM>(small), TRUE);
 
@@ -4934,12 +5055,42 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
     SyncInfoTipMetrics(st);
 }
 
+// THE GPU ASSIGNMENT TAB'S RE-READ, in the order SwitchPage's comment below gives. Shared by SwitchPage and by the
+// panel's GPUN_REFRESH, so a refresh the panel asks for after Apply or Remove reads exactly what entering the tab reads.
+void ActivateGpuPage(SettingsState* st) {
+    if (!st->hGpuPanel) return;
+    StoreUiToProfile(st);
+    RefreshCpuTable(st);
+    ActivateGpuPanel(st->hGpuPanel, st->work, st->cpuSnap);
+}
+
 void SwitchPage(SettingsState* st, HWND hwnd, int page) {
     if (page < 0 || page >= PAGE_COUNT || page == st->page) return;
+    // Recorded on the way IN only, so the GPU Assignment tab's own Cancel can return the user to
+    // the page they came from rather than always to Profiles.
+    if (page == PAGE_GPU) st->pageBeforeGpu = st->page;
     st->page = page;
     // Set BEFORE telling the bar, so the notification it sends back finds the page already
     // current and returns above rather than recursing.
     if (st->hNav) theme::TabBarSetSelected(st->hNav, IDC_NAV_PROFILES + page);
+    // Without the tab bar, the fallback row marks the current page the same way: stamped once at creation, it kept
+    // "Profiles" highlighted on every page.
+    for (int i = 0; !st->hNav && i < PAGE_COUNT; ++i) {
+        if (!st->hNavBtn[i]) continue;
+        SetButtonKind(st->hNavBtn[i], i == page ? theme::ButtonKind::Primary : theme::ButtonKind::Ghost);
+        InvalidateRect(st->hNavBtn[i], nullptr, TRUE);
+    }
+    // THE GPU ASSIGNMENT TAB RE-READS EVERYTHING EACH TIME IT IS ENTERED, before it is shown or
+    // laid out, so its first paint already holds this visit's rows. Three steps, in this order:
+    //   * StoreUiToProfile - a game typed on the Profiles page is NOT in `work` until this runs,
+    //     and the panel excludes the games of the profiles in `work`. It only copies controls into
+    //     `work`; it moves no control and shows nothing.
+    //   * RefreshCpuTable - cpuSnap is refreshed by the 1 s timer only while the heavy list is on
+    //     screen, so a visit from another tab would otherwise list processes that may have exited.
+    //   * ActivateGpuPanel - adapters, Windows' preferences, unfinished records, rows.
+    // FOCUS IS DELIBERATELY NOT MOVED INTO THE PANEL HERE. Left/Right on the tab bar arrive through
+    // this function too, and a panel that took focus would swallow the next arrow key.
+    if (page == PAGE_GPU) ActivateGpuPage(st);
     ApplyPageVisibility(st);
     SettingsLayout(st, hwnd);
     RedrawSettings(hwnd);
@@ -5359,34 +5510,45 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 reinterpret_cast<HMENU>(static_cast<UINT_PTR>(IDC_NAV)),
                 GetModuleHandleW(nullptr), nullptr);
             if (st->hNav) {
-                theme::TabBarAddItem(st->hNav, IDC_NAV_PROFILES, L"Profiles");
-                theme::TabBarAddItem(st->hNav, IDC_NAV_COREMAP, L"Core map");
+                // ONE LABEL PER PAGE, IN PAGE ORDER, FROM settings_pages.h - the only place a
+                // test can see them (AJ38), and the same array the fallback row and the page
+                // headings read. Tabs appear in the order they are added.
+                //
                 // THE LABEL IS "Setting", THE IDENTIFIER IS STILL IDC_NAV_GENERAL, and the
                 // split is deliberate. Operator instruction 2026-09-08 renamed the tab; the
                 // ids, PAGE_GENERAL and the IDC_NAV range checks below are load-bearing
                 // wiring that no user ever reads, and renaming them would touch five call
                 // sites to change nothing on screen. Every USER-FACING "General" moved with
                 // this one - the fallback button row below, the page's own heading, and the
-                // extreme-mode sentence that sends the user there.
-                theme::TabBarAddItem(st->hNav, IDC_NAV_GENERAL, L"Setting");
+                // extreme-mode sentence that sends the user there. v0.5.6 made the same split
+                // twice more: "CPU Core Map" is still IDC_NAV_COREMAP, and the new
+                // "GPU Assignment" tab is IDC_NAV_GPU, inserted before IDC_NAV_GENERAL.
+                //
+                // [M] v0.5.6, the four labels fit the minimum width with room to spare:
+                // Font::UiBody measures 39 + 76 + 88 + 37 px at 96 dpi, so with kTabPadX a side
+                // and kTabGap between them the bar needs 372 px plus the Profiles count badge,
+                // against 880.
+                for (int i = 0; i < PAGE_COUNT; ++i)
+                    theme::TabBarAddItem(st->hNav, IDC_NAV_PROFILES + i, kSettingsPageLabels[i]);
                 theme::TabBarSetSelected(st->hNav, IDC_NAV_PROFILES);
             } else {
                 // Read GetLastError before anything else can overwrite it. Without a
-                // switcher two of the three pages would be unreachable, so a plain button
+                // switcher three of the four pages would be unreachable, so a plain button
                 // row stands in rather than the window losing most of its content.
                 const DWORD gle = GetLastError();
                 LogLine(L"[settings] the tab bar could not be created "
                         L"(class %s), gle=%lu", theme::kTabBarClass, gle);
-                const wchar_t* names[PAGE_COUNT] = { L"Profiles", L"Core map", L"Setting" };
                 for (int i = 0; i < PAGE_COUNT; ++i) {
-                    st->hNavBtn[i] = Mk(hwnd, L"BUTTON", names[i],
+                    st->hNavBtn[i] = Mk(hwnd, L"BUTTON", kSettingsPageLabels[i],
                                         BS_OWNERDRAW | WS_TABSTOP, IDC_NAV_PROFILES + i);
                     SetButtonKind(st->hNavBtn[i], i == 0 ? theme::ButtonKind::Primary
                                                          : theme::ButtonKind::Ghost);
                 }
             }
 
-            st->hProfHdr  = Mk(hwnd, L"STATIC", L"Profiles", SS_LEFT, -1);
+            // Every page heading is its tab's label from settings_pages.h, so "matches the tab
+            // character for character" (see hGenHdr below) holds by construction.
+            st->hProfHdr  = Mk(hwnd, L"STATIC", kSettingsPageLabels[PAGE_PROFILES], SS_LEFT, -1);
             // CREATED HERE, BEFORE THE SEARCH BOX AND THE LIST, BECAUSE CREATION ORDER IS
             // TAB ORDER. This window runs IsDialogMessageW (see RunModalLoop), which walks
             // Z-order, and Z-order is the order controls are created in. The button is drawn
@@ -5481,6 +5643,15 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // TTF_SUBCLASS hook never sees a WM_MOUSEMOVE. The tip would simply never appear.
             st->hAutoInfo = Mk(hwnd, L"STATIC", L"",
                                SS_OWNERDRAW | SS_NOTIFY, IDC_AUTOINFO);
+            // "Optimize assignment of GPUs" - the operator's own caption, v0.5.6. CREATED HERE,
+            // right after the (i), BECAUSE CREATION ORDER IS TAB ORDER and the button now sits on
+            // the auto-pin row: created where it used to be, after the extreme-mode controls,
+            // Tab would reach it three stops after the controls it sits beside. It switches to
+            // the GPU Assignment tab. SECONDARY, not Primary: this card's one primary action is
+            // Add profile, and a second accent button in the same card would compete with it.
+            st->hIsolateGpu = Mk(hwnd, L"BUTTON", L"Optimize assignment of GPUs",
+                                 BS_OWNERDRAW | WS_TABSTOP, IDC_ISOLATE_GPU);
+            SetButtonKind(st->hIsolateGpu, theme::ButtonKind::Secondary);
             st->hPctLbl = Mk(hwnd, L"STATIC", L"Pin a process above", SS_LEFT, -1);
             st->hPct = Mk(hwnd, L"EDIT", L"", ES_NUMBER | ES_AUTOHSCROLL | WS_TABSTOP,
                           IDC_PCT);
@@ -5526,7 +5697,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             st->hExtremeStatus = Mk(hwnd, L"STATIC", L"", SS_LEFT, IDC_EXTREME_STATUS);
             if (st->hExtremeStatus) ShowWindow(st->hExtremeStatus, SW_HIDE);
 
-            st->hMapHdr = Mk(hwnd, L"STATIC", L"Core map", SS_LEFT, -1);
+            st->hMapHdr = Mk(hwnd, L"STATIC", kSettingsPageLabels[PAGE_COREMAP], SS_LEFT, -1);
             st->hTopoText = Mk(hwnd, L"STATIC", TopologyBlock(*st->topo).c_str(),
                                SS_LEFT, -1);
             st->hMapMaskLbl = Mk(hwnd, L"STATIC", L"Editing mask:", SS_LEFT, -1);
@@ -5563,9 +5734,31 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 LogLine(L"[settings] the core map control could not be created "
                         L"(class %s), gle=%lu", kCoreMapClass, gle);
                 st->hMapFail = Mk(hwnd, L"STATIC",
-                                  L"The core map could not be created, so the per-core view "
+                                  L"The CPU Core Map could not be created, so the per-core view "
                                   L"is not available on this page. Everything else here still "
                                   L"works. See GameOptimizer.log in the config folder.",
+                                  SS_LEFT, -1);
+            }
+
+            // ---- the GPU Assignment tab ------------------------------------------------------
+            // CREATED HERE, between the CPU Core Map controls and the Setting controls, because
+            // creation order is Tab order and this is the page order. The panel is ONE child
+            // window holding the whole tab (gpuwindow.cpp): created HIDDEN, holding controls
+            // only, and reading nothing until SwitchPage activates it - so opening Settings costs
+            // no GPU enumeration and shows no GPU notice on any other tab.
+            st->hGpuHdr = Mk(hwnd, L"STATIC", kSettingsPageLabels[PAGE_GPU], SS_LEFT, -1);
+            st->hGpuPanel = CreateGpuPanel(hwnd, IDC_GPU_PANEL);
+            if (!st->hGpuPanel) {
+                // Read GetLastError before anything else can overwrite it. The tab still exists.
+                // A card holding only its heading read as a layout bug with no reason given
+                // (Council review, v0.5.6), so the panel's place says why, as hMapFail does above.
+                const DWORD gle = GetLastError();
+                LogLine(L"[settings] the GPU Assignment panel could not be created, so that tab "
+                        L"shows why instead, gle=%lu", gle);
+                st->hGpuFail = Mk(hwnd, L"STATIC",
+                                  L"The GPU Assignment panel could not be created, so GPU assignments "
+                                  L"cannot be seen or changed on this page. Everything else in Settings "
+                                  L"still works. See GameOptimizer.log in the config folder.",
                                   SS_LEFT, -1);
             }
 
@@ -5573,7 +5766,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // A heading that still said "General" under a tab that says "Setting" is the
             // same class of defect as a control whose label and action name different
             // objects - the user cannot tell whether they are on the page they clicked.
-            st->hGenHdr = Mk(hwnd, L"STATIC", L"Setting", SS_LEFT, -1);
+            st->hGenHdr = Mk(hwnd, L"STATIC", kSettingsPageLabels[PAGE_GENERAL], SS_LEFT, -1);
             st->hStartup = Mk(hwnd, L"BUTTON", L"Start with Windows",
                               BS_AUTOCHECKBOX | WS_TABSTOP, IDC_STARTUP);
             st->hNotify = Mk(hwnd, L"BUTTON", L"Show notifications",
@@ -6090,11 +6283,13 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     b = st->cardBrush;
                 }
                 COLORREF fg = pal.textSecondary;
+                // hGpuHdr is here AND in ApplySettingsFonts' heads[]: a heading missing from this
+                // list renders in textSecondary, dimmer than every other page heading.
                 if (msg == WM_CTLCOLORBTN || ctl == st->hProfHdr || ctl == st->hEditHdr ||
-                    ctl == st->hMapHdr || ctl == st->hGenHdr) {
+                    ctl == st->hMapHdr || ctl == st->hGpuHdr || ctl == st->hGenHdr) {
                     fg = pal.textPrimary;
                 } else if (ctl == st->hGameMaskWarn || ctl == st->hHeavyMaskWarn ||
-                           ctl == st->hVCacheActive || ctl == st->hMapFail) {
+                           ctl == st->hVCacheActive || ctl == st->hMapFail || ctl == st->hGpuFail) {
                     // The SAME pal.warn the parked-mask rows use. This row only exists when
                     // it has something to warn about, so unlike hAutoStatus it has no quiet
                     // state to colour differently.
@@ -6377,6 +6572,40 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     // than `out` because the masks it names must be the ones on screen.
                     if (code == BN_CLICKED && st->topo)
                         ShowInterruptBench(hwnd, st->work, *st->topo, st->engine);
+                    return 0;
+                case IDC_ISOLATE_GPU:
+                    // "Optimize assignment of GPUs": switch to the GPU Assignment tab (operator
+                    // request, v0.5.6) - no window of its own any more. SwitchPage does the
+                    // refresh: it stores the Profiles page's unsaved edits into `work` and takes a
+                    // fresh cpuSnap before the panel reads either. The panel writes the REGISTRY
+                    // and never the config, so nothing here has to be saved, reloaded or
+                    // reconciled afterwards.
+                    //
+                    // FOCUS GOES INTO THE LIST HERE, AND ONLY HERE. The click hid the button, so
+                    // SwitchPage parked focus on the tab bar; a user who pressed a button labelled
+                    // for GPU assignment is sent to the applications list itself. SwitchPage does
+                    // not do this for every entry, because arrowing along the tab bar enters the
+                    // tab through it too.
+                    if (code == BN_CLICKED) {
+                        SwitchPage(st, hwnd, PAGE_GPU);
+                        if (st->hGpuPanel) FocusGpuPanel(st->hGpuPanel);
+                    }
+                    return 0;
+                case IDC_GPU_PANEL:
+                    // The panel's own Cancel has already unticked every row and written nothing
+                    // (founder decision: the tab keeps its own Apply and Cancel beside this
+                    // window's OK / Cancel / Apply). What is left is the chair's routine call:
+                    // hand the user back to the tab they came from, and the keyboard to the bar.
+                    if (code == GPUN_CANCEL) {
+                        const int back = st->pageBeforeGpu == PAGE_GPU ? PAGE_PROFILES : st->pageBeforeGpu;
+                        SwitchPage(st, hwnd, back);
+                        // Without a tab bar, the fallback button of the page returned to - never the bare frame.
+                        SetFocus(st->hNav ? st->hNav : (st->hNavBtn[back] ? st->hNavBtn[back] : hwnd));
+                    }
+                    // Apply or Remove refused a row whose GPU choice changed after the list was shown, and the
+                    // user has read the result: re-read the tab exactly as entering it does, since only this
+                    // window holds `work` and cpuSnap. Sent from the panel's own buttons, so the tab is showing.
+                    if (code == GPUN_REFRESH && st->page == PAGE_GPU) ActivateGpuPage(st);
                     return 0;
                 case IDC_AUTOPIN:
                     SyncAutoPinEnable(st);

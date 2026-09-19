@@ -136,11 +136,11 @@ inline std::wstring TopologyChangedPreservedSentence(size_t preservedCustomCount
     if (preservedCustomCount == 0) return std::wstring();
     if (preservedCustomCount == 1) {
         return L"1 custom mask you created was kept, but the processor numbers inside it may "
-               L"now refer to different cores - open the Core map and check it.";
+               L"now refer to different cores - open the CPU Core Map and check it.";
     }
     return std::to_wstring(preservedCustomCount) +
            L" custom masks you created were kept, but the processor numbers inside them may "
-           L"now refer to different cores - open the Core map and check each one.";
+           L"now refer to different cores - open the CPU Core Map and check each one.";
 }
 
 }  // namespace cd

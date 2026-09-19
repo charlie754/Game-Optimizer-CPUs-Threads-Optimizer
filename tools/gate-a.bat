@@ -126,5 +126,9 @@ if errorlevel 1 (
 )
 
 echo.
+echo === GATE A.5 GPU panel regressions (hidden windows, in-memory GPU preferences) ===
+call "%ROOT%\tools\test-gpu-panel.bat"
+if errorlevel 1 ( echo GATE_A5=FAIL panel regressions & set FAIL=1 ) else ( echo GATE_A5=PASS )
+echo.
 echo === GATE A RESULT: FAIL=%FAIL% ===
 exit /b %FAIL%

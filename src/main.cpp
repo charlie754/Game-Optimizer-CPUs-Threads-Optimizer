@@ -189,12 +189,10 @@ void AddDeclined(const std::wstring& exe) {
 }
 
 // ---- Filtering -------------------------------------------------------------
-// An All Games profile covers everything, so a specific prompt would be noise.
 bool CoveredByEnabledProfile(const std::wstring& exe) {
     for (size_t i = 0; i < g_cfg.profiles.size(); ++i) {
         const Profile& p = g_cfg.profiles[i];
         if (!p.enabled) continue;
-        if (p.isAllGames) return true;
         if (p.game.empty()) continue;
         if (IEquals(BaseName(p.game), exe)) return true;
     }

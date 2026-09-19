@@ -22,9 +22,11 @@ else, and clears every mask the moment the game exits.
 - **CPU Sets only.** `SetProcessDefaultCpuSets`, never `SetProcessAffinityMask`.
 - **Child processes included.** A worker spawned twenty minutes into a session is picked up
   within one poll period. This is not optional — CPU sets are *not* inherited by children.
-- **Nothing global by default.** No CCD parking, no system policy, no driver, no reboot. The one
-  exception is opt-in: the AMD 3D V-Cache setting described below, which changes a driver's start
-  type and needs a restart.
+- **Nothing global by default.** No CCD parking, no system policy, no driver, no reboot. There are
+  two exceptions, both opt-in: the AMD 3D V-Cache setting described below, which changes a driver's
+  start type and needs a restart; and Apply on the GPU Assignment tab, which writes Windows' own
+  per-application GPU preference for the applications you tick, needs no elevation, and keeps the
+  previous values in a restore file.
 - **No injection, no overlay.** One native exe, no .NET runtime. Nothing needs elevation except
   the optional AMD 3D V-Cache setting, which asks for it once.
 - **Local config only.** No account, no telemetry, and the app itself makes no network
@@ -51,7 +53,7 @@ is classified by core type and never by cache size.
 |---|---|---|---|
 | More than one distinct efficiency class | Intel hybrid (P/E cores) | `P-cores`, `E-cores`, `All`, plus `no SMT` variants where they differ | A real split. Game on P-cores, background apps on E-cores. High confidence |
 | Two or more last-level-cache domains, sizes differ | AMD asymmetric cache (X3D) | `Cache`, `Freq`, `Freq 2`, …, `All` | A real split. Game on the largest-L3 domain, background apps on the rest. High confidence |
-| Two or more last-level-cache domains, same size | Multi-CCD symmetric | `CCD0`, `CCD1`, …, `All` | A real split, but which domain gets called `CCD0` is an ordering choice, not a measurement. Medium confidence — check the core map |
+| Two or more last-level-cache domains, same size | Multi-CCD symmetric | `CCD0`, `CCD1`, …, `All` | A real split, but which domain gets called `CCD0` is an ordering choice, not a measurement. Medium confidence — check the CPU Core Map |
 | Exactly one last-level-cache domain | Single cache domain | `All`, and `All no SMT` if the CPU has SMT | Very little. There is no second group to move background work onto |
 | No cache domains reported at all | Unknown | the same as a single domain | Very little, and the first-run screen says so |
 
@@ -159,7 +161,10 @@ The `third_party\webview2\` folder is **documentation only** — nothing in it i
 time. To remove Game Optimizer: **if you turned on the AMD 3D V-Cache setting, turn it off first and
 restart** — that setting disables a driver, and the record of its original value lives in
 `config.ini`, so deleting that file first leaves the driver disabled with nothing left to restore
-it. Then Exit from the tray icon, delete the folder you unzipped, and delete
+it. **GPU assignments are Windows settings and stay after the app is deleted** — to undo them,
+use **Remove assignment** on the GPU Assignment tab before removing the app, or keep the
+`gpu-preferences-before-*.reg` restore files, which live in `%LOCALAPPDATA%\GameOptimizer\`, and
+open them. Then Exit from the tray icon, delete the folder you unzipped, and delete
 `%LOCALAPPDATA%\GameOptimizer\` if you want its settings gone too.
 
 **If Windows says the file is blocked**, that is the mark-of-the-web that lands on anything
@@ -277,7 +282,7 @@ The tray icon's **Settings** item brings the window back; **Exit** is what actua
 quitting clears every mask it applied. If you turn on **Start with Windows**, the app starts
 quietly at login with no window.
 
-On first launch it detects your topology, shows you a core map, and asks you to confirm it
+On first launch it detects your topology, shows you a CPU Core Map, and asks you to confirm it
 before anything is applied. Then pick a game — from the running-process list or by browsing to
 an .exe — and choose which named mask it should get.
 
@@ -300,6 +305,26 @@ reads that journal and tries to clear each one, writing the result of every atte
 FAILED and not retried later**, so the log is the place to check rather than an assumption.
 Rebooting is the guaranteed reset: a CPU Set assignment belongs to a running process and does
 not survive one.
+
+### GPU Assignment
+
+The **GPU Assignment** tab in Settings lists the running applications and the GPU each one is
+assigned to; **Optimize assignment of GPUs** on the Profiles tab opens it. Tick a row by
+double-clicking it or pressing Space, pick a GPU under **Assign ticked apps to:** (the first entry,
+**Main GPU:** and a name, is the GPU your games run on), and press **Apply**. **Auto assign GPU for
+Gaming** ticks applications to move to the chosen GPU. It skips games in a profile, Windows and
+excluded programs, and applications pinned to the main GPU, and it is off while the main GPU is
+chosen or while Windows' GPU preferences could not all be read. **Remove assignment** returns ticked
+applications to Windows' default GPU choice.
+
+This is Windows' own per-application GPU preference, the one Windows' Settings app also changes:
+one value per program under `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`. Other fields
+Windows keeps in that value, Auto HDR's for example, are left as they were. Apply and Remove
+assignment each ask first, defaulting to No, and need no administrator rights. The previous value
+of every application changed is kept in
+`%LOCALAPPDATA%\GameOptimizer\gpu-preferences-before-<timestamp>.reg`; double-click that file to
+put the old values back. A change takes effect the next time each application starts. If the
+chosen GPU is integrated, the confirmation warns that some applications can overload it.
 
 ### Upgrading from the "CoreDirector" builds
 
@@ -392,6 +417,8 @@ Being specific here rather than implying more coverage than exists.
   notification, that program and Game Optimizer can silently overwrite each other. Game Optimizer
   only ever clears masks it applied itself, and has no "clear everything" action, precisely
   because clearing is indiscriminate.
+- GPU Assignment, on one machine with an AMD integrated GPU, an NVIDIA RTX 4090 and an NVIDIA
+  RTX 5090, on Windows 11. Other GPU mixes are covered by unit tests only.
 
 **Not tested by anyone, anywhere in this work:**
 

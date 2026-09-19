@@ -63,7 +63,7 @@ inline std::wstring Page2VCacheText(const EnvironmentInfo& env,
              L"The part that does the work is a background process, amd3dvcacheUser.exe, and it is "
              L"running now. It watches which window has focus and tells firmware which CCD to prefer - a "
              L"second, independent influence on where your game runs. It is not Windows Game Mode, and "
-             L"turning Game Mode off does not stop it. If the core map shows a parked CCD, this is the "
+             L"turning Game Mode off does not stop it. If the CPU Core Map shows a parked CCD, this is the "
              L"likeliest reason.\r\n\r\n"
              L"Game Optimizer does not stop, start or configure it.";
     } else if (env.amdVCacheServiceState == AmdVCacheServiceState::NotDeterminable) {
