@@ -41,6 +41,7 @@
 #include <vector>
 
 #include "config.h"
+#include "gpu_cuda.h"
 #include "gpu_edit.h"
 #include "gpu_policy.h"
 #include "gpu_pref.h"
@@ -58,6 +59,7 @@ enum : int {
     IDC_GPU_LIST = 2100,
     IDC_GPU_TARGET,
     IDC_GPU_BULK,
+    IDC_GPU_SELALL,
     IDC_GPU_CLEARSEL,
     IDC_GPU_REMOVE,
     IDC_GPU_APPLY,
@@ -103,6 +105,25 @@ struct Row {
     std::wstring listedChoice;
 };
 
+// EVERY UNTICK GOES THROUGH HERE, AND THE TICK'S ORIGIN GOES WITH IT (v0.5.7). `autoSelected` says Auto assign made a tick,
+// and Apply re-checks such a tick against Auto assign's rule (PrepareEdits, and inside the guarded write). Thirteen sites
+// cleared only `selected`, so an unticked row could keep saying Auto assign ticked it; one rule for all of them means no
+// site has to remember the second field.
+void Untick(Row& row) {
+    row.r.selected = false;
+    row.autoSelected = false;
+}
+
+// AND EVERY TICK BY HAND GOES THROUGH HERE, the mirror of Untick (v0.5.9). `autoSelected` must be CLEARED by a hand
+// tick, not merely left alone: that is what tells Apply's two v0.5.7 re-checks this tick is the user's own override and
+// not Auto assign's. The pair was written out verbatim at the Space and double-click sites, and Select all would have
+// been a third copy - one rule for all three means no site has to remember the second field. Auto assign does NOT use
+// this: DoBulk sets `autoSelected` true on purpose.
+void Tick(Row& row) {
+    row.r.selected = true;
+    row.autoSelected = false;   // a tick by hand, never Auto assign's
+}
+
 struct GpuState {
     int dpi = 96;
     HFONT font = nullptr;
@@ -117,6 +138,10 @@ struct GpuState {
     bool prefsComplete = true;              // false: the registry walk could not see every preference
     // GpuChoicePairs of that walk: the other versions Auto assign checks a row against (AnotherVersionMayHoldMainGpuPin)
     std::vector<std::pair<std::wstring, std::wstring> > prefPairs;
+    // "Also set which GPU CUDA uses" on the Setting tab, copied from the config on every activation
+    // (v0.5.8). A bool, not the config itself: the panel borrows `cfg` for the length of one call and
+    // stores nothing that could go stale (gpuwindow.h).
+    bool cudaEnabled = true;
     bool controlsBroken = false;            // a control failed to create - decided once, in WM_CREATE
     bool broken = false;                    // a control this panel needs is missing or unusable: nothing is offered
     std::vector<UnfinishedRecord> unfinished;   // .pending records earlier changes left behind, oldest first
@@ -125,7 +150,7 @@ struct GpuState {
 
     HWND hPlan = nullptr, hTargetLbl = nullptr, hTarget = nullptr, hStatus = nullptr;
     HWND hList = nullptr, hPath = nullptr;
-    HWND hBulk = nullptr, hClearSel = nullptr, hRemove = nullptr, hApply = nullptr, hClose = nullptr;
+    HWND hBulk = nullptr, hSelAll = nullptr, hClearSel = nullptr, hRemove = nullptr, hApply = nullptr, hClose = nullptr;
 };
 
 GpuState* StateOf(HWND h) {
@@ -333,6 +358,27 @@ size_t MovableCount(const GpuState* st) {
     return n;
 }
 
+// What "Select all" ticks: gpu_rows.h's SelectAllTicks, asked row by row rather than kept as a copy here - exactly as
+// IsMovable asks SelectForAutoAssign. Nothing about Auto assign's policy applies; see the header for why the three
+// exceptions have to hold at selection time. The button's own conditions - a target, a complete walk - are SyncButtons'
+// and DoSelectAll's, not a row's.
+bool IsSelectable(const GpuState* st, const Row& r) {
+    return SelectAllTicks(r.r, r.listed, r.system, st->plan.gameKey, st->prefPairs);
+}
+
+// Rows Select all would NEWLY tick - what its enabled state reads (the count itself is the header's
+// SelectAllPendingCount, so the rule and the count cannot drift). The two flags go across as they stand on each Row.
+size_t SelectablePendingCount(const GpuState* st) {
+    std::vector<GpuRow> rows;
+    std::vector<bool> listed, system;
+    for (size_t i = 0; i < st->rows.size(); ++i) {
+        rows.push_back(st->rows[i].r);
+        listed.push_back(st->rows[i].listed);
+        system.push_back(st->rows[i].system);
+    }
+    return SelectAllPendingCount(rows, listed, system, st->plan.gameKey, st->prefPairs);
+}
+
 // Listed rows Auto assign leaves alone for a confirmed main-GPU pin, or (possibleOnly) an unreadable sibling preference -
 // the rows the "nothing to move" sentence must not call already on the chosen GPU. Windows and excluded rows, and profile
 // games, are skipped for their own reasons and are not counted. The pin rules themselves are IsMainGpuPin, the one
@@ -467,8 +513,39 @@ void RefreshLines(GpuState* st) {
     if (moved) LayoutGpu(panel, st);
 }
 
+// 🔴 A RUN IS GOING, AND NOTHING ELSE MAY START ONE (v0.5.9). Greater than zero for the whole of DoApply and DoRemove,
+// including the message boxes they open.
+//
+// IT IS FILE-SCOPE AND NOT A FIELD OF GpuState, ON PURPOSE. RunGuard's destructor runs after the last message box of
+// the function it guards, and PanelMessageBox may already have freed the state by then - Tray Exit closes Settings
+// while a box is open (PanelLifetime, gpu_edit.h). A counter reached through `st` would be a read of freed memory at
+// exactly that moment. One panel exists at a time, so one counter is enough.
+int g_running = 0;
+
+// THERE IS A GPU TO WRITE: the panel was built, and a target is picked and on screen (FillTargets clears `targetKey`
+// otherwise, and an undecidable plan offers no candidate at all). Apply, Auto assign and Select all are lit only on it,
+// and DoSelectAll refuses on it too, so a click already queued to a grey button ticks nothing.
+bool Decidable(const GpuState* st) { return !st->broken && !st->targetKey.empty(); }
+
 void SyncButtons(GpuState* st) {
-    const bool decidable = !st->broken && !st->targetKey.empty();
+    // 🔴 THE INPUT FREEZE, DECIDED IN ONE PLACE (v0.5.9). Everything that could start or change a run goes dead while
+    // one is running, and it is decided HERE rather than beside each button so that a button added later is covered
+    // without its author remembering. It also disarms the keyboard for nothing: GpuPanelKey posts a BN_CLICKED only
+    // for a control that IsWindowEnabled.
+    //
+    // THE LIST BOX STAYS ENABLED so the run stays readable and scrollable. A double-click there only toggles a tick,
+    // and the run's plan was frozen when PrepareEdits copied it - the WM_COMMAND handler refuses the toggle anyway.
+    if (g_running > 0) {
+        EnableWindow(st->hTarget, FALSE);
+        EnableWindow(st->hBulk, FALSE);
+        EnableWindow(st->hSelAll, FALSE);
+        EnableWindow(st->hClearSel, FALSE);
+        EnableWindow(st->hRemove, FALSE);
+        EnableWindow(st->hApply, FALSE);
+        EnableWindow(st->hClose, FALSE);
+        return;
+    }
+    const bool decidable = Decidable(st);
     // The picker stays usable whenever there is anything to pick, even with no target: a failed lookup
     // clears the target, and the user must still be able to choose again (adversarial review, round 4).
     EnableWindow(st->hTarget, !st->broken && !st->candidates.empty() ? TRUE : FALSE);
@@ -478,7 +555,26 @@ void SyncButtons(GpuState* st) {
                                 ? TRUE : FALSE);
     EnableWindow(st->hApply, decidable && AnySelected(st) ? TRUE : FALSE);
     EnableWindow(st->hRemove, RemovableCount(st) > 0 ? TRUE : FALSE);
-    EnableWindow(st->hClearSel, AnySelected(st) ? TRUE : FALSE);
+    // THE SELECTION PAIR. Select all is lit only while there is a row left for it to tick: a list whose every eligible
+    // row is already ticked, or which has no eligible row at all, leaves it grey rather than offering a click that
+    // changes nothing. Deselect all keeps its own rule - anything ticked, eligible or not. Neither is offered on a
+    // panel that could not be built (`broken`), where no row is listed and nothing may be written.
+    //
+    // 🔴 AND IT IS OFF WHILE WINDOWS' GPU PREFERENCES COULD NOT ALL BE READ, exactly as Auto assign is (chair
+    // decision, v0.5.9 - see DoSelectAll for the reasoning). The condition is the completeness half of
+    // AutoAssignAllowed and nothing else: the main GPU being the picker's choice still changes nothing here.
+    //
+    // 🔴 AND IT IS OFF WITHOUT A TARGET, exactly as Apply is (`decidable`; pre-publish review of v0.5.9). With no
+    // target - one GPU, or two cards the plan cannot tell apart - there is no main GPU either, so IsMainGpuPin is
+    // false for every row and a preference the user set in Windows' Graphics settings reads as an ordinary row.
+    // A lit Select all would tick those, and Remove assignment would then delete them in bulk on one Yes.
+    EnableWindow(st->hSelAll, decidable && st->prefsComplete && SelectablePendingCount(st) > 0 ? TRUE : FALSE);
+    EnableWindow(st->hClearSel, !st->broken && AnySelected(st) ? TRUE : FALSE);
+    // 🔴 CANCEL IS SET EXPLICITLY, THOUGH IT HAS NO CONDITION OF ITS OWN (v0.5.9). Until the freeze above existed
+    // this control was simply never touched here and stayed enabled from WM_CREATE; the freeze turns it off, so
+    // something has to turn it back on. A button disabled once and re-enabled nowhere is a dead Cancel for the rest
+    // of the Settings session.
+    EnableWindow(st->hClose, TRUE);
 }
 
 void Redraw(GpuState* st) {
@@ -488,6 +584,30 @@ void Redraw(GpuState* st) {
     RefreshLines(st);
     SyncButtons(st);
 }
+
+// 🔴 ONE OF THESE AT THE TOP OF DoApply AND DoRemove, AND IT IS WHAT MAKES THE FREEZE TRUE (v0.5.9). It raises
+// g_running for the whole run - the confirmation and the result box included - and puts it back however the function
+// returns, including the early returns a message box that destroyed the panel forces.
+//
+// 🔴 `st` IS NULLED BY THE CALLER ON EVERY PATH WHERE THE PANEL WAS DESTROYED, because the destructor's Redraw would
+// otherwise read freed memory. Every `if (!PanelMessageBox(...))` return in the guarded functions does it, and so does
+// a DropTarget that answers false - which is why DropTarget has a return value at all.
+//
+// The wait cursor is decoration and nothing more (v0.5.9): it is honest only because mouse messages are never pumped,
+// and Windows judges a window hung from its message queue, never from its cursor. The pump below is the fix.
+struct RunGuard {
+    GpuState* st;
+    explicit RunGuard(GpuState* state) : st(state) {
+        ++g_running;
+        if (g_running == 1) SetCursor(LoadCursorW(nullptr, IDC_WAIT));
+        if (st) SyncButtons(st);   // the freeze starts NOW, not at the first repaint after it
+    }
+    ~RunGuard() {
+        --g_running;
+        if (g_running == 0) SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        if (st) Redraw(st);
+    }
+};
 
 // THE FULL PATH OF THE ROW UNDER THE CURSOR, below the list. Two rows can share a file name, and even their
 // folders once a line is cut to fit; this is where a row's identity can always be read in full (adversarial
@@ -541,7 +661,7 @@ void FillList(GpuState* st) {
     }
     for (size_t i = 0; i < st->rows.size(); ++i) {
         if (st->broken || !st->hList) st->rows[i].listed = false;
-        if (!st->rows[i].listed) st->rows[i].r.selected = false;
+        if (!st->rows[i].listed) Untick(st->rows[i]);
     }
     UpdatePath(st);
     Redraw(st);
@@ -599,20 +719,61 @@ void FillTargets(GpuState* st) {
 // Actions
 // ---------------------------------------------------------------------------
 
-// Read the policy evidence afresh without replacing listedChoice: a fresh policy check must
-// never make the user's earlier consent apply to a different per-path GPU choice.
-std::vector<GpuRow> ReadAutoChoices(GpuState* st) {
-    const std::vector<GpuPreferenceEntry> entries = EnumerateGpuPreferenceEntries(&st->prefsComplete);
-    st->prefPairs = GpuChoicePairs(entries);
+// Each walked value's choice key, by lower-cased path: how a fresh read gives a row its assignedKey. ONE LOOKUP, READ BY
+// TWO: ReadAutoChoices, and the check inside an automatic row's guarded write (StillAutoEligible).
+std::map<std::wstring, std::wstring> ChoicesByPath(const std::vector<GpuPreferenceEntry>& entries) {
     std::map<std::wstring, std::wstring> choices;
     for (const auto& entry : entries) choices[ToLower(entry.path)] = entry.choiceKey;
+    return choices;
+}
+
+// Read the policy evidence afresh without replacing listedChoice: a fresh policy check must
+// never make the user's earlier consent apply to a different per-path GPU choice.
+//
+// 🔴 EACH ROW'S assignedKey TAKES THE FRESH READ TOO (v0.5.7), so the GPU column, the status line and the buttons speak for
+// the read Auto assign just acted on. An application pinned to the main GPU after the list was read made DoBulk tick
+// nothing and say so, while the line above it still counted that application as one that can be moved. listedChoice is
+// never touched: it is what Apply compares with (PrepareVerdict), and a fresh read must not become consent. Two limits,
+// both on purpose: a path that a read which could not see everything did not return keeps its assignedKey - a partial read
+// is no evidence of "no value" - and a row that now holds a setting drops its "lost its GPU" note, as PrepareEdits and
+// RunEdits already drop it. EVERY CALLER REDRAWS AFTER THIS: DoBulk itself, and DoApply and DoRemove after PrepareEdits
+// and RunEdits.
+//
+// ONE FRESH READ, READ BY TWO (v0.5.9): ReadAutoChoices below, and DoSelectAll. Both bulk ticks judge the same facts,
+// read at the moment of the click, rather than the ones the list happened to be built from.
+std::vector<GpuRow> RefreshRowEvidence(GpuState* st) {
+    const std::vector<GpuPreferenceEntry> entries = EnumerateGpuPreferenceEntries(&st->prefsComplete);
+    st->prefPairs = GpuChoicePairs(entries);
+    const std::map<std::wstring, std::wstring> choices = ChoicesByPath(entries);
     std::vector<GpuRow> live;
-    for (const auto& row : st->rows) {
-        GpuRow r = row.r;
-        r.assignedKey = choices[ToLower(r.exePath)];
-        live.push_back(r);
+    for (auto& row : st->rows) {
+        const std::map<std::wstring, std::wstring>::const_iterator found = choices.find(ToLower(row.r.exePath));
+        if (found != choices.end() || st->prefsComplete) {
+            row.r.assignedKey = found != choices.end() ? found->second : std::wstring();
+            if (!row.r.assignedKey.empty()) {
+                row.orphaned = false;
+                row.note.clear();
+                row.r.lostKey.clear();
+            }
+        }
+        live.push_back(row.r);
     }
-    return SelectForAutoAssign(live, st->targetKey, st->plan.gameKey, st->prefsComplete, st->prefPairs);
+    return live;
+}
+
+std::vector<GpuRow> ReadAutoChoices(GpuState* st) {
+    const std::vector<GpuRow> live = RefreshRowEvidence(st);
+    std::vector<GpuRow> picked =
+        SelectForAutoAssign(live, st->targetKey, st->plan.gameKey, st->prefsComplete, st->prefPairs);
+    // EVERY CALLER INDEXES THE ANSWER BY ROW. An answer of another size would tick or refuse the wrong rows, so it
+    // selects nothing and is logged.
+    if (picked.size() != st->rows.size()) {
+        LogLine(L"[gpu] Auto assign's rule answered %zu rows for %zu; nothing is selected", picked.size(),
+                st->rows.size());
+        picked = live;
+        for (auto& p : picked) p.selected = false;
+    }
+    return picked;
 }
 
 void DoBulk(GpuState* st, HWND hwnd) {
@@ -621,7 +782,7 @@ void DoBulk(GpuState* st, HWND hwnd) {
     // both are refused here as well (AutoAssignAllowed), so a click posted to a disabled button ticks nothing. Said
     // nowhere but the status line, which already gives the reason beside the button.
     if (st->targetKey.empty() || !AutoAssignAllowed(st->prefsComplete, MainGpuTargeted(st))) {
-        for (auto& row : st->rows) if (row.autoSelected) row.r.selected = false;
+        for (auto& row : st->rows) if (row.autoSelected) Untick(row);
         Redraw(st);
         return;
     }
@@ -638,6 +799,56 @@ void DoBulk(GpuState* st, HWND hwnd) {
     Redraw(st);
     if (n == 0) PanelMessageBox(st, hwnd, FormatNothingToMoveLine(MainGpuPinCount(st), MainGpuPinCount(st, true)).c_str(),
                                MB_OK | MB_ICONINFORMATION);
+}
+
+// "SELECT ALL" - THE OTHER BULK TICK, AND IT IS NOT AUTO ASSIGN (v0.5.9, operator request: the tab offered a way to
+// untick everything and no way to tick anything). It is not off while the main GPU is the picker's choice, and it never
+// asks whether a row would actually move: it ticks what is safe to tick (SelectAllTicks, gpu_rows.h) and leaves Auto
+// assign to decide what is worth moving.
+//
+// 🔴 BUT IT NEEDS A TARGET, EXACTLY AS APPLY DOES (Decidable; pre-publish review of v0.5.9). "Safe to tick" leans on
+// IsMainGpuPin, and with no target there is no main GPU: one GPU, or two cards the plan cannot tell apart, leaves
+// `plan.gameKey` empty, IsMainGpuPin false for every row, and a preference the user set in Windows' Graphics settings
+// indistinguishable from an ordinary row. Ticking those in bulk would put them one Yes of Remove assignment away from
+// being deleted.
+//
+// EVERY TICK IT MAKES IS A HAND TICK, through Tick() - because that is what it is. Ticking the same rows one at a time
+// with Space would have left exactly this state, and Apply must treat them the same way.
+//
+// 🔴 SO THE EVIDENCE IS READ AGAIN FIRST, exactly as Auto assign reads it. A hand tick carries autoSelected = false and
+// Apply's two v0.5.7 re-checks skip it by design, so this click has no net behind it: the three exceptions are checked
+// against a fresh walk of Windows' preferences, or they are checked against a read an external pin made minutes ago has
+// already outrun.
+//
+// IT ADDS TO THE SELECTION AND NEVER CLEARS ONE. A row ticked by hand that this rule would not tick - an excluded
+// binary the user chose deliberately - is left exactly as the user left it; Deselect all is the button that clears.
+//
+// 🔴 AN INCOMPLETE PREFERENCE WALK STOPS IT, EXACTLY AS IT STOPS AUTO ASSIGN (chair decision, v0.5.9 - this replaces
+// the corner-cut that first shipped with the button, which left it on and named the trade). Auto assign refuses
+// everything while `prefsComplete` is false because a walk that missed a value cannot prove an application is
+// unpinned (AutoAssignAllowed, AJ45), and the exception this button most depends on -
+// AnotherVersionMayHoldMainGpuPin, applied at selection time because nothing downstream re-checks a hand tick - reads
+// the very map that walk builds. The standing decision that a tick BY HAND stays available in that state still
+// holds, and is what the list box is for: one row, judged by the user looking at it. Forty rows ticked by one click
+// are not that, and cannot be judged row by row the way a single hand tick can.
+//
+// The condition is the completeness half of AutoAssignAllowed plus Decidable, and nothing else: the main GPU being the
+// picker's choice does not stop Select all. SyncButtons carries the same two conditions, so the button is grey before
+// it is refused - and a click already queued to it when it went grey is refused here.
+void DoSelectAll(GpuState* st) {
+    if (!Decidable(st)) return;
+    // The fresh walk first, so the refusal below judges the read of this click and not the one the list was built
+    // from - exactly the order DoBulk uses.
+    RefreshRowEvidence(st);
+    if (!st->prefsComplete) {
+        // Said nowhere but the status line, which already gives the reason beside Auto assign
+        // (FormatIncompleteScanStatusLine), and no tick made by hand is cleared: this button only ever adds.
+        Redraw(st);
+        return;
+    }
+    for (size_t i = 0; i < st->rows.size(); ++i)
+        if (IsSelectable(st, st->rows[i])) Tick(st->rows[i]);
+    Redraw(st);
 }
 
 // ---- The two passes every registry write goes through ----------------------------------------
@@ -668,21 +879,27 @@ struct EditPlan {
 void PrepareEdits(GpuState* st, bool removing, std::vector<EditPlan>& ready, std::vector<std::wstring>& refused,
                   size_t& changedSinceListed) {
     changedSinceListed = 0;
+    // REMOVE SKIPS EXACTLY THE ROWS ITS QUESTION DID NOT COUNT (RemovableCount), as before v0.5.7: ReadAutoChoices below now
+    // refreshes every row's assignedKey, and a row whose value vanished since stays PrepareVerdict's to refuse and name.
+    std::vector<bool> hadAssignment;
+    for (size_t i = 0; i < st->rows.size(); ++i) hadAssignment.push_back(!st->rows[i].r.assignedKey.empty());
     const std::vector<GpuRow> automatic = ReadAutoChoices(st);
     for (size_t i = 0; i < st->rows.size(); ++i) {
         Row& r = st->rows[i];
         if (!r.listed || !r.r.selected || r.r.exePath.empty()) continue;
         if (!removing && r.autoSelected && !automatic[i].selected) {
-            r.r.selected = false;
+            Untick(r);
             Refuse(refused, r, L"its automatic selection is no longer safe after reading Windows' GPU settings again; "
                               L"review the row and tick it by hand to change it");
             ++changedSinceListed;
             continue;
         }
-        if (removing && r.r.assignedKey.empty()) continue;   // nothing of this feature's to remove
+        if (removing && !hadAssignment[i]) continue;   // nothing of this feature's to remove
         EditPlan e;
         e.row = i;
         e.item.exePath = r.r.exePath;
+        // Auto assign's tick is checked once more inside the guarded write (StillAutoEligible); a hand tick never is.
+        e.item.automatic = !removing && r.autoSelected;
         bool unreadable = false;
         e.item.present = ReadGpuPreference(r.r.exePath, e.item.existing, &unreadable);
         const GpuPrepareVerdict verdict = PrepareVerdict(r.listedChoice, e.item.present, e.item.existing, unreadable);
@@ -702,7 +919,7 @@ void PrepareEdits(GpuState* st, bool removing, std::vector<EditPlan>& ready, std
             r.r.lostKey.clear();
         }
         if (verdict == GpuPrepareVerdict::ChangedSinceListed) {
-            r.r.selected = false;
+            Untick(r);
             ++changedSinceListed;
         }
         Refuse(refused, r, PrepareRefusalReason(verdict));
@@ -743,11 +960,16 @@ bool TargetStillShown(const GpuState* st, const std::wstring& targetKey) {
 
 // A TARGET THAT CANNOT BE CONFIRMED IS DROPPED, AND SAID (adversarial review, round 5: Apply used to return
 // without a word, leaving a lit button that did nothing). Ticks made for it go too, as when the picker changes.
-void DropTarget(GpuState* st, HWND hwnd) {
+//
+// 🔴 FALSE MEANS THE PANEL WAS DESTROYED WHILE THE BOX WAS OPEN - PanelMessageBox' own contract, and until v0.5.9
+// this function THREW THAT ANSWER AWAY. It was the one latent instance of exactly the defect RunGuard exists to
+// guard against: with the answer discarded, the caller could not null `run.st`, and the guard's destructor would
+// have redrawn freed memory. Every caller must now write `if (!DropTarget(st, hwnd)) run.st = nullptr;`.
+bool DropTarget(GpuState* st, HWND hwnd) {
     st->targetKey.clear();
-    for (size_t i = 0; i < st->rows.size(); ++i) st->rows[i].r.selected = false;
+    for (size_t i = 0; i < st->rows.size(); ++i) Untick(st->rows[i]);
     Redraw(st);
-    PanelMessageBox(st, hwnd,
+    return PanelMessageBox(st, hwnd,
                 L"Nothing was changed.\r\n\r\nThe GPU shown beside \"Assign ticked apps to\" could not be "
                 L"confirmed. Choose the GPU again, then tick the applications again.",
                 MB_OK | MB_ICONWARNING);
@@ -781,23 +1003,461 @@ struct EditTally {
     size_t changedSinceListed = 0;   // rows left unfinished at another program's GPU choice, and unticked (UntickAfterRun)
 };
 
+// 🔴 A ROW AUTO ASSIGN TICKED IS CHECKED AGAIN INSIDE ITS GUARDED WRITE (v0.5.7 - the sibling-pin race, Council review of
+// v0.5.6). PrepareEdits asks Auto assign's rule again before the write, but the guarded write compared only the row's OWN
+// value: another version of the application pinned to the main GPU after PrepareEdits and before the commit was not
+// seen, and the row was moved to the background GPU. So the write asks once more, after its own comparison: Windows' GPU
+// preferences are read again, the row gets the GPU choice that read found for it, and SelectForAutoAssign - the one rule,
+// never a copy - must still tick it. A row no longer in the list, or a read that could not see everything, fails closed.
+// A write to this key landing after this check and before the commit makes the commit fail (6704, [M] txprobe3), as said
+// at GuardedWriteGpuPreference.
+struct AutoWriteCheck {
+    const GpuState* st;
+    const std::wstring* exePath;
+};
+
+bool StillAutoEligible(void* context) {
+    const AutoWriteCheck* c = static_cast<const AutoWriteCheck*>(context);
+    bool complete = true;
+    const std::vector<GpuPreferenceEntry> entries = EnumerateGpuPreferenceEntries(&complete);
+    const std::map<std::wstring, std::wstring> choices = ChoicesByPath(entries);
+    for (size_t i = 0; i < c->st->rows.size(); ++i) {
+        if (!WcsIcmp(c->st->rows[i].r.exePath, *c->exePath)) continue;
+        GpuRow row = c->st->rows[i].r;
+        const std::map<std::wstring, std::wstring>::const_iterator found = choices.find(ToLower(row.exePath));
+        row.assignedKey = found != choices.end() ? found->second : std::wstring();
+        return SelectForAutoAssign(std::vector<GpuRow>(1, row), c->st->targetKey, c->st->plan.gameKey, complete,
+                                   GpuChoicePairs(entries))[0].selected;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// The CUDA half of one run (v0.5.8)
+// ---------------------------------------------------------------------------
+//
+// 🔴 ON APPLY IT FOLLOWS THE GPU WRITE AND CAN NEVER FAIL IT; ON REMOVE IT GOES FIRST AND CAN STOP IT.
+// Windows' per-application GPU preference decides which adapter an application DRAWS on; NVIDIA keeps
+// which GPU its CUDA work may use somewhere else entirely (gpu_cuda.h). So a row whose preference was
+// written is ALSO given a settings entry of ours that says which GPU CUDA may use - and every way that
+// can go wrong (no driver, a settings session refused, an entry NVIDIA already manages, three NVIDIA
+// cards, a save the driver would not do) costs one sentence in the result and nothing else.
+// Remove is the other way round (E4): the entry has to go BEFORE the Windows assignment, because the
+// button that could try again is enabled only while the row still has an assignment.
+struct CudaRun {
+    bool on = false;                                     // a CUDA change is possible for this run
+    bool removing = false;
+    CudaOps ops;
+    CudaTarget target;                                   // Apply only
+    // ONE RECORD FOR THE WHOLE RUN, read before the question and written one line at a time (gpu_cuda.h,
+    // E2). Apply adds and updates lines in it; Remove uses them and takes them out again.
+    CudaRecord record;
+    CudaRefusal whole = CudaRefusal::None;               // said ONCE for the run, not once per row
+    // 🔴 THE CUDA HALF IS OVER FOR THIS RUN, WITHOUT ANYTHING HAVING REACHED DISK. The open driver session
+    // may hold a change of ours that was neither saved nor taken back out, and NvAPI_DRS_SaveSettings
+    // commits the WHOLE session - so no later row may save. This is NOT E5's whole-run stop: nothing was
+    // lost, the notes are intact and the action can simply be run again. E5's stop is the GpuRowGate.
+    bool stopped = false;
+    // 🔴 R6-3: THE SESSION WAS OPENED ONLY TO LOOK. No ticked row has a line of ours, so there is nothing
+    // to put back - but NVIDIA may still hold an entry this product made for one of them, and until round
+    // 6 the commonest way to reach one (delete gpu-cuda-record.txt, then press Remove) said NOTHING at
+    // all: the session was never opened, the Windows pin went, and the CUDA entry stayed forever. In this
+    // mode every row is looked up and named if it is ours, NOTHING is ever refused or counted as
+    // "nothing to put back", and the run-wide refusal is never set - blocking Remove is the trap E4 closes.
+    bool lookOnly = false;
+    size_t changed = 0, already = 0, noRecord = 0;
+    // R5-1: of `changed`, the rows whose entry held other settings too, so only our own CUDA setting was
+    // taken out of it and the entry itself was left standing.
+    size_t keptEntry = 0;
+    // R6-7: rows whose line already said the entry holds nothing of ours. Nothing to do, nothing failed.
+    size_t nothingOfOurs = 0;
+    std::vector<std::wstring> refused, unresolved, unrecorded;
+    // R5-5: Remove rows with no line of ours that NVIDIA still holds a Game-Optimizer-named entry for.
+    // Nothing is done about them and nothing is blocked; they are named so the user can act.
+    std::vector<std::wstring> orphans;
+    bool recordTouched = false;                          // a line was written or taken out of the record
+};
+
+// True when the record has a line for any ticked row this Remove would act on. 🔴 IT IS ASKED BEFORE THE
+// DRIVER IS OPENED, AND THAT IS THE POINT (Council round 2): with nothing of ours recorded for anything
+// ticked there is nothing to put back, so a machine with no NVIDIA driver was told "which GPU CUDA uses
+// was not put back" about a change nobody had ever made.
+bool AnyRecordedRow(GpuState* st, const CudaRecord& record) {
+    for (size_t i = 0; i < st->rows.size(); ++i) {
+        const Row& r = st->rows[i];
+        // EXACTLY THE ROWS RemovableCount COUNTED, so the question's two numbers cannot disagree.
+        if (!r.listed || !r.r.selected || r.r.exePath.empty() || r.r.assignedKey.empty()) continue;
+        const CudaRecordRow* line = CudaLineFor(record, r.r.exePath);
+        // 🔴 R6-7: A LINE SAYING "THE ENTRY IS OURS AND HOLDS NOTHING OF OURS" IS NOT SOMETHING TO PUT
+        // BACK. Counting it would make a machine with no NVIDIA driver answer "nothing is removed at all"
+        // over a change that has already been undone - E4's block spent on nothing.
+        if (line != nullptr && !CudaRowHoldsNothingOfOurs(*line)) return true;
+    }
+    return false;
+}
+
+// Opened once per Apply or Remove and closed at its end - the driver session has to stay open across the
+// whole run, because a value set on it is only real once that same session saves.
+CudaRun OpenCudaRun(GpuState* st, const std::wstring& targetKey, bool removing) {
+    CudaRun run;
+    run.removing = removing;
+    if (removing) {
+        // 🔴 THE CHECK BOX GATES APPLY'S WRITES, AND NOT REMOVE'S RESTORE (Council round 1, F7). Gating
+        // Remove on it too left the only way back behind the very switch a user flips to say "stop
+        // touching CUDA": assign with it ticked, clear it, Remove - the GPU preference goes, the CUDA
+        // exclusion stays, and with nothing assigned any more Remove is greyed out. A setting that can
+        // turn a change on but not off is a trap, so what this product wrote it can always take back.
+        run.record = ReadCudaRecord(GetConfigDir());
+        if (run.record.state == CudaRecordState::Unreadable) {
+            // 🔴 A NOTE NOBODY COULD READ MAY NAME THE VERY APPLICATION BEING REMOVED (E6), so it is
+            // never the same answer as "there is nothing of ours", and the check box does not silence it.
+            run.whole = CudaRefusal::RecordUnreadable;
+            return run;
+        }
+        // 🔴 R6-3: NOTHING OF OURS RECORDED FOR ANYTHING TICKED IS NOT THE SAME AS NOTHING OF OURS BEING
+        // THERE, AND THE DIFFERENCE IS THE COMMONEST WAY TO A LEFTOVER. The user deletes
+        // gpu-cuda-record.txt - it is a text file in their configuration folder that says it is only a
+        // note - and presses Remove. Until round 6 the session was never opened at all: the Windows pin
+        // went, the NVIDIA settings entry this product made stayed behind forever, and not one word was
+        // said about it. R5-5's sentence existed for exactly this and could only be reached when some
+        // OTHER ticked row still had a line.
+        //
+        // So the session is opened anyway, to LOOK. Three outcomes, and only one of them is new:
+        //   * it will not open -> exactly as before: silent, run.whole untouched, and Remove proceeds;
+        //   * it opens and the ticked rows have no entry of ours -> still silent;
+        //   * it opens and one of them does -> that entry is NAMED in the result and left alone.
+        // 🔴 IT MUST NEVER SET run.whole AND MUST NEVER REFUSE A ROW. Blocking every Remove because a
+        // driver session would not open is the trap E4 exists to close, and there is nothing here to put
+        // back in the first place.
+        if (!AnyRecordedRow(st, run.record)) {
+            run.ops = MakeCudaOps();
+            if (!run.ops.available) return run;   // silent, exactly as it was
+            run.on = true;
+            run.lookOnly = true;
+            return run;
+        }
+        run.ops = MakeCudaOps();
+        if (!run.ops.available) {
+            // There IS something of ours recorded and no driver to put it back with. Said once.
+            run.whole = run.ops.openRefusal;
+            return run;
+        }
+        run.on = true;
+        return run;
+    }
+    // OFF MEANS SILENT ON APPLY. Nothing CUDA-related happens, and nothing about it is said (founder-facing
+    // setting, Setting tab).
+    if (!st->cudaEnabled) return run;
+    // 🔴 A NON-NVIDIA TARGET NEVER OPENS NVIDIA'S SETTINGS AT ALL (founder decision 18, verbatim: "ignore
+    // all non-nvidia GPU by our CUDA config"). Asked here rather than after MakeCudaOps, so an application
+    // pinned to the AMD integrated GPU costs no driver session and produces no sentence either way.
+    if (!IsNvidiaAdapterKey(targetKey)) return run;
+    run.record = ReadCudaRecord(GetConfigDir());
+    if (run.record.state == CudaRecordState::Unreadable) {
+        // Apply cannot keep the original safely without first reading what is already recorded for these
+        // applications, and a change it cannot record is one Remove assignment cannot put back.
+        run.whole = CudaRefusal::RecordUnreadable;
+        return run;
+    }
+    run.ops = MakeCudaOps();
+    if (!run.ops.available) {
+        run.whole = run.ops.openRefusal;
+        return run;
+    }
+    run.target = CudaTargetFor(targetKey, run.ops.listGpus(), run.ops.listIds());
+    if (!run.target.act) {
+        run.whole = run.target.refusal;
+        return run;
+    }
+    run.on = true;
+    return run;
+}
+
+// Closes the driver session however the action returns - including the early returns a message box that
+// destroyed the panel forces. NvAPI_Unload is never called; see gpu_cuda.cpp.
+struct CudaRunCloser {
+    CudaRun* run;
+    ~CudaRunCloser() {
+        if (run && run->ops.close) run->ops.close();
+    }
+};
+
+// How many ticked applications this product has a note for, so Remove's question can say there is really
+// something to take away (Council round 1, F8). 🔴 IT ASKS THE DRIVER NOTHING. Until round 3 it also looked
+// each row up to name the other programs a shared NVIDIA profile carries along; E1 means this product never
+// writes on a shared profile at all, so there are no neighbours left to disclose.
+size_t CudaRestoreCount(GpuState* st, const CudaRun& run) {
+    size_t count = 0;
+    if (!run.on || !run.removing) return count;
+    for (size_t i = 0; i < st->rows.size(); ++i) {
+        const Row& r = st->rows[i];
+        // EXACTLY THE ROWS RemovableCount COUNTED, so the two numbers in one question cannot disagree.
+        if (!r.listed || !r.r.selected || r.r.exePath.empty() || r.r.assignedKey.empty()) continue;
+        const CudaRecordRow* line = CudaLineFor(run.record, r.r.exePath);
+        // R6-7: as AnyRecordedRow does - a line holding nothing of ours has nothing to take away, so
+        // promising the user it will be taken away would be false.
+        if (line != nullptr && !CudaRowHoldsNothingOfOurs(*line)) ++count;
+    }
+    return count;
+}
+
+// One row's CUDA half, and the answer decides what happens to that row's Windows GPU preference.
+// On APPLY this is called after a Done row - a refused, unconfirmed or untried row did not move GPU, so
+// its CUDA setting must not move either - and the only answer that is not Go is E5's whole-run stop.
+// On REMOVE it is called BEFORE the row is touched, and a refusal keeps the assignment (E4).
+GpuRowGate CudaAfterRow(CudaRun& run, const Row& r, std::wstring& reason) {
+    if (run.removing) {
+        // 🔴 E4 AT THE LEVEL OF THE WHOLE RUN. If the CUDA half could not start at all - an unreadable
+        // note, no NVIDIA driver to put anything back with - then NOTHING is removed. Stripping the
+        // assignments would grey out Remove assignment while entries this product made are still there,
+        // which is precisely the trap E4 exists to close. The reason is said ONCE, as run.whole.
+        if (run.whole != CudaRefusal::None) {
+            // R5-6: the unreadable-note reason names the folder and the legacy file pattern, so a user who
+            // is told nothing can be removed is told where to look.
+            reason = L"its GPU assignment was left in place: " + CudaWholeRunReason(run.whole, GetConfigDir());
+            return GpuRowGate::SkipRow;
+        }
+        if (!run.on) return GpuRowGate::Go;
+        if (run.stopped) {
+            reason = L"not tried: NVIDIA's settings could not be finished for an application before it";
+            Refuse(run.refused, r, L"not tried: NVIDIA's settings could not be finished for an application "
+                                   L"before it");
+            return GpuRowGate::SkipRow;
+        }
+        const CudaRecordRow* line = CudaLineFor(run.record, r.r.exePath);
+        if (line == nullptr) {
+            // The note was read whole - an unreadable one stopped the run before any row - so this really
+            // means this product never changed that application's CUDA setting.
+            //
+            // 🔴 R5-5: EXCEPT THAT NVIDIA MAY STILL HOLD AN ENTRY NAMED FOR THIS PRODUCT FOR IT - a note
+            // that was deleted, or a line that was spent while the driver kept the entry. It is SAID and
+            // nothing else: the removal is NOT blocked (blocking every Remove is the trap E4 exists to
+            // close) and the entry is NOT deleted (an entry no record claims is not ours to delete, E1).
+            const CudaResolved orphan = ResolveCudaProfile(r.r.exePath, run.ops);
+            if (orphan.state == CudaLookup::Found && IsCudaProfileWeMade(orphan.profileName)) {
+                Refuse(run.orphans, r, FormatCudaOrphanEntryLine(orphan.profileName));
+                return GpuRowGate::Go;
+            }
+            // 🔴 R6-3: IN LOOK-ONLY MODE NOTHING IS COUNTED. The session was opened for the orphan check
+            // above and for nothing else, so a machine that has never used this feature reads exactly as
+            // it did before - not one sentence about CUDA in the question or the result.
+            if (run.lookOnly) return GpuRowGate::Go;
+            ++run.noRecord;
+            return GpuRowGate::Go;
+        }
+        const CudaRecordRow rec = *line;   // a COPY: the record is rewritten below, and `line` with it
+        const CudaRowResult res = RestoreCudaForRow(r.r.exePath, rec, run.ops);
+        // The open session may hold a delete that was neither saved nor put back, and the next row's save
+        // would commit it with the line still naming it. No later row of this run asks the driver anything.
+        if (res.sessionDirty) run.stopped = true;
+        // 🔴 R6-7: THE LINE ALREADY SAID THE ENTRY HOLDS NOTHING OF OURS. An earlier Remove took our own
+        // CUDA setting out of an entry it had to leave standing. Nothing to take away, nothing failed, and
+        // THE LINE STAYS - it is what lets a later Apply own that entry again.
+        if (res.outcome == CudaOutcome::NothingOfOurs) {
+            ++run.nothingOfOurs;
+            return GpuRowGate::Go;
+        }
+        if (res.outcome == CudaOutcome::Written || res.outcome == CudaOutcome::Absent) {
+            if (res.outcome == CudaOutcome::Written) {
+                ++run.changed;
+                // R5-1: a restore that left the entry standing because it held settings we did not write.
+                if (res.settingCleared) ++run.keptEntry;
+            }
+            else ++run.already;   // E3: NVIDIA has no entry for it any more, so there is nothing to take away
+            run.recordTouched = true;
+            // 🔴 R6-7: THE CLEAR-ONLY RESTORE KEEPS ITS LINE, WITH THE VALUE EMPTIED. Spending it stranded
+            // the entry: it still exists, still carries this product's name, and with no line claiming it
+            // every future Apply answered "NVIDIA manages this one" - forever, with NVIDIA Control Panel
+            // the only way out. The line now says "we made this entry and there is nothing of ours in it",
+            // which a later Apply can own again and a later Remove finds nothing to do about.
+            if (res.settingCleared) {
+                CudaRecordRow kept = rec;
+                kept.lastWrote = CudaNothingWritten();
+                kept.when.clear();   // stamped afresh: this is when the setting came out
+                if (!SaveCudaRecordRow(run.record, kept))
+                    Refuse(run.unrecorded, r,
+                           L"its CUDA setting was taken out, but the record of it could not be updated");
+                return GpuRowGate::Go;
+            }
+            // 🔴 THE LINE IS SPENT, AND ONLY NOW (E3). Leaving it is what lets a later Remove act on an
+            // entry that is already gone.
+            if (!ForgetCudaRecordRow(run.record, rec.appEntry))
+                Refuse(run.unrecorded, r,
+                       L"its CUDA setting was put back, but the record of it could not be updated");
+            return GpuRowGate::Go;
+        }
+        Refuse(run.refused, r, CudaRowRefusalText(res));
+        reason = L"its GPU assignment was left in place because which GPU CUDA uses could not be put back "
+                 L"for it";
+        return GpuRowGate::SkipRow;
+    }
+    if (!run.on) return GpuRowGate::Go;
+    if (run.stopped) {
+        Refuse(run.refused, r, L"not tried: NVIDIA's settings could not be finished for an application "
+                               L"before it");
+        return GpuRowGate::Go;
+    }
+    // 🔴 THE LINE GOES DOWN BEFORE THE SAVE. WriteCudaForRow calls this after the driver takes the value
+    // and before NvAPI_DRS_SaveSettings, so a change that reaches disk is always one the note already
+    // names - and a row whose line could not be written is taken back out of the driver instead.
+    // The snapshot is what the note has to go back to if that undo succeeds: leaving a line pointing at a
+    // value the driver does not hold would make the next Remove report a conflict that never happened.
+    const std::vector<CudaRecordRow> before = run.record.rows;
+    CudaApplyInputs in;
+    in.record = [&run](const CudaRecordRow& line) { return SaveCudaRecordRow(run.record, line); };
+    const CudaRowResult res = WriteCudaForRow(r.r.exePath, run.target, run.ops, run.record, in);
+    if (res.recorded) run.recordTouched = true;
+    // 🔴 R5-4: A CLEAN-UP THAT FAILED LEFT SOMETHING OF THIS ROW'S IN THE OPEN SESSION, and
+    // NvAPI_DRS_SaveSettings commits the WHOLE session - so no later row of this run may save. The row
+    // itself is also unresolved below, which stops the run outright; this is the belt under that brace, so
+    // a future path that sets sessionDirty without unresolved cannot commit a leftover behind us.
+    if (res.sessionDirty) run.stopped = true;
+    if (res.recorded && res.undone && !SetCudaRecordRows(run.record, before))
+        Refuse(run.unrecorded, r,
+               L"its CUDA setting was not changed, but the record still names it; Remove assignment will "
+               L"report that as a change somebody else made");
+    switch (res.outcome) {
+        case CudaOutcome::Written:
+            ++run.changed;
+            break;
+        case CudaOutcome::AlreadySet:
+            ++run.already;
+            break;
+        case CudaOutcome::Refused:
+            if (res.unresolved) {
+                // 🔴 E5. A change reached NVIDIA's database and could not be taken back out, so no later
+                // application is attempted at all - for CUDA or for its Windows GPU preference.
+                Refuse(run.unresolved, r, CudaRowRefusalText(res));
+                run.stopped = true;
+                return GpuRowGate::StopRun;
+            }
+            Refuse(run.refused, r, CudaRowRefusalText(res));
+            // A note that cannot take a line will not take the next one either, and every row after this
+            // would be written and taken back out again for nothing.
+            if (res.refusal == CudaRefusal::NotRecorded) run.stopped = true;
+            break;
+        default:
+            break;
+    }
+    return GpuRowGate::Go;
+}
+
+// What the result dialog says about CUDA. The twelve-line cap is ListedLines', the same one every other
+// list in this window uses, so a run with forty refusals reads like every other long result.
+CudaResultText CudaTextOf(const CudaRun& run, const std::wstring& targetName) {
+    CudaResultText text;
+    text.changed = run.changed;
+    text.already = run.already;
+    text.noRecord = run.noRecord;
+    text.keptEntry = run.keptEntry;
+    text.nothingOfOurs = run.nothingOfOurs;   // R6-7
+    text.anyOrphan = !run.orphans.empty();
+    text.orphanLines = ListedLines(run.orphans);
+    text.targetName = targetName;
+    text.wholeReason = CudaWholeRunReason(run.whole, GetConfigDir());
+    text.anyRefused = !run.refused.empty();
+    text.refusedLines = ListedLines(run.refused);
+    text.recordStarted = run.recordTouched;
+    text.recordPath = run.record.path;
+    text.anyUnresolved = !run.unresolved.empty();
+    text.unresolvedLines = ListedLines(run.unresolved);
+    text.anyUnrecorded = !run.unrecorded.empty();
+    text.unrecordedLines = ListedLines(run.unrecorded);
+    return text;
+}
+
+// True when the CUDA half of a run has nothing to complain about, so a result the GPU half is happy with
+// still shows the information icon rather than the warning one.
+bool CudaClean(const CudaRun& run) {
+    // R5-5: an entry nothing of ours claims is something the user has to go and deal with in NVIDIA Control
+    // Panel, so the result wears the warning icon even though nothing failed and nothing was blocked.
+    return run.whole == CudaRefusal::None && run.refused.empty() && run.unresolved.empty() &&
+           run.unrecorded.empty() && run.orphans.empty();
+}
+
+// 🔴 THE ONE THING THAT KEEPS THIS TAB PAINTING WHILE A RUN WALKS ITS ROWS (v0.5.9) - the status line is set, that
+// one control is repainted, and the queue's PAINTS ARE LET THROUGH. Nothing else.
+//
+// 🔴 WM_PAINT AND NOTHING ELSE, AS EXACT SINGLE-MESSAGE PEEKS, NEVER A RANGE. WM_PAINT is 0x000F and WM_CLOSE is
+// 0x0010: a range one message wider would destroy this panel BETWEEN two registry writes, with the lifetime counter
+// at zero, freeing the state the edit loop is still holding. Keys, mouse, WM_COMMAND, WM_TIMER, WM_CLOSE and
+// WM_SYSCOMMAND all stay QUEUED and are never retrieved - a click posted during a run is still there when the run
+// returns, which is what B3's refusals then decline. WM_TIMER in particular re-reads the environment and the
+// topology and can lay the whole window out again, once a second, between two registry writes.
+//
+// EACH LOOP IS BOUNDED because a window that invalidates itself from its own WM_PAINT would otherwise spin here
+// forever, and a run that never returns is worse than one that does not paint.
+//
+// RefreshLines and LayoutGpu are NOT called from here: this runs between two registry writes, and the row data it
+// would read is mid-run.
+void ShowRunProgress(GpuState* st, const std::wstring& line) {
+    if (!st->hStatus) return;
+    SetWindowTextW(st->hStatus, line.c_str());
+    InvalidateRect(st->hStatus, nullptr, TRUE);
+    UpdateWindow(st->hStatus);
+    MSG msg;
+    for (int i = 0; i < 32 && PeekMessageW(&msg, nullptr, WM_PAINT, WM_PAINT, PM_REMOVE); ++i)
+        DispatchMessageW(&msg);
+    for (int i = 0; i < 4 && PeekMessageW(&msg, nullptr, WM_SYNCPAINT, WM_SYNCPAINT, PM_REMOVE); ++i)
+        DispatchMessageW(&msg);
+}
+
 // PASS TWO, and every row brought up to date with what the registry now holds. See RunGpuEdits for the order
 // that keeps the restore file honest at any point a run can stop.
 EditTally RunEdits(GpuState* st, const std::vector<EditPlan>& ready, bool removing, const std::wstring& targetKey,
-                   GpuRestoreJournal& journal) {
+                   GpuRestoreJournal& journal, CudaRun* cuda = nullptr) {
+    const ULONGLONG started = GetTickCount64();
     std::vector<GpuEditItem> items;
     for (size_t k = 0; k < ready.size(); ++k) items.push_back(ready[k].item);
+    // 🔴 THE PROGRESS COUNTER, AND THE CUDA SENTENCE IT MAY CARRY (v0.5.9). `on` alone is not "this run has a CUDA
+    // half": Remove opens the driver session in look-only mode too (R6-3), where nothing is ever written and nothing
+    // is ever saved, so a run that will not save must not promise the user a save per application.
+    const bool cudaHalf = cuda != nullptr && cuda->on && !cuda->lookOnly;
+    const size_t total = items.size();
+    size_t rowsDone = 0;
+    // One-based, and never past `total`: a run that stops part-way stops counting here, because RunGpuEdits' after-
+    // a-stop fast path calls nothing at all. Making that number tidy would mean calling afterRow on that path, which
+    // also fires TestWriteDelay and would change the timing of a documented end-to-end test seam.
+    const auto publish = [&]() {
+        ShowRunProgress(st, FormatRunProgressLine(removing, rowsDone < total ? rowsDone + 1 : total, total, cudaHalf));
+    };
     GpuEditOps ops;
-    ops.write = [](const std::wstring& path, bool expectPresent, const std::wstring& expectValue, bool deleteValue,
-                   const std::wstring& value, unsigned long& error) {
-        return GuardedWriteGpuPreference(path, expectPresent, expectValue, deleteValue, value, &error);
+    ops.write = [st](const std::wstring& path, bool expectPresent, const std::wstring& expectValue, bool deleteValue,
+                     const std::wstring& value, unsigned long& error, bool automatic) {
+        // A hand tick is the user's override (founder decision, v0.5.6) and passes no check.
+        if (!automatic) return GuardedWriteGpuPreference(path, expectPresent, expectValue, deleteValue, value, &error);
+        AutoWriteCheck check = { st, &path };
+        return GuardedWriteGpuPreference(path, expectPresent, expectValue, deleteValue, value, &error, nullptr, nullptr,
+                                         StillAutoEligible, &check);
     };
     ops.read = [](const std::wstring& path, std::wstring& value, bool& unreadable) {
         return ReadGpuPreference(path, value, &unreadable);
     };
     ops.record = [&journal](const GpuPreferenceBefore& row) { return RecordGpuRestoreRow(journal, row); };
-    ops.afterRow = TestWriteDelay;
-    if (!items.empty()) TestWriteDelay();
+    // 🔴 THE PROGRESS LINE RIDES THE SEAM THAT ALREADY EXISTS, rather than a second callback beside it. `afterRow` is
+    // "called after every row; may be empty" (gpu_edit.h) and was already wired to TestWriteDelay; that call and its
+    // place are kept exactly - it is a documented end-to-end test seam - and the counter is published beside it.
+    ops.afterRow = [&]() {
+        TestWriteDelay();
+        ++rowsDone;
+        publish();
+    };
+    // 🔴 THE CUDA HALF RUNS INSIDE THE ROW LOOP, NOT IN A SECOND PASS OVER ITS RESULTS (E4, E5). It used to
+    // run here, after every registry write had already happened - so a Remove could strip an assignment
+    // before finding out that the NVIDIA entry had to stay, and an Apply whose rollback failed carried on
+    // writing later applications while the result claimed nothing after it was tried.
+    if (cuda) {
+        ops.cudaRow = [st, &ready, cuda](size_t index, std::wstring& reason) {
+            return CudaAfterRow(*cuda, st->rows[ready[index].row], reason);
+        };
+    }
+    // AND ONCE BEFORE THE FIRST WRITE, where this seam already paused: the first row carries the first whole-database
+    // save and is the slowest single unit of the run, so a counter that only appeared after it would leave the tab
+    // blank for exactly the longest wait it exists to explain.
+    if (!items.empty()) {
+        TestWriteDelay();
+        publish();
+    }
     const std::vector<GpuEditResult> results = RunGpuEdits(items, removing, targetKey, ops);
 
     EditTally t;
@@ -809,8 +1469,8 @@ EditTally RunEdits(GpuState* st, const std::vector<EditPlan>& ready, bool removi
         r.listedChoice = res.choiceText;   // the same read: the list now shows it, so the next Apply compares with it
         const bool changed = res.outcome == GpuEditOutcome::Done || res.outcome == GpuEditOutcome::Unconfirmed;
         switch (res.outcome) {
-            case GpuEditOutcome::Done:         ++t.done; r.r.selected = false; break;
-            case GpuEditOutcome::AlreadyDone:  Refuse(t.already, r, res.reason); r.r.selected = false; break;
+            case GpuEditOutcome::Done:         ++t.done; Untick(r); break;
+            case GpuEditOutcome::AlreadyDone:  Refuse(t.already, r, res.reason); Untick(r); break;
             case GpuEditOutcome::Refused:      Refuse(t.refused, r, res.reason); break;
             case GpuEditOutcome::Unconfirmed:  Refuse(t.uncertain, r, res.reason); break;
             case GpuEditOutcome::NotAttempted: Refuse(t.notTried, r, res.reason); break;
@@ -818,7 +1478,7 @@ EditTally RunEdits(GpuState* st, const std::vector<EditPlan>& ready, bool removi
         // A ROW LEFT UNFINISHED AT ANOTHER PROGRAM'S GPU CHOICE IS UNTICKED (UntickAfterRun, gpu_edit.h): kept ticked, the next
         // Apply would compare with that choice - the listed one now - and write over it.
         if (UntickAfterRun(res.outcome, listedBefore, res.choiceText, IntendedChoiceText(ready[k].item, removing, targetKey))) {
-            r.r.selected = false;
+            Untick(r);
             ++t.changedSinceListed;
         }
         // "LOST ITS GPU" DESCRIBES THE OLD STATE. A row this run changed, or one that now holds a setting, no
@@ -835,7 +1495,13 @@ EditTally RunEdits(GpuState* st, const std::vector<EditPlan>& ready, bool removi
     // sibling-version evidence and invalidate earlier automatic ticks before the next action.
     const std::vector<GpuRow> automatic = ReadAutoChoices(st);
     for (size_t i = 0; i < st->rows.size(); ++i)
-        if (st->rows[i].autoSelected && !automatic[i].selected) st->rows[i].r.selected = false;
+        if (st->rows[i].autoSelected && !automatic[i].selected) Untick(st->rows[i]);
+    // 🔴 HOW LONG A ROW ACTUALLY TAKES, WHICH NOBODY HAS EVER MEASURED (v0.5.9). Every judgement about this run -
+    // whether the bounded paint pump above is enough, whether a hundred-row Apply is minutes or seconds - has been an
+    // assumption. It is one line at the end of a run, in ActivateGpuPanel's own form ("[gpu] panel refreshed in %llu
+    // ms (%zu rows)"), and the CUDA flag is part of it because a whole-database save per row is the whole question.
+    LogLine(L"[gpu] %s ran %zu rows in %llu ms (CUDA half %s)", removing ? L"Remove" : L"Apply", items.size(),
+            GetTickCount64() - started, cudaHalf ? L"on" : L"off");
     return t;
 }
 
@@ -883,13 +1549,19 @@ void RereadAfterChangedRows(GpuState* st, HWND hwnd, size_t changedSinceListed) 
 }
 
 void DoApply(GpuState* st, HWND hwnd) {
+    // 🔴 FIRST STATEMENT, BEFORE ANYTHING CAN RETURN (v0.5.9): the run is declared, the buttons go dead and the
+    // WM_COMMAND handler starts refusing a second click - including one ALREADY IN THE QUEUE, which the confirmation
+    // box's own modal loop would otherwise dispatch straight back into here. That re-entry opened a SECOND NVAPI DRS
+    // session over the first, each carrying its own in-memory copy of gpu-cuda-record.txt, and whichever saved last
+    // lost the other's lines. It took a double-press, not a rare race.
+    RunGuard run(st);
     // THE TARGET IS CHECKED AGAIN HERE, NOT TRUSTED FROM THE PICKER: one of the GPUs the picker offers - the main
     // GPU among them since v0.5.6 - and the one the picker really shows (adversarial review, v0.5.5). It is copied
     // once, and that copy is what every row is written with.
     const std::wstring targetKey = st->targetKey;
     if (targetKey.empty()) return;   // Apply is disabled without a target
     if (!TargetStillShown(st, targetKey)) {
-        DropTarget(st, hwnd);
+        if (!DropTarget(st, hwnd)) run.st = nullptr;
         return;
     }
     const size_t pending = SelectedCount(st);
@@ -911,20 +1583,31 @@ void DoApply(GpuState* st, HWND hwnd) {
     // The words come from FormatAssignConfirm, which the unit suite pins (AJ37): v0.5.5's sentences unchanged, plus a
     // warning when the target is the main GPU, and one when DXCore said the target is an integrated GPU. A GPU whose
     // kind could not be read gets no integrated warning - nothing is said that was not measured.
+    // THE DRIVER SESSION IS OPENED BEFORE THE QUESTION, because the question has to say what the answer
+    // will do: which GPU CUDA will use, and which other applications NVIDIA carries along with each
+    // ticked one. It is closed however this function returns.
+    CudaRun cuda = OpenCudaRun(st, targetKey, false);
+    CudaRunCloser closer = { &cuda };
+
     AssignConfirm confirm;
     confirm.count = pending;
     confirm.targetName = target;
     confirm.replacing = replacing;
     confirm.mainGpu = IsMainGpuKey(st->plan, targetKey);
     confirm.integrated = KindForKey(st->adapters, targetKey) == GpuKind::Integrated;
+    confirm.cudaLine = FormatCudaConfirmLine(cuda.on, target);
     const std::wstring ask = FormatAssignConfirm(confirm);
     int answer = 0;
-    // A false return is a panel destroyed while the question was open: `st` is freed or about to be, so nothing more.
-    if (!PanelMessageBox(st, hwnd, ask.c_str(), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2, &answer)) return;
+    // A false return is a panel destroyed while the question was open: `st` is freed or about to be, so nothing more -
+    // and the guard is told, or its destructor would redraw that freed state.
+    if (!PanelMessageBox(st, hwnd, ask.c_str(), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2, &answer)) {
+        run.st = nullptr;
+        return;
+    }
     if (answer != IDYES) return;
     // Checked again after the question: nothing may have moved the picker while it was open.
     if (!TargetStillShown(st, targetKey)) {
-        DropTarget(st, hwnd);
+        if (!DropTarget(st, hwnd)) run.st = nullptr;
         return;
     }
 
@@ -938,11 +1621,17 @@ void DoApply(GpuState* st, HWND hwnd) {
         Redraw(st);
         const std::wstring notStarted =
             NotStartedMessage(st, ready, notWritten, L"Not written:") + ChangedSinceListedLine(changedSinceListed);
-        if (!PanelMessageBox(st, hwnd, notStarted.c_str(), MB_OK | MB_ICONWARNING)) return;
+        if (!PanelMessageBox(st, hwnd, notStarted.c_str(), MB_OK | MB_ICONWARNING)) {
+            run.st = nullptr;
+            return;
+        }
         RereadAfterChangedRows(st, hwnd, changedSinceListed);
         return;
     }
-    const EditTally t = RunEdits(st, ready, false, targetKey, journal);
+    // The CUDA record is NOT a per-run file and is not started here: it is one file in the config folder,
+    // already read by OpenCudaRun, and each row's line goes into it before that row's change is saved
+    // (gpu_cuda.h, E2).
+    const EditTally t = RunEdits(st, ready, false, targetKey, journal, &cuda);
     changedSinceListed += t.changedSinceListed;   // pass two's too: those rows are unticked, said and read again the same way
     // THE RECORD GOES ONLY WHEN EVERY CHANGE IS OVER AND EVERY CHANGED ROW IS IN THE RESTORE FILE.
     const bool finished = ready.empty() || (t.unrecorded.empty() && FinishGpuRestore(journal));
@@ -953,39 +1642,75 @@ void DoApply(GpuState* st, HWND hwnd) {
     notWritten.insert(notWritten.end(), t.refused.begin(), t.refused.end());
     std::wstring msg = std::to_wstring(t.done) + L" of " + std::to_wstring(pending)
                      + L" assigned to " + target + L".";
-    if (!t.already.empty()) msg += L"\r\n\r\nAlready set, nothing written:" + ListedLines(t.already);
+    // 🔴 R6-4: IT SAYS WHICH SETTING IT MEANS. "Already set, nothing written" is about WINDOWS' own
+    // per-application GPU preference and nothing else - and since R5-3 those very rows DO get their CUDA
+    // entry written. On a machine upgrading from v0.5.6 or v0.5.7 every ticked application is already
+    // pinned, so this heading covers the whole list while the CUDA half below it reports real changes; the
+    // unqualified wording read as "nothing happened for any of these".
+    if (!t.already.empty())
+        msg += L"\r\n\r\nWindows' own GPU preference was already set, nothing written:" + ListedLines(t.already);
     if (!notWritten.empty()) msg += L"\r\n\r\nNot written:" + ListedLines(notWritten);
     msg += ChangedSinceListedLine(changedSinceListed);
     if (!t.uncertain.empty()) msg += L"\r\n\r\nWritten, but not confirmed:" + ListedLines(t.uncertain);
     if (!t.notTried.empty()) msg += L"\r\n\r\nNot tried:" + ListedLines(t.notTried);
     msg += RestoreLines(journal, t, finished);
-    if (t.done > 0) {
+    const CudaResultText cudaText = CudaTextOf(cuda, target);
+    msg += FormatCudaApplyLines(cudaText);
+    // 🔴 R6-4, AND IT IS WHAT AN UPGRADE FROM v0.5.7 ACTUALLY HITS. This paragraph used to be printed only
+    // when a REGISTRY value had been written. Since R5-3 the CUDA half also runs for a row whose Windows
+    // pin is already what this Apply intends - which is every application v0.5.6 and v0.5.7 pinned - so on
+    // those machines Apply writes no registry value, t.done is 0, and the one sentence telling the user
+    // the change arrives at the application's NEXT LAUNCH was skipped. They saw "nothing written", no
+    // restart advice, and concluded the feature had not worked. A CUDA setting that changed is a change,
+    // and it needs the same restart.
+    if (t.done > 0 || cudaText.changed > 0) {
         // AN INSTRUCTION, NEVER A CLAIM THAT IT HAS TAKEN EFFECT. Windows reads this preference when
         // an application creates its graphics device, at start-up, so a running application keeps
-        // the GPU it already has.
+        // the GPU it already has. Byte-identical to v0.5.7's, which end-to-end scripts match on.
         msg += L"\r\n\r\nRestart those applications for the change to take effect. A running "
                L"application keeps the GPU it started on.";
+        // 🔴 AND THE SECOND HALF ONLY WHEN IT IS TRUE. A row on the AMD integrated GPU, or a run with the
+        // check box off, must not see the word CUDA anywhere (founder decision 18).
+        if (cudaText.changed > 0)
+            msg += L" The same is true of which GPU CUDA uses: NVIDIA reads that when an application "
+                   L"starts as well.";
     }
-    const bool clean = notWritten.empty() && t.uncertain.empty() && t.notTried.empty() && finished;
-    if (!PanelMessageBox(st, hwnd, msg.c_str(), MB_OK | (clean ? MB_ICONINFORMATION : MB_ICONWARNING))) return;
+    const bool clean = notWritten.empty() && t.uncertain.empty() && t.notTried.empty() && finished && CudaClean(cuda);
+    if (!PanelMessageBox(st, hwnd, msg.c_str(), MB_OK | (clean ? MB_ICONINFORMATION : MB_ICONWARNING))) {
+        run.st = nullptr;
+        return;
+    }
     RereadAfterChangedRows(st, hwnd, changedSinceListed);
 }
 
 void DoRemove(GpuState* st, HWND hwnd) {
+    RunGuard run(st);   // as in DoApply, and for the same re-entry: see RunGuard and the WM_COMMAND refusals
     // 🔴 CONFIRM FIRST, DEFAULTING TO NO - EXACTLY AS APPLY DOES. Found in the v0.5.5 window's own
     // screenshot: after the bulk action (now "Auto assign GPU for Gaming") this red button sits lit
     // beside Apply, and it used to delete registry values the moment it was clicked.
     const size_t removable = RemovableCount(st);
     if (removable == 0) return;
-    const std::wstring nl2 = std::wstring(1, wchar_t(13)) + wchar_t(10) + wchar_t(13) + wchar_t(10);
-    const std::wstring ask = L"Remove the GPU assignment from " + std::to_wstring(removable) +
-                             L" application" + (removable == 1 ? L"" : L"s") + L"?" + nl2 +
-                             L"Each returns to Windows' default GPU choice the next time it starts, and the "
-                             L"previous value of each one it changes is kept in a restore file. " +
-                             L"Ticked applications with no assignment are left alone.";
+    // Opened before the question for the same reason Apply opens it there: the driver session has to be
+    // the one that later saves, and the records have to be readable before anything is undone - and, since
+    // v0.5.8, because the question itself has to say what putting the CUDA setting back will touch (F8).
+    CudaRun cuda = OpenCudaRun(st, std::wstring(), true);
+    CudaRunCloser closer = { &cuda };
+    // The words come from FormatRemoveConfirm, which the unit suite pins (AJ37b): v0.5.7's two sentences
+    // unchanged, plus the CUDA line when a note really has something to take away - or when the CUDA half
+    // cannot run at all, in which case E4 removes NOTHING and the question has to say so BEFORE Yes.
+    RemoveConfirm confirm;
+    confirm.count = removable;
+    // R5-6: the blocked-Remove sentence names the configuration folder and the legacy file pattern.
+    confirm.cudaLine = FormatCudaRestoreConfirmLine(CudaRestoreCount(st, cuda), !st->cudaEnabled,
+                                                    CudaWholeRunReason(cuda.whole, GetConfigDir()));
+    const std::wstring ask = FormatRemoveConfirm(confirm);
     int answer = 0;
-    // As in DoApply: a false return is a panel destroyed while the question was open, so nothing more.
-    if (!PanelMessageBox(st, hwnd, ask.c_str(), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2, &answer)) return;
+    // As in DoApply: a false return is a panel destroyed while the question was open, so nothing more, and the guard
+    // is told so its destructor does not redraw freed state.
+    if (!PanelMessageBox(st, hwnd, ask.c_str(), MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2, &answer)) {
+        run.st = nullptr;
+        return;
+    }
     if (answer != IDYES) return;
 
     std::vector<EditPlan> ready;
@@ -998,12 +1723,15 @@ void DoRemove(GpuState* st, HWND hwnd) {
         Redraw(st);
         const std::wstring notStarted =
             NotStartedMessage(st, ready, notRemoved, L"Not removed:") + ChangedSinceListedLine(changedSinceListed);
-        if (!PanelMessageBox(st, hwnd, notStarted.c_str(), MB_OK | MB_ICONWARNING)) return;
+        if (!PanelMessageBox(st, hwnd, notStarted.c_str(), MB_OK | MB_ICONWARNING)) {
+            run.st = nullptr;
+            return;
+        }
         RereadAfterChangedRows(st, hwnd, changedSinceListed);
         return;
     }
     // STRIP ONLY THIS FEATURE'S FIELDS; the whole value is deleted only when nothing else was in it.
-    const EditTally t = RunEdits(st, ready, true, std::wstring(), journal);
+    const EditTally t = RunEdits(st, ready, true, std::wstring(), journal, &cuda);
     changedSinceListed += t.changedSinceListed;   // as in DoApply
     const bool finished = ready.empty() || (t.unrecorded.empty() && FinishGpuRestore(journal));
     Redraw(st);
@@ -1017,12 +1745,16 @@ void DoRemove(GpuState* st, HWND hwnd) {
     if (!t.uncertain.empty()) msg += L"\r\n\r\nChanged, but not confirmed:" + ListedLines(t.uncertain);
     if (!t.notTried.empty()) msg += L"\r\n\r\nNot tried:" + ListedLines(t.notTried);
     msg += RestoreLines(journal, t, finished);
+    msg += FormatCudaRemoveLines(CudaTextOf(cuda, std::wstring()));
     if (t.done > 0) {
         msg += L"\r\n\r\nThose applications return to Windows' default GPU choice the next time "
                L"they start.";
     }
-    const bool clean = notRemoved.empty() && t.uncertain.empty() && t.notTried.empty() && finished;
-    if (!PanelMessageBox(st, hwnd, msg.c_str(), MB_OK | (clean ? MB_ICONINFORMATION : MB_ICONWARNING))) return;
+    const bool clean = notRemoved.empty() && t.uncertain.empty() && t.notTried.empty() && finished && CudaClean(cuda);
+    if (!PanelMessageBox(st, hwnd, msg.c_str(), MB_OK | (clean ? MB_ICONINFORMATION : MB_ICONWARNING))) {
+        run.st = nullptr;
+        return;
+    }
     RereadAfterChangedRows(st, hwnd, changedSinceListed);
 }
 
@@ -1140,21 +1872,51 @@ void LayoutGpu(HWND hwnd, GpuState* st) {
     const int need = text > 0 ? static_cast<int>(text) + 2 * theme::Dp(10, dpi) + theme::Dp(8, dpi) : theme::Dp(190, dpi);
     if (need > bw) bw = need;
     const int bn = theme::Dp(116, dpi);
-    int bx = x;
-    MoveWindow(st->hBulk, bx, btnY, bw, ROW, TRUE);      bx += bw + GT;
-    MoveWindow(st->hClearSel, bx, btnY, bn, ROW, TRUE);  bx += bn + GT;
-    MoveWindow(st->hRemove, bx, btnY, bw, ROW, TRUE);
 
+    // THE RIGHT-HAND GROUP IS PLACED FIRST, BECAUSE THE LEFT GROUP'S ROOM IS WHATEVER IT LEAVES.
+    //
+    // 🔴 THE ROW DID NOT FIT ONCE SELECT ALL JOINED IT, AND THE OVERLAP WAS INVISIBLE AT THE DEFAULT SIZE. [M] At the
+    // panel's MINIMUM width - 824 px at 96 dpi, from Settings' Dp(880) client minimum less its kGap and kCardPad - the
+    // three old buttons ended at 488 and Apply began at 584, so a fourth Dp(116) button plus its Dp(8) gap wanted 124
+    // px of the 96 that were free: 28 px of overlap at 96 dpi, 62 at 192. At the DEFAULT width it fits with room to
+    // spare, which is exactly why looking at the panel would have passed it. Raising Dp(880) is closed (settings.cpp:
+    // 900 leaves zero room on a 1366-wide screen, and three files would have to move together), so the row absorbs it
+    // in its own arithmetic instead, the way settings.cpp's Reset/Add/Remove row shares its remainder.
     const int rx = x + w;
+    const int applyX = rx - bn - GT - bn;
     MoveWindow(st->hClose, rx - bn, btnY, bn, ROW, TRUE);
-    MoveWindow(st->hApply, rx - bn - GT - bn, btnY, bn, ROW, TRUE);
+    MoveWindow(st->hApply, applyX, btnY, bn, ROW, TRUE);
+
+    // Select all and Deselect all SHARE what the row has left after the two wide buttons and the three gaps between
+    // the four - at most the width Deselect all had alone, and never narrower than a readable caption. At the default
+    // width the min() is inert and every button keeps the width it had before Select all existed.
+    const int leftEdge = applyX - GT;   // the left group's right edge may never pass this
+    int bs = (std::min)(bn, (leftEdge - x - 2 * bw - 3 * GT) / 2);
+    bs = (std::max)(bs, theme::Dp(76, dpi));
+
+    // 🔴 AND A HARD CLAMP THE PRECEDENT DOES NOT HAVE. The readable floor above can win on a panel narrower than
+    // anything Settings will hand us, and an arithmetic that "cannot" fail is exactly the kind that ships an overlap.
+    // No button of this group may start or end past `leftEdge`, so a row that genuinely cannot fit ellipsizes its
+    // captions - theme::DrawButton already does that with DT_END_ELLIPSIS - instead of sliding under Apply. Each
+    // button also starts after the previous one ENDS, so two of them can never overlap each other either.
+    const HWND leftRow[4] = { st->hBulk, st->hSelAll, st->hClearSel, st->hRemove };
+    const int leftW[4] = { bw, bs, bs, bw };
+    int bx = x;
+    for (int i = 0; i < 4; ++i) {
+        if (bx > leftEdge) bx = leftEdge;
+        int cw = leftW[i];
+        if (bx + cw > leftEdge) cw = leftEdge - bx;
+        if (cw < 0) cw = 0;
+        MoveWindow(leftRow[i], bx, btnY, cw, ROW, TRUE);
+        bx += cw + GT;
+    }
     InvalidateRect(hwnd, nullptr, TRUE);
 }
 
 // Every control gets the body font at the panel's current dpi. WM_CREATE and WM_DPICHANGED_AFTERPARENT share this.
 void ApplyPanelFont(GpuState* st) {
     HWND all[] = { st->hPlan, st->hTargetLbl, st->hTarget, st->hStatus, st->hList, st->hPath,
-                   st->hBulk, st->hClearSel, st->hRemove, st->hApply, st->hClose };
+                   st->hBulk, st->hSelAll, st->hClearSel, st->hRemove, st->hApply, st->hClose };
     for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); ++i)
         if (all[i]) SendMessageW(all[i], WM_SETFONT, reinterpret_cast<WPARAM>(st->font), TRUE);
 }
@@ -1195,7 +1957,7 @@ std::wstring PickedCandidate(const GpuState* st) {
 // takes when it shows another GPU than the target.
 void TakePickedTarget(GpuState* st) {
     st->targetKey = PickedCandidate(st);
-    for (size_t i = 0; i < st->rows.size(); ++i) st->rows[i].r.selected = false;
+    for (size_t i = 0; i < st->rows.size(); ++i) Untick(st->rows[i]);
     Redraw(st);
 }
 
@@ -1236,7 +1998,12 @@ LRESULT CALLBACK GpuProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                            IDC_GPU_LIST);
             st->hPath = Mk(hwnd, L"EDIT", L"", ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL, IDC_GPU_PATH);
             st->hBulk = Mk(hwnd, L"BUTTON", kBulkCaption, BS_OWNERDRAW | WS_TABSTOP, IDC_GPU_BULK);
-            st->hClearSel = Mk(hwnd, L"BUTTON", L"Clear selection", BS_OWNERDRAW | WS_TABSTOP,
+            // 🔴 THE ORDER OF THESE Mk() CALLS IS THE TAB ORDER. Win32 tab order is Z-order, which is creation order
+            // (the same rule settings.cpp records where it creates the pages' controls), so Select all is created
+            // immediately before Deselect all and the pair is reached by Tab in the order the row reads.
+            st->hSelAll = Mk(hwnd, L"BUTTON", L"Select all", BS_OWNERDRAW | WS_TABSTOP, IDC_GPU_SELALL);
+            // Renamed from "Clear selection" in v0.5.9 so the pair reads together (operator request).
+            st->hClearSel = Mk(hwnd, L"BUTTON", L"Deselect all", BS_OWNERDRAW | WS_TABSTOP,
                                IDC_GPU_CLEARSEL);
             st->hRemove = Mk(hwnd, L"BUTTON", L"Remove assignment", BS_OWNERDRAW | WS_TABSTOP,
                              IDC_GPU_REMOVE);
@@ -1249,7 +2016,7 @@ LRESULT CALLBACK GpuProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // panel shows its reason and offers nothing. Decided here, once, before the font pass can
             // overwrite GetLastError; ActivateGpuPanel starts every refresh from this.
             st->controlsBroken = !st->hPlan || !st->hTargetLbl || !st->hTarget || !st->hStatus || !st->hList || !st->hPath ||
-                                 !st->hBulk || !st->hClearSel || !st->hRemove || !st->hApply || !st->hClose;
+                                 !st->hBulk || !st->hSelAll || !st->hClearSel || !st->hRemove || !st->hApply || !st->hClose;
             st->broken = st->controlsBroken;
             if (st->controlsBroken) {
                 LogLine(L"[gpu] the GPU Assignment panel could not create its controls, gle=%lu", GetLastError());
@@ -1315,7 +2082,7 @@ LRESULT CALLBACK GpuProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 theme::ButtonKind k = theme::ButtonKind::Secondary;
                 if (di->hwndItem == st->hApply || di->hwndItem == st->hBulk) k = theme::ButtonKind::Primary;
                 else if (di->hwndItem == st->hRemove) k = theme::ButtonKind::Danger;
-                else if (di->hwndItem == st->hClearSel) k = theme::ButtonKind::Ghost;
+                else if (di->hwndItem == st->hClearSel || di->hwndItem == st->hSelAll) k = theme::ButtonKind::Ghost;
                 return theme::DrawButton(di, k, st->dpi);
             }
             break;
@@ -1363,12 +2130,14 @@ LRESULT CALLBACK GpuProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // Without it a row could be ticked only with a mouse. Every other key keeps the list
             // box's own handling (-1); a handled Space returns -2 so the list box does nothing more.
             if (st && reinterpret_cast<HWND>(lp) == st->hList && LOWORD(wp) == VK_SPACE) {
+                // As at LBN_DBLCLK: the list stays enabled during a run, so this toggle refuses for itself (v0.5.9).
+                if (g_running != 0) return -2;
                 const int caret = static_cast<int>(HIWORD(wp));
                 const LRESULT data = SendMessageW(st->hList, LB_GETITEMDATA, static_cast<WPARAM>(caret), 0);
                 const size_t idx = (data != LB_ERR) ? static_cast<size_t>(data) : st->rows.size();
                 if (!st->broken && idx < st->rows.size() && st->rows[idx].listed) {
-                    st->rows[idx].r.selected = !st->rows[idx].r.selected;
-                    st->rows[idx].autoSelected = false;
+                    if (st->rows[idx].r.selected) Untick(st->rows[idx]);
+                    else Tick(st->rows[idx]);
                     Redraw(st);
                 }
                 return -2;
@@ -1383,13 +2152,17 @@ LRESULT CALLBACK GpuProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // TOGGLE ON DOUBLE-CLICK, NOT ON SELECTION. LBN_SELCHANGE also fires for arrow-key
             // navigation, so toggling on it would flip a row every time the user walked the list.
             if (id == IDC_GPU_LIST && code == LBN_DBLCLK) {
+                // The list box stays ENABLED during a run so it can be read and scrolled, so its toggle is the one
+                // list path that has to refuse for itself (v0.5.9). A run's plan is frozen, but a tick changed
+                // under it would leave the tab claiming a state the run never acted on.
+                if (g_running != 0) return 0;
                 const int sel = static_cast<int>(SendMessageW(st->hList, LB_GETCURSEL, 0, 0));
                 if (sel >= 0) {
                     const size_t idx = static_cast<size_t>(
                         SendMessageW(st->hList, LB_GETITEMDATA, static_cast<WPARAM>(sel), 0));
                     if (!st->broken && idx < st->rows.size() && st->rows[idx].listed) {
-                        st->rows[idx].r.selected = !st->rows[idx].r.selected;
-                        st->rows[idx].autoSelected = false;
+                        if (st->rows[idx].r.selected) Untick(st->rows[idx]);
+                        else Tick(st->rows[idx]);
                         Redraw(st);
                     }
                 }
@@ -1428,20 +2201,30 @@ LRESULT CALLBACK GpuProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 return 0;
             }
             if (code != BN_CLICKED) break;
+            // 🔴 EVERY ONE OF THESE REFUSES AT THE MESSAGE WHILE A RUN IS GOING, NOT ONLY AT THE BUTTON (v0.5.9).
+            // DISABLING A BUTTON DOES NOT TAKE BACK A CLICK ALREADY IN THE QUEUE, and a disabled owner does not stop
+            // a POSTED message either: MessageBoxW runs its own modal loop, which dispatches that click straight
+            // into DoApply while Apply's own question is still open. GpuPanelKey's Enter and Esc are posted the same
+            // way and arrive by the same route. SyncButtons' freeze is what stops the SECOND click; this is what
+            // stops the one that was already on its way.
             switch (id) {
-                case IDC_GPU_BULK:     DoBulk(st, hwnd); return 0;
+                case IDC_GPU_BULK:     if (g_running != 0) return 0; DoBulk(st, hwnd); return 0;
+                case IDC_GPU_SELALL:   if (g_running != 0) return 0; DoSelectAll(st); return 0;
                 case IDC_GPU_CLEARSEL:
-                    for (size_t i = 0; i < st->rows.size(); ++i) st->rows[i].r.selected = false;
+                    if (g_running != 0) return 0;
+                    for (size_t i = 0; i < st->rows.size(); ++i) Untick(st->rows[i]);
                     Redraw(st);
                     return 0;
-                case IDC_GPU_REMOVE:   DoRemove(st, hwnd); return 0;
-                case IDC_GPU_APPLY:    DoApply(st, hwnd); return 0;
+                case IDC_GPU_REMOVE:   if (g_running != 0) return 0; DoRemove(st, hwnd); return 0;
+                case IDC_GPU_APPLY:    if (g_running != 0) return 0; DoApply(st, hwnd); return 0;
                 case IDC_GPU_CLOSE:
+                    // Cancel unticks the rows, so a run walking them must not see one vanish mid-loop.
+                    if (g_running != 0) return 0;
                     // CANCEL UNTICKS AND HANDS BACK; IT NEVER DESTROYS. The separate window closed itself here; a tab
                     // that did the same would stay empty until Settings was opened again. A tick writes nothing, so
                     // there is nothing else to undo. Where to go next is Settings' call - the tab the user came from -
                     // so the panel only tells its parent, and touches nothing once that call returns.
-                    for (size_t i = 0; i < st->rows.size(); ++i) st->rows[i].r.selected = false;
+                    for (size_t i = 0; i < st->rows.size(); ++i) Untick(st->rows[i]);
                     Redraw(st);
                     SendMessageW(GetParent(hwnd), WM_COMMAND, MAKEWPARAM(GetDlgCtrlID(hwnd), GPUN_CANCEL),
                                  reinterpret_cast<LPARAM>(hwnd));
@@ -1524,6 +2307,7 @@ void LoadGpuData(GpuState* st, const Config& cfg, const ProcessSnapshot& snap) {
         if (st->rows[i].listed && st->rows[i].r.selected)
             ticked.push_back(FactsOfRow(st->rows[i].r, st->rows[i].listedChoice, st->plan.gameKey));
 
+    st->cudaEnabled = cfg.setCudaGpu;
     std::wstring err;
     const bool adaptersRead = EnumerateGpuAdapters(st->adapters, &err);
     if (!adaptersRead) st->adapters.clear();
@@ -1566,6 +2350,7 @@ void LoadGpuData(GpuState* st, const Config& cfg, const ProcessSnapshot& snap) {
         Row& row = st->rows[i];
         row.autoSelected = automaticPaths.count(ToLower(row.r.exePath)) != 0;
         row.r.selected = kept[i] && (!row.autoSelected || (!row.system && automatic[i].selected));
+        if (!row.r.selected) Untick(row);   // a tick that did not survive takes its origin with it
     }
 }
 
@@ -1595,7 +2380,7 @@ void ActivateGpuPanel(HWND panel, const Config& cfg, const ProcessSnapshot& snap
     FillTargets(st);
     // NO TARGET ON SCREEN, NO TICKS KEPT FOR ONE: a tick is made for a GPU, exactly as when the picker changes.
     if (st->targetKey.empty())
-        for (size_t i = 0; i < st->rows.size(); ++i) st->rows[i].r.selected = false;
+        for (size_t i = 0; i < st->rows.size(); ++i) Untick(st->rows[i]);
     FillList(st);
     LayoutGpu(panel, st);
     SyncButtons(st);
@@ -1663,7 +2448,8 @@ bool GpuPanelKey(HWND panel, const MSG& msg) {
         press = st->hClose;
     } else {
         const HWND f = GetFocus();
-        if (f && (f == st->hBulk || f == st->hClearSel || f == st->hRemove || f == st->hApply || f == st->hClose))
+        if (f && (f == st->hBulk || f == st->hSelAll || f == st->hClearSel || f == st->hRemove || f == st->hApply ||
+                  f == st->hClose))
             press = f;
     }
     if (press && IsWindowEnabled(press))

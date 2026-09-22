@@ -161,11 +161,15 @@ The `third_party\webview2\` folder is **documentation only** — nothing in it i
 time. To remove Game Optimizer: **if you turned on the AMD 3D V-Cache setting, turn it off first and
 restart** — that setting disables a driver, and the record of its original value lives in
 `config.ini`, so deleting that file first leaves the driver disabled with nothing left to restore
-it. **GPU assignments are Windows settings and stay after the app is deleted** — to undo them,
-use **Remove assignment** on the GPU Assignment tab before removing the app, or keep the
-`gpu-preferences-before-*.reg` restore files, which live in `%LOCALAPPDATA%\GameOptimizer\`, and
-open them. Then Exit from the tray icon, delete the folder you unzipped, and delete
-`%LOCALAPPDATA%\GameOptimizer\` if you want its settings gone too.
+it. **GPU assignments and CUDA settings stay after the app is deleted** — the first are Windows
+settings and the second are NVIDIA's. To undo both, start the applications you assigned (the GPU
+Assignment tab lists only running applications), tick them, and press **Remove assignment**
+**before** doing anything else. Do it before opening any `gpu-preferences-before-*.reg` restore
+file: those files put back Windows' GPU preference but not the CUDA setting, and once one has cleared
+an application's preference, Remove assignment can no longer reach that application's CUDA setting.
+Then Exit from the tray icon, delete the folder you unzipped, and delete
+`%LOCALAPPDATA%\GameOptimizer\` if you want its settings gone too — only after Remove assignment,
+because that folder holds `gpu-cuda-record.txt`, the only record of which CUDA settings to undo.
 
 **If Windows says the file is blocked**, that is the mark-of-the-web that lands on anything
 downloaded. Right-click the **zip** before extracting, Properties, tick **Unblock**, OK, then
@@ -314,8 +318,12 @@ double-clicking it or pressing Space, pick a GPU under **Assign ticked apps to:*
 **Main GPU:** and a name, is the GPU your games run on), and press **Apply**. **Auto assign GPU for
 Gaming** ticks applications to move to the chosen GPU. It skips games in a profile, Windows and
 excluded programs, and applications pinned to the main GPU, and it is off while the main GPU is
-chosen or while Windows' GPU preferences could not all be read. **Remove assignment** returns ticked
-applications to Windows' default GPU choice.
+chosen or while Windows' GPU preferences could not all be read. **Select all** ticks every
+application that is safe to move — it skips the same games, Windows and excluded programs, and
+main-GPU pins — and is off while no GPU can be assigned or Windows' GPU preferences could not all be
+read. **Deselect all** unticks everything. **Remove assignment** returns ticked applications to
+Windows' default GPU choice. While Apply or Remove assignment is working, the status line counts the
+applications as it goes.
 
 This is Windows' own per-application GPU preference, the one Windows' Settings app also changes:
 one value per program under `HKCU\Software\Microsoft\DirectX\UserGpuPreferences`. Other fields
@@ -325,6 +333,48 @@ of every application changed is kept in
 `%LOCALAPPDATA%\GameOptimizer\gpu-preferences-before-<timestamp>.reg`; double-click that file to
 put the old values back. A change takes effect the next time each application starts. If the
 chosen GPU is integrated, the confirmation warns that some applications can overload it.
+
+#### Which GPU CUDA uses
+
+**Also set which GPU CUDA uses**, on the Setting tab and on by default, extends Apply to NVIDIA's
+own per-application setting for which GPUs an application's CUDA work may use. When a ticked
+application is assigned to an NVIDIA GPU, Game Optimizer asks the driver to keep that application's
+CUDA work on the same card. It needs no administrator rights, and CUDA obeys it the next time that
+application starts — so restart the application to see it.
+
+**NVIDIA keeps these settings for the whole PC, not for one Windows user.** A CUDA setting Game
+Optimizer makes applies to that program for everyone who uses this computer, while the record of
+what to undo is kept only in the Windows account that made it. Remove assignment in that account is
+the way to take it back.
+
+**It only ever touches a settings entry it made itself, covering that one application, and for
+many programs that means it does nothing at all.** NVIDIA ships its own entries for a great many
+well-known programs, and one NVIDIA entry often covers several programs at once, so writing to it
+would move CUDA for all of them. Game Optimizer leaves every entry it did not make alone. It names
+the entry in the result, says how many other programs share it, and asks you to set that one
+yourself in NVIDIA Control Panel. **That is a limit of the feature, not a fault:** for those
+applications, ticking the box changes nothing.
+
+**Remove assignment puts it back**, whether or not the box is ticked, for each ticked application
+that still has its Windows GPU assignment. The entries it made are listed in
+`%LOCALAPPDATA%\GameOptimizer\gpu-cuda-record.txt`, and that file is the only thing that knows what
+to undo — delete it and the undo is gone. If you have since set anything else for such an application
+in NVIDIA Control Panel, Remove assignment clears only Game Optimizer's own CUDA setting and leaves
+the entry, and your settings in it, standing. If you changed the CUDA setting itself there, Remove
+assignment leaves it alone and says so.
+
+**The `.reg` restore file does not contain CUDA settings.** NVIDIA keeps them in its own database
+rather than the registry, so no registry file can put them back; Remove assignment is the way.
+
+**Assigning an application to a different GPU later does not always change its CUDA setting.**
+Moving it to a GPU that is not an NVIDIA card, or to another NVIDIA card with the box unticked,
+leaves the CUDA setting it already had. Use Remove assignment first, then assign it again.
+
+Apply asks nothing of NVIDIA when the chosen GPU is not an NVIDIA card, when the machine has no
+NVIDIA driver, or when the box is unticked. Remove assignment always looks in NVIDIA's settings for
+an entry Game Optimizer made, and **if the NVIDIA driver has been removed, it will not remove a GPU
+assignment whose CUDA setting Game Optimizer changed** — it leaves both in place until the driver is
+back.
 
 ### Upgrading from the "CoreDirector" builds
 

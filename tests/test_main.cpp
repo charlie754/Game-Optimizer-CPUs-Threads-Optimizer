@@ -1,4 +1,4 @@
-// Game Optimizer - unit-test harness.
+﻿// Game Optimizer - unit-test harness.
 //
 // Every expectation in this file is written from the header comments in src\topology.h,
 // src\config.h, src\engine.h and src\procwatch.h. No implementation .cpp was read while
@@ -34,6 +34,7 @@
 #include "applier.h"
 #include "apply_rules.h"
 #include "config.h"
+#include "gpu_cuda.h"
 #include "gpu_edit.h"
 #include "gpu_pref.h"
 #include "gpu_policy.h"
@@ -7163,11 +7164,11 @@ void Test_AA13_OneCandidateIgnoresTheForegroundEntirely() {
 }
 
 void Test_AB1_TheShippedVersionFormatsAsTheOperatorNamesIt() {
-    Case("AB1 0,5,5,0 in the resource reads 'v0.5.5' on screen");
+    Case("AB1 0,5,8,0 in the resource reads 'v0.5.8' on screen");
     // ms = (major<<16)|minor, ls = (patch<<16)|build - the VS_FIXEDFILEINFO packing.
     // Tracks src\GameOptimizer.rc: a version bump that leaves this vector behind makes the
     // case NAME a lie while the assertion still passes, which is the quiet half of a stale test.
-    CHECK_EQ(cd::FormatVersionLabel(0x00000005u, 0x00050000u), std::wstring(L"v0.5.5"));
+    CHECK_EQ(cd::FormatVersionLabel(0x00000005u, 0x00080000u), std::wstring(L"v0.5.8"));
 }
 
 void Test_AB2_AFourthFieldIsShownOnlyWhenItSaysSomething() {
@@ -7657,6 +7658,89 @@ void Test_AH3_SelectForBackground() {
     CHECK_EQ(result[0].selected, true);
 }
 
+// "Select all" (v0.5.9): the SAFE bulk tick. gpuwindow.cpp is not in this build, so the rule lives in gpu_rows.h
+// where these can reach it - deleting any one of its three exceptions there must turn one of these red.
+void Test_AH4_SelectAllTicks() {
+    const std::wstring mainKey = L"10DE&2B85&53021462", bgKey = L"10DE&2684&40BF1458";
+    // The sibling pair: same install root, same version-folder stem, so AnotherVersionMayHoldMainGpuPin can see them.
+    const std::wstring oldPath = L"C:\\SelectAllTest\\Chat\\app-1.0\\chat.exe";
+    const std::wstring newPath = L"C:\\SelectAllTest\\Chat\\app-2.0\\chat.exe";
+    typedef std::vector<std::pair<std::wstring, std::wstring> > Pairs;
+    const Pairs none;
+
+    Case("AH4a Select all: a listed, ordinary application IS ticked");
+    cd::GpuRow plain;
+    plain.exeName = L"editor.exe";
+    plain.exePath = L"C:\\SelectAllTest\\Editor\\editor.exe";
+    CHECK_EQ(cd::SelectAllTicks(plain, true, false, mainKey, none), true);
+
+    Case("AH4b Select all: a Windows or excluded image is NEVER ticked");
+    CHECK_EQ(cd::SelectAllTicks(plain, true, true, mainKey, none), false);
+
+    Case("AH4c Select all: a game the user has a profile for is NEVER ticked");
+    cd::GpuRow game = plain;
+    game.isProfileGame = true;
+    CHECK_EQ(cd::SelectAllTicks(game, true, false, mainKey, none), false);
+
+    Case("AH4d Select all: a LIVE main-GPU pin is NEVER ticked, and the same row on the background GPU is");
+    cd::GpuRow pinned = plain;
+    pinned.assignedKey = mainKey;
+    CHECK_EQ(cd::SelectAllTicks(pinned, true, false, mainKey, none), false);
+    // CONTROL: without it AH4d would pass on a rule that refused every assigned row, pin or not.
+    cd::GpuRow onBackground = plain;
+    onBackground.assignedKey = bgKey;
+    CHECK_EQ(cd::SelectAllTicks(onBackground, true, false, mainKey, none), true);
+    // A pin lost to an auto-update is still the user's pin: no value of its own, lostKey names the main GPU.
+    cd::GpuRow lost = plain;
+    lost.lostKey = mainKey;
+    CHECK_EQ(cd::SelectAllTicks(lost, true, false, mainKey, none), false);
+
+    Case("AH4e Select all: an application a SIBLING install of which may hold a main-GPU pin is NEVER ticked");
+    cd::GpuRow sibling;
+    sibling.exeName = L"chat.exe";
+    sibling.exePath = newPath;          // no value of its own
+    Pairs reg;
+    reg.push_back(std::make_pair(oldPath, mainKey));
+    CHECK_EQ(cd::SelectAllTicks(sibling, true, false, mainKey, reg), false);
+    // CONTROL: the same sibling pinned to the BACKGROUND GPU is no reason to skip this row.
+    Pairs bgReg;
+    bgReg.push_back(std::make_pair(oldPath, bgKey));
+    CHECK_EQ(cd::SelectAllTicks(sibling, true, false, mainKey, bgReg), true);
+
+    Case("AH4f Select all: a row that is not in the list box is NEVER ticked");
+    CHECK_EQ(cd::SelectAllTicks(plain, false, false, mainKey, none), false);
+
+    Case("AH4g Select all: no target is needed, and the main GPU being chosen changes nothing");
+    // It is NOT Auto assign: SelectForAutoAssign refuses everything with no target and while the main GPU is the
+    // target (AutoAssignAllowed). Select all takes no target at all, so there is nothing to refuse on.
+    CHECK_EQ(cd::SelectAllTicks(plain, true, false, std::wstring(), none), true);
+    // ...and it does not ask "would this row actually move": a row ALREADY on the GPU it would be sent to is still
+    // safe to tick, which is exactly where SelectForBackground says no.
+    std::vector<cd::GpuRow> one(1, onBackground);
+    CHECK_EQ(cd::SelectForBackground(one, bgKey, mainKey)[0].selected, false);
+    CHECK_EQ(cd::SelectAllTicks(onBackground, true, false, mainKey, none), true);
+
+    Case("AH4h SelectAllPendingCount: an already-ticked row does not count, an empty list counts nothing");
+    std::vector<cd::GpuRow> rows;
+    rows.push_back(plain);          // eligible, unticked  -> counts
+    rows.push_back(game);           // profile game        -> never
+    rows.push_back(pinned);         // main-GPU pin        -> never
+    cd::GpuRow already = plain;
+    already.exeName = L"ticked.exe";
+    already.selected = true;        // eligible but ALREADY ticked -> does not count
+    rows.push_back(already);
+    std::vector<bool> listed(4, true), system(4, false);
+    CHECK_EQ(cd::SelectAllPendingCount(rows, listed, system, mainKey, none), static_cast<size_t>(1));
+    system[0] = true;               // the one that counted is now a Windows image
+    CHECK_EQ(cd::SelectAllPendingCount(rows, listed, system, mainKey, none), static_cast<size_t>(0));
+    const std::vector<cd::GpuRow> empty;
+    const std::vector<bool> noFlags;
+    CHECK_EQ(cd::SelectAllPendingCount(empty, noFlags, noFlags, mainKey, none), static_cast<size_t>(0));
+    // FAIL CLOSED: flags shorter than the rows read as "not listed" and "system", so a caller that cannot supply
+    // them ticks nothing rather than everything.
+    CHECK_EQ(cd::SelectAllPendingCount(rows, noFlags, noFlags, mainKey, none), static_cast<size_t>(0));
+}
+
 // ===========================================================================
 // == AJ. GPU assignment policy - every case here was FOUND on the operator's real machine ==
 // ===========================================================================
@@ -7699,12 +7783,14 @@ struct FakeGpuEdits {
     std::vector<std::wstring> log;
     std::vector<cd::GpuPreferenceBefore> recorded;
     std::set<std::wstring> written;
+    std::set<std::wstring> automaticWrites;                              // written with GpuEditItem::automatic set
 
     cd::GpuEditOps Ops() {
         cd::GpuEditOps ops;
         ops.write = [this](const std::wstring& path, bool expectPresent, const std::wstring& expectValue, bool del,
-                           const std::wstring& value, unsigned long& err) {
+                           const std::wstring& value, unsigned long& err, bool automatic) {
             log.push_back(L"write " + path + (del ? std::wstring(L" delete") : L" set " + value));
+            if (automatic) automaticWrites.insert(path);
             err = 0;
             const std::map<std::wstring, cd::GuardedWriteResult>::const_iterator forced = result.find(path);
             if (forced != result.end()) {
@@ -7916,6 +8002,43 @@ void Test_AJ_GpuPolicy() {
         CHECK(!cd::IsDefaultExcluded(L"firefox.exe"));
     }
 
+    Case("AJ48 two Microsoft components a hand test found are protected by the SHIPPED exclusions too");
+    {
+        // FAILURE-BEFORE-FIX CONTROL, built from the operator's own hand test of the previous
+        // build. [M] They applied the GPU feature to eight applications and two were Microsoft
+        // system components - Defender's session helper under ProgramData, GameInput's
+        // redistributable service under Program Files. IsWindowsImagePath matches only an image
+        // under "X:\windows\", so neither was ever classified as a Windows component, and a
+        // config.ini written before these names joined the defaults cannot protect them either.
+        cd::Config theirs;
+        const wchar_t* names[] = { L"EasyAntiCheat.exe", L"audiodg.exe", L"dwm.exe", L"csrss.exe",
+                                   L"NVDisplay.Container.exe", L"nvcontainer.exe", L"AMDRSServ.exe",
+                                   L"RadeonSoftware.exe", L"MsMpEng.exe", L"GameOptimizer.exe" };
+        for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i) theirs.exclusions.push_back(names[i]);
+        CHECK(!theirs.IsExcluded(L"DefenderSessionHelper.exe"));    // the user's older list misses both...
+        CHECK(!theirs.IsExcluded(L"GameInputRedistService.exe"));
+        CHECK(cd::IsDefaultExcluded(L"DefenderSessionHelper.exe"));  // ...the shipped list does not
+        CHECK(cd::IsDefaultExcluded(L"GameInputRedistService.exe"));
+        // The list matches a BARE FILE NAME, case-insensitively, so whatever casing a process
+        // reports and the full path a row carries both reach the same entry.
+        CHECK(cd::IsDefaultExcluded(L"defendersessionhelper.exe"));
+        CHECK(cd::IsDefaultExcluded(L"GAMEINPUTREDISTSERVICE.EXE"));
+        CHECK(cd::IsDefaultExcluded(
+            L"C:\\ProgramData\\Microsoft\\Windows Defender\\DefenderSessionHelper.exe"));
+        CHECK(cd::IsDefaultExcluded(
+            L"C:\\Program Files\\Microsoft GameInput\\x64\\GameInputRedistService.exe"));
+        // ...and THE REASON the name list has to be the mechanism: neither real path is under
+        // the Windows directory, so the path rule cannot see them however it is read.
+        CHECK(!cd::IsWindowsImagePath(
+            L"C:\\ProgramData\\Microsoft\\Windows Defender\\DefenderSessionHelper.exe"));
+        CHECK(!cd::IsWindowsImagePath(
+            L"C:\\Program Files\\Microsoft GameInput\\x64\\GameInputRedistService.exe"));
+        // CONTROL: both entries are exact names, not prefixes, and ordinary applications stay free.
+        CHECK(!cd::IsDefaultExcluded(L"DefenderSessionHelper-helper.exe"));
+        CHECK(!cd::IsDefaultExcluded(L"GameInputRedist.exe"));
+        CHECK(!cd::IsDefaultExcluded(L"claude.exe"));
+    }
+
     Case("AJ8 two rows with one file name are told apart by their folders");
     {
         // The window showed claude.exe twice - Claude Desktop and Claude Code - as identical lines.
@@ -8113,14 +8236,72 @@ void Test_AJ_GpuPolicy() {
         before[1].exePath = L"C:\\P\\y.exe";
         before[1].present = false;
         const std::wstring expected =
-            L"Windows Registry Editor Version 5.00\r\n\r\n"
-            L"[HKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences]\r\n"
+            cd::FormatRegRestoreHeader() +
             L"\"C:\\\\P\\\\app-1\\\\x.exe\"=\"AppStatus=1;Q=\\\"q\\\";\"\r\n"
             L"\"C:\\\\P\\\\y.exe\"=-\r\n";
         CHECK_EQ(cd::FormatRegRestoreFile(before), expected);
-        CHECK_EQ(cd::FormatRegRestoreFile(std::vector<cd::GpuPreferenceBefore>()),
-                 std::wstring(L"Windows Registry Editor Version 5.00\r\n\r\n"
-                              L"[HKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences]\r\n"));
+        CHECK_EQ(cd::FormatRegRestoreFile(std::vector<cd::GpuPreferenceBefore>()), cd::FormatRegRestoreHeader());
+        // regedit's own two lines, unchanged and in their places: the first line of the file, and the key
+        // line immediately above the first row.
+        CHECK_EQ(cd::RegRestoreVersionLine(), std::wstring(L"Windows Registry Editor Version 5.00\r\n"));
+        CHECK_EQ(cd::RegRestoreKeyLine(),
+                 std::wstring(L"[HKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences]\r\n"));
+        CHECK_EQ(expected.compare(0, cd::RegRestoreVersionLine().size(), cd::RegRestoreVersionLine()), 0);
+        CHECK(expected.find(cd::RegRestoreKeyLine() + L"\"C:") != std::wstring::npos);
+    }
+
+    Case("AJ17b the restore file says CUDA is NOT in it, in lines regedit treats as comments (F12)");
+    {
+        // 🔴 THE .REG IS THE WHOLE UNDO FOR WINDOWS' GPU PREFERENCE AND NONE OF THE UNDO FOR CUDA. NVIDIA
+        // keeps which GPU CUDA uses in its own settings, so no registry file can put it back - and a user
+        // who opens this one and stops there is left with the CUDA exclusion still on.
+        const std::wstring head = cd::FormatRegRestoreHeader();
+        CHECK(head.find(L"WHICH GPU CUDA USES IS NOT IN THIS FILE.") != std::wstring::npos);
+        CHECK(head.find(L"NVIDIA keeps that in its own settings, not in the") != std::wstring::npos);
+        CHECK(head.find(L"Use \"Remove assignment\" on Game Optimizer's") != std::wstring::npos);
+        CHECK(head.find(L"GPU Assignment tab for that") != std::wstring::npos);
+        // It names the ONE record this version keeps (D1), not the per-run files rounds 1 and 2 wrote.
+        CHECK(head.find(L"gpu-cuda-record.txt file kept in this same folder") != std::wstring::npos);
+        CHECK(head.find(cd::CudaRecordFileName()) != std::wstring::npos);
+        CHECK(head.find(L"gpu-cuda-before") == std::wstring::npos);
+
+        // 🔴 AND IT IS STILL A .REG FILE REGEDIT WILL IMPORT. The version line is first, the key line is
+        // last, and EVERY line between them is blank or starts with ';' - regedit's comment marker - so
+        // the note changes nothing the file writes.
+        CHECK_EQ(head.compare(0, cd::RegRestoreVersionLine().size(), cd::RegRestoreVersionLine()), 0);
+        const size_t key = head.find(cd::RegRestoreKeyLine());
+        CHECK(key != std::wstring::npos);
+        CHECK_EQ(key + cd::RegRestoreKeyLine().size(), head.size());
+        size_t at = cd::RegRestoreVersionLine().size();
+        size_t comments = 0;
+        bool everyLineIsAComment = true;
+        while (at < key) {
+            const size_t nl = head.find(L"\r\n", at);
+            if (nl == std::wstring::npos) { everyLineIsAComment = false; break; }
+            const std::wstring line = head.substr(at, nl - at);
+            if (!line.empty()) {
+                if (line[0] != L';') everyLineIsAComment = false;
+                else ++comments;
+            }
+            at = nl + 2;
+        }
+        CHECK(everyLineIsAComment);
+        CHECK(comments >= 5);
+
+        // A complete file is still recognised as complete, and a .reg an EARLIER version wrote - the same
+        // two lines with no comment block - still is too. Refusing that one would make the window tell a
+        // user not to open the only way back they have (FormatUnfinishedNotice).
+        std::vector<cd::GpuPreferenceBefore> one(1);
+        one[0].exePath = L"C:\\x.exe";
+        one[0].present = false;
+        CHECK(cd::IsCompleteRegRestoreText(cd::FormatRegRestoreFile(one)));
+        CHECK(cd::IsCompleteRegRestoreText(cd::RegRestoreVersionLine() + L"\r\n" + cd::RegRestoreKeyLine() +
+                                           L"\"C:\\\\x.exe\"=-\r\n"));
+        // and nothing became complete that was not: no row, a comment with no line break, another key.
+        CHECK(!cd::IsCompleteRegRestoreText(head));
+        CHECK(!cd::IsCompleteRegRestoreText(cd::RegRestoreVersionLine() + L"; cut off here"));
+        CHECK(!cd::IsCompleteRegRestoreText(cd::RegRestoreVersionLine() + L"\r\n[HKEY_CURRENT_USER\\Other]\r\n"
+                                            L"\"C:\\\\x.exe\"=-\r\n"));
     }
 
     Case("AJ18 a card counts only beside its own mode, and control characters are never edited");
@@ -8294,6 +8475,38 @@ void Test_AJ_GpuPolicy() {
         CHECK(cd::GuardedReason(G::Unavailable, 0).find(L"(error") == std::wstring::npos);
         CHECK(cd::GuardedReason(G::Failed, 87).find(L"(error 87)") != std::wstring::npos);
         CHECK(cd::GuardedReason(G::Written, 0).empty());
+        // v0.5.7: the caller's own check said no - its own words, never "Windows refused" (the default case)
+        CHECK_EQ(cd::GuardedReason(G::NoLongerAllowed, 0),
+                 std::wstring(L"another version of it may now be pinned to the main GPU, or Windows' GPU settings could "
+                              L"not all be read again, so it was left alone; tick it by hand to change it anyway"));
+        CHECK(cd::GuardedReason(G::NoLongerAllowed, 0) != cd::GuardedReason(G::Failed, 0));
+    }
+
+    Case("AJ47 a row Auto assign ticked reaches the guarded write marked as such; a hand tick never does");
+    {
+        // v0.5.7, the sibling-pin race: the window's write op asks Auto assign's rule again inside the guarded write only
+        // for an item marked automatic, so RunGpuEdits must hand each item's own flag through, unchanged, in order.
+        FakeGpuEdits f;
+        const std::wstring handPath = L"C:\\Apps\\Hand\\hand.exe", autoPath = L"C:\\Apps\\Auto\\auto.exe";
+        std::vector<std::wstring> paths;
+        paths.push_back(handPath);
+        paths.push_back(autoPath);
+        std::vector<cd::GpuEditItem> items = f.Items(paths);
+        items[1].automatic = true;
+        CHECK(!items[0].automatic);   // the default is a hand tick
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(items, false, L"10DE&2684&40BF1458", f.Ops());
+        CHECK(r.size() == 2 && r[0].outcome == cd::GpuEditOutcome::Done && r[1].outcome == cd::GpuEditOutcome::Done);
+        CHECK(f.automaticWrites.size() == 1 && f.automaticWrites.count(autoPath) == 1);
+        // a refusal from the check is reported in its own words, and nothing is recorded or counted as done
+        FakeGpuEdits g;
+        g.result[autoPath] = cd::GuardedWriteResult::NoLongerAllowed;
+        std::vector<cd::GpuEditItem> one = g.Items(std::vector<std::wstring>(1, autoPath));
+        one[0].automatic = true;
+        const std::vector<cd::GpuEditResult> refused = cd::RunGpuEdits(one, false, L"10DE&2684&40BF1458", g.Ops());
+        CHECK(refused.size() == 1 && refused[0].outcome == cd::GpuEditOutcome::Refused);
+        CHECK(refused.size() == 1 &&
+              refused[0].reason == cd::GuardedReason(cd::GuardedWriteResult::NoLongerAllowed, 0));
+        CHECK(g.recorded.empty() && g.reg.find(autoPath) == g.reg.end());
     }
 
     Case("AJ25 the record kept while a change runs cannot be imported; the .reg is its heading plus its rows");
@@ -8676,9 +8889,15 @@ void Test_AJ_GpuPolicy() {
 
     Case("AJ37 Apply's question keeps v0.5.5's words and warns only about what is true");
     {
-        // Copied from v0.5.5's DoApply, byte for byte: the first line, the explanation and both replacing sentences.
+        // Copied from v0.5.5's DoApply, byte for byte: the first line and both replacing sentences.
+        // 🔴 R6-4: THE EXPLAINING PARAGRAPH IS NOT BYTE-IDENTICAL ANY MORE, AND IT MUST NOT BE. It promised
+        // to write Windows' own GPU preference "for each one", and a ticked row that already carries
+        // exactly that preference is AlreadyDone - nothing is written for it. On every machine upgrading
+        // from v0.5.6 or v0.5.7 that is EVERY ticked row, so the question promised a write for all of them
+        // and the result then reported none.
         const std::wstring gap = L"\r\n\r\n";
-        const std::wstring explain = L"This writes Windows' own per-application GPU preference for each one, and keeps "
+        const std::wstring explain = L"This writes Windows' own per-application GPU preference for each one that does "
+                                     L"not already have it, and keeps "
                                      L"the previous value of each one it changes in a restore file. It takes effect the "
                                      L"next time each application starts. Remove assignment later returns an application "
                                      L"to Windows' default GPU choice.";
@@ -8718,6 +8937,26 @@ void Test_AJ_GpuPolicy() {
         c.replacing = 2;
         CHECK_EQ(cd::FormatAssignConfirm(c), L"Assign 3 applications to NVIDIA GeForce RTX 5090?" + gap + explain +
                                                  gap + mainLine + gap + igpuLine + gap + many);
+    }
+
+    Case("AJ37b Remove's question keeps v0.5.7's words and gains a CUDA line only when one is true");
+    {
+        // Copied from v0.5.7's DoRemove, byte for byte: the question and its one explaining paragraph.
+        const std::wstring gap = L"\r\n\r\n";
+        const std::wstring explain = L"Each returns to Windows' default GPU choice the next time it starts, and the "
+                                     L"previous value of each one it changes is kept in a restore file. "
+                                     L"Ticked applications with no assignment are left alone.";
+        cd::RemoveConfirm c;
+        c.count = 3;
+        CHECK_EQ(cd::FormatRemoveConfirm(c), L"Remove the GPU assignment from 3 applications?" + gap + explain);
+        c.count = 1;
+        const std::wstring without = cd::FormatRemoveConfirm(c);
+        CHECK_EQ(without, L"Remove the GPU assignment from 1 application?" + gap + explain);
+        // the CUDA line is last, and a question without one is byte-identical to the one v0.5.7 asked
+        c.cudaLine = L"This also asks NVIDIA to put back which GPU CUDA uses for 1 of them.";
+        const std::wstring with = cd::FormatRemoveConfirm(c);
+        CHECK_EQ(with.compare(0, without.size(), without), 0);
+        CHECK_EQ(with, without + gap + c.cudaLine);
     }
 
     Case("AJ38 fixed v0.5.6 wording reads exactly as shipped");
@@ -9429,6 +9668,3443 @@ void Test_AI2_DriftStatusLine() {
 }  // namespace
 
 // ===========================================================================
+// ===========================================================================
+// AK. Which GPU CUDA uses (v0.5.8)
+//
+// Every function below is reachable with no NVIDIA driver on the machine and no driver session open:
+// the pure half lives in gpu_cuda.h and everything that touches NVIDIA is a function object this suite
+// substitutes. The two id strings are the ones the operator's driver really enumerates [M] 2026-09-19.
+//
+// ROUND 3 IS A REDESIGN, NOT MORE GUARDS (D1-D10). Two review
+// rounds kept finding new corners of one domain - the restore journal and the Remove path - so the
+// journal and Remove were replaced rather than patched again. The tests that pin the new rules, one each,
+// are AK17 (D1 and D3), AK19 (D2), AK18 (D4), AK6g (D5), AK14f (D6), AK8g (D7), AK10h (D8) and AK12d
+// with AK7h (D9).
+// ===========================================================================
+
+namespace cudatest {
+
+const wchar_t* kId5090 = L"id,2.0:2B8510DE,00000100,GF - (432,2,161,32607) @ (0)";
+const wchar_t* kId4090 = L"id,2.0:268410DE,00000300,GF - (400,2,161,23028) @ (0)";
+const wchar_t* kKey5090 = L"10DE&2B85&53021462";
+const wchar_t* kKey4090 = L"10DE&2684&40BF1458";
+const wchar_t* kKeyAmd = L"1002&164E&164E1002";
+
+std::vector<cd::NvidiaGpu> TwoCards() {
+    std::vector<cd::NvidiaGpu> gpus;
+    cd::NvidiaGpu a;
+    a.adapterKey = kKey5090;
+    a.busId = 1;
+    gpus.push_back(a);
+    cd::NvidiaGpu b;
+    b.adapterKey = kKey4090;
+    b.busId = 3;
+    gpus.push_back(b);
+    return gpus;
+}
+
+std::vector<std::wstring> BothIds() {
+    std::vector<std::wstring> ids;
+    ids.push_back(L"autoselect");
+    ids.push_back(kId4090);
+    ids.push_back(kId5090);
+    return ids;
+}
+
+// A whole NVIDIA driver in memory: profiles, their CUDA setting, and every refusal a real one can give.
+//
+// 🔴 THE SESSION AND THE DATABASE ARE SEPARATE MAPS, and that is the point of this fake rather than a
+// detail of it. NvAPI_DRS_SaveSettings does not save one setting - it writes the WHOLE open session. A
+// fake that committed every write on its own could never show the failure the Council found: a row whose
+// own save failed is still sitting in the session, and the NEXT row's save puts it in the database with
+// no record naming it.
+struct Fake {
+    bool available = true;
+    cd::CudaRefusal openRefusal = cd::CudaRefusal::NoNvidiaDriver;
+    std::vector<cd::NvidiaGpu> gpus;
+    std::vector<std::wstring> ids;
+    std::map<std::wstring, cd::CudaProfile> byExe;     // lower-case exe path -> the profile that governs it
+    std::set<std::wstring> profiles;                   // every profile name the database holds, empty ones too
+    std::map<std::wstring, std::wstring> settings;     // THE SESSION: profile name -> 0x10354FF8
+    // 🔴 R5-1: SETTINGS ON A PROFILE THAT ARE NOT OURS - what a user sets in NVIDIA Control Panel, which
+    // NVIDIA keeps in the SAME profile as our CUDA setting. A count is enough: the rule only asks whether
+    // there are any, and deleting the profile would take all of them with it.
+    std::map<std::wstring, size_t> otherSettings;      // profile name -> settings this product did not write
+    // 🔴 R6-1: PROFILES WHOSE CUDA VALUE IS READ BUT IS NOT THAT PROFILE'S OWN. NvAPI_DRS_GetSetting
+    // answers from NVIDIA's general settings when the profile itself has no such setting, so a value
+    // coming back is not proof of where it lives. A profile in here reads exactly as any other and
+    // enumerates WITHOUT 0x10354FF8 - which is the contradiction RestoreCudaForRow must refuse.
+    std::set<std::wstring> inherited;
+    bool settingsListFails = false;    // R6-1: NvAPI_DRS_EnumSettings refuses
+    bool noEnumSettings = false;       // R6-2: this driver does not offer it at all, so the op is EMPTY
+    // 🔴 R6-11: the adopt re-check inside createProfileForExe loses a race - the plan adopted the entry,
+    // and a member arrived between the lookup and the create call.
+    bool adoptRaceLost = false;
+    size_t adoptRaceOtherApps = 1;     // what that second guard MEASURED
+    bool adoptRaceIncomplete = false;  // ... or could not measure
+    std::map<std::wstring, std::wstring> saved;        // THE DATABASE: only what a save really committed
+    std::vector<std::wstring> written;                 // "<profile>=<value>" or "<profile>=CLEAR", in order
+    // What CreateApplication answers. 🔴 IT IS ASKED AFTER THE PROFILE IS MADE, WHICH IS WHERE THE REAL -167
+    // ARRIVES - so a test that sets it also exercises E7's clean-up of the profile made moments before.
+    cd::CudaCreate createAnswer = cd::CudaCreate::Created;
+    bool writeFails = false;
+    bool writeIgnored = false;   // the driver answers yes and changes nothing, which a read-back catches
+    int failWriteNumber = 0;     // or only the Nth write refuses, counting from 1
+    bool lookupFails = false;    // every lookup answers Failed, as a refused FindApplicationByName does
+    bool nameLookupFails = false;   // R5-2: FindProfileByName answers Failed, so nothing is adopted or made
+    bool nameAppsIncomplete = false;   // R5-2: a by-name membership the driver would not finish listing
+    bool readFails = false;      // every read answers Failed, as a refused GetSetting does
+    bool saveFails = false;
+    int failSaveNumber = 0;      // or only the Nth save refuses, counting from 1
+    bool noDelete = false;       // a driver that offers no way to remove a profile
+    bool deleteFails = false;    // it offers one and refuses
+    int saves = 0;
+    int creates = 0;
+    int deletes = 0;
+    int writes = 0;
+};
+
+// The driver already keeps `profileName` for `exe`, under the application entry `entry`.
+void Own(Fake& f, const std::wstring& exe, const std::wstring& profileName, const std::wstring& entry,
+         bool predefined = false, size_t otherApps = 0) {
+    cd::CudaProfile p;
+    p.profileName = profileName;
+    p.appEntry = entry;
+    p.isPredefined = predefined;
+    p.otherApps = otherApps;
+    f.byExe[cd::ToLower(exe)] = p;
+    f.profiles.insert(profileName);
+}
+
+// An entry of OURS that an earlier run left behind: the profile is in the database, but it covers no
+// application, so a lookup for the executable still answers Absent.
+void LeftBehind(Fake& f, const std::wstring& exe) { f.profiles.insert(cd::CudaProfileNameFor(exe)); }
+
+// NVDRS_PROFILE::numOfSettings, as the driver would report it: our own CUDA setting when there is one, plus
+// every setting somebody else put on the same profile (R5-1).
+size_t SettingsOn(const Fake& f, const std::wstring& profileName) {
+    size_t n = f.settings.count(profileName) != 0 ? 1u : 0u;
+    const std::map<std::wstring, size_t>::const_iterator it = f.otherSettings.find(profileName);
+    if (it != f.otherSettings.end()) n += it->second;
+    return n;
+}
+
+// 🔴 R6-1: WHAT NvAPI_DRS_EnumSettings WOULD LIST - the profile's OWN setting ids, and nothing it merely
+// inherits. This is the answer the delete decision is taken on, and the whole point of round 6 is that it
+// is not the same thing as the count above: a profile can hold ONE setting that is not ours at all.
+std::vector<unsigned long> SettingIdsOn(const Fake& f, const std::wstring& profileName) {
+    std::vector<unsigned long> ids;
+    if (f.settings.count(profileName) != 0 && f.inherited.count(profileName) == 0)
+        ids.push_back(cd::CudaSettingId());
+    const std::map<std::wstring, size_t>::const_iterator it = f.otherSettings.find(profileName);
+    const size_t n = it != f.otherSettings.end() ? it->second : 0;
+    // Real NVIDIA setting ids that are NOT ours: OGL_IMPLICIT_GPU_AFFINITY_ID and its neighbours.
+    for (size_t k = 0; k < n; ++k) ids.push_back(0x20D0F3E6ul + static_cast<unsigned long>(k));
+    return ids;
+}
+
+cd::CudaOps OpsOf(Fake& f) {
+    cd::CudaOps ops;
+    ops.available = f.available;
+    ops.openRefusal = f.openRefusal;
+    ops.listGpus = [&f]() { return f.gpus; };
+    ops.listIds = [&f]() { return f.ids; };
+    ops.findProfileForExe = [&f](const std::wstring& exePath, cd::CudaProfile& profile) {
+        profile = cd::CudaProfile();
+        if (f.lookupFails) return cd::CudaLookup::Failed;
+        const std::map<std::wstring, cd::CudaProfile>::const_iterator it = f.byExe.find(cd::ToLower(exePath));
+        if (it == f.byExe.end()) return cd::CudaLookup::Absent;
+        profile = it->second;
+        profile.numSettings = SettingsOn(f, profile.profileName);   // R5-1, as GetProfileInfo reports it
+        return cd::CudaLookup::Found;
+    };
+    // 🔴 R5-2: what the driver says about a profile asked for BY NAME. The live one is FindProfileByName +
+    // GetProfileInfo + EnumApplications; this one answers the same three states from the maps above.
+    ops.findProfileByName = [&f](const std::wstring& profileName, cd::CudaProfile& profile) {
+        profile = cd::CudaProfile();
+        if (f.nameLookupFails || profileName.empty()) return cd::CudaLookup::Failed;
+        if (f.profiles.count(profileName) == 0) return cd::CudaLookup::Absent;
+        profile.profileName = profileName;
+        size_t apps = 0;
+        for (std::map<std::wstring, cd::CudaProfile>::const_iterator it = f.byExe.begin();
+             it != f.byExe.end(); ++it) {
+            if (!cd::IEquals(it->second.profileName, profileName)) continue;
+            apps += 1 + it->second.otherApps;
+            if (it->second.isPredefined) profile.isPredefined = true;
+        }
+        profile.otherApps = apps;                 // nothing is excluded: none of them can be ours
+        profile.appsComplete = !f.nameAppsIncomplete;
+        profile.numSettings = SettingsOn(f, profileName);
+        return cd::CudaLookup::Found;
+    };
+    ops.readSetting = [&f](const std::wstring& profile, std::wstring& value) {
+        value.clear();
+        if (f.readFails) return cd::CudaRead::Failed;
+        const std::map<std::wstring, std::wstring>::const_iterator it = f.settings.find(profile);
+        if (it == f.settings.end()) return cd::CudaRead::Absent;
+        value = it->second;
+        return cd::CudaRead::Value;
+    };
+    ops.writeSetting = [&f](const std::wstring& profile, bool clear, const std::wstring& value) {
+        ++f.writes;
+        if (f.writeFails || f.writes == f.failWriteNumber) return false;
+        f.written.push_back(profile + L"=" + (clear ? std::wstring(L"CLEAR") : value));
+        if (f.writeIgnored) return true;
+        if (clear) f.settings.erase(profile);
+        else f.settings[profile] = value;
+        return true;
+    };
+    // The live one looks the name up, makes the profile only when there is none, refuses to touch one it
+    // was not told it may adopt (E1), and takes a profile it just made away again when the application
+    // will not go into it (E7). This one answers the same way from the maps above.
+    // 🔴 R6-12: `adoptName` is the entry the caller ruled on, EMPTY when there is none. The live one opens
+    // exactly that name, because [M] probe S23 measured NvAPI_DRS_FindProfileByName to be CASE-SENSITIVE -
+    // and `f.profiles` is a std::set<std::wstring>, so the lookup below has case in exactly the same way.
+    ops.createProfileForExe = [&f](const std::wstring& exePath, const std::wstring& adoptName,
+                                   cd::CudaProfile& made) {
+        ++f.creates;
+        const bool reuseNamed = !adoptName.empty();
+        const std::wstring name = reuseNamed ? adoptName : cd::CudaProfileNameFor(exePath);
+        const bool exists = f.profiles.count(name) != 0;
+        if (exists && !reuseNamed) return cd::CudaCreate::NameTaken;
+        bool created = false;
+        if (!exists) {
+            f.profiles.insert(name);
+            created = true;
+        }
+        // 🔴 `made` IS FILLED EVEN WHEN THE ANSWER IS NOT Created, exactly as the live one fills it: a
+        // profile this call made is a change to the driver whatever the application call answered, and
+        // taking it away again is the CALLER's decision (E7).
+        made = cd::CudaProfile();
+        made.profileName = name;
+        made.appEntry = cd::CudaAppKeyFor(exePath);
+        made.createdNow = created;
+        // 🔴 R6-11: THE SECOND GUARD, TAKEN AGAINST THE HANDLE ACTUALLY ABOUT TO BE WRITTEN. The live one
+        // re-reads GetProfileInfo here and answers NameTaken when a member arrived since the plan adopted
+        // the entry, filling `made` with what it measured.
+        if (reuseNamed && f.adoptRaceLost) {
+            made.otherApps = f.adoptRaceIncomplete ? 0 : f.adoptRaceOtherApps;
+            made.appsComplete = !f.adoptRaceIncomplete;
+            return cd::CudaCreate::NameTaken;
+        }
+        if (f.createAnswer != cd::CudaCreate::Created) return f.createAnswer;
+        f.byExe[cd::ToLower(exePath)] = made;
+        return cd::CudaCreate::Created;
+    };
+    // The live one re-reads the profile and refuses unless all four guards hold (gpu_cuda.cpp,
+    // DeleteOwnProfile). This one answers the same way from the maps above, so a test that asks it to
+    // delete somebody else's profile - or one whose single application is not the entry it was given -
+    // gets the same no.
+    // 🔴 R6-2: IT IS INSTALLED UNCONDITIONALLY, EXACTLY AS MakeCudaOps INSTALLS ITS OWN - and
+    // ApplyCudaDriverCalls at the end of this function is what takes it away again when the driver has no
+    // delete entry points. That wiring is the round-5 defect both seats found, so this suite has to run
+    // the real gate rather than an `if (!f.noDelete)` of its own that could stay right while the product's
+    // went wrong.
+    {
+        ops.deleteProfile = [&f](const std::wstring& profileName, const std::wstring& appEntry) {
+            ++f.deletes;
+            if (f.deleteFails) return false;
+            if (!cd::IsCudaProfileWeMade(profileName) || appEntry.empty()) return false;
+            if (f.profiles.count(profileName) == 0) return false;
+            size_t apps = 0, others = 0;
+            bool predefined = false;
+            for (std::map<std::wstring, cd::CudaProfile>::const_iterator it = f.byExe.begin();
+                 it != f.byExe.end(); ++it) {
+                if (it->second.profileName != profileName) continue;
+                ++apps;
+                others += it->second.otherApps;
+                if (!cd::IEquals(it->second.appEntry, appEntry)) ++others;
+                if (it->second.isPredefined) predefined = true;
+            }
+            if (predefined || apps > 1 || others > 0) return false;
+            // 🔴 R5-1 / R6-1, GUARD 5, exactly as gpu_cuda.cpp's DeleteOwnProfile now refuses it: it
+            // enumerates the entry's own setting IDS and deletes nothing that holds a setting this product
+            // did not write. A count is not an identity, and an enumeration nobody could make refuses.
+            if (f.settingsListFails || f.noEnumSettings) return false;
+            const std::vector<unsigned long> ids = SettingIdsOn(f, profileName);
+            for (size_t i = 0; i < ids.size(); ++i)
+                if (ids[i] != cd::CudaSettingId()) return false;
+            for (std::map<std::wstring, cd::CudaProfile>::iterator it = f.byExe.begin(); it != f.byExe.end();) {
+                if (it->second.profileName == profileName) f.byExe.erase(it++);
+                else ++it;
+            }
+            f.settings.erase(profileName);
+            f.profiles.erase(profileName);
+            return true;
+        };
+    }
+    // 🔴 R6-1 / R6-2: THE SETTING IDS, AND THE OPERATION IS ABSENT ON A DRIVER THAT CANNOT LIST THEM. It
+    // is installed here and taken away again by ApplyCudaDriverCalls below, exactly as MakeCudaOps does
+    // it, so the capability gate this suite pins is the one the product really runs.
+    ops.listSettingIds = [&f](const std::wstring& profileName, std::vector<unsigned long>& ids) {
+        ids.clear();
+        if (f.settingsListFails) return false;
+        ids = SettingIdsOn(f, profileName);
+        return true;
+    };
+    ops.save = [&f]() {
+        ++f.saves;
+        if (f.saveFails || f.saves == f.failSaveNumber) return false;
+        f.saved = f.settings;   // the whole session, which is what the driver's own save does
+        return true;
+    };
+    // 🔴 R6-2: THE SAME ONE GATE THE .cpp USES. `noDelete` and `noEnumSettings` are entry points that did
+    // not resolve, so they must reach the operations through ApplyCudaDriverCalls and not through an `if`
+    // of this file's own - otherwise this suite would be pinning a rule the product does not run.
+    cd::CudaDriverCalls calls;
+    calls.deleteProfile = !f.noDelete;
+    calls.deleteApplication = !f.noDelete;
+    calls.enumSettings = !f.noEnumSettings;
+    cd::ApplyCudaDriverCalls(ops, calls);
+    return ops;
+}
+
+// The record on disk, without the disk: SaveCudaRecordRow's own rules (gpu_cuda.cpp) over a CudaRecord.
+struct Rec {
+    cd::CudaRecord record;
+    bool fails = false;   // every write to the record refuses
+    int saves = 0;
+    Rec() {
+        record.state = cd::CudaRecordState::Ok;
+        record.path = L"C:\\d\\gpu-cuda-record.txt";
+    }
+};
+
+cd::CudaApplyInputs InputsOf(Rec& r) {
+    cd::CudaApplyInputs in;
+    in.record = [&r](const cd::CudaRecordRow& row) {
+        ++r.saves;
+        if (r.fails) return false;
+        cd::CudaRecordRow line = row;
+        if (line.when.empty()) line.when = L"2026-09-20 12:00:00";
+        if (!cd::CudaRecordRowIsWritable(line)) return false;
+        r.record.rows = cd::CudaRowsWith(r.record.rows, line);
+        return true;
+    };
+    return in;
+}
+
+cd::CudaRowResult Apply(const std::wstring& exe, const cd::CudaTarget& t, const cd::CudaOps& ops, Rec& rec) {
+    return cd::WriteCudaForRow(exe, t, ops, rec.record, InputsOf(rec));
+}
+
+// One line of the record, as ReadCudaRecord would have parsed it.
+cd::CudaRecordRow Line(const std::wstring& profile, const std::wstring& entry, const std::wstring& lastWrote) {
+    cd::CudaRecordRow row;
+    row.profileName = profile;
+    row.appEntry = entry;
+    row.lastWrote = lastWrote;
+    row.when = L"2026-09-20 12:00:00";
+    return row;
+}
+
+}  // namespace cudatest
+
+void Test_AK1_ParseUniversalGpuId() {
+    Case("AK1 the two joinable fields of a driver id string, and everything that is not one");
+    const cd::UniversalGpuId a = cd::ParseUniversalGpuId(cudatest::kId5090);
+    CHECK(a.ok);
+    CHECK_EQ((unsigned int)a.deviceId, 0x2B8510DEu);
+    CHECK_EQ((unsigned int)a.busId, 1u);                       // 0x00000100 >> 8
+    const cd::UniversalGpuId b = cd::ParseUniversalGpuId(cudatest::kId4090);
+    CHECK(b.ok);
+    CHECK_EQ((unsigned int)b.deviceId, 0x268410DEu);
+    CHECK_EQ((unsigned int)b.busId, 3u);                       // 0x00000300 >> 8
+    // The driver's own list holds these beside the real ids, and neither is a GPU.
+    CHECK(!cd::ParseUniversalGpuId(L"autoselect").ok);
+    CHECK(!cd::ParseUniversalGpuId(L"none").ok);
+    CHECK(!cd::ParseUniversalGpuId(L"").ok);
+    CHECK(!cd::ParseUniversalGpuId(L"id,2.0:2B8510DE").ok);            // one field, no comma after it
+    CHECK(!cd::ParseUniversalGpuId(L"id,2.0:2B8510DE,00000100").ok);   // the second comma is missing
+    CHECK(!cd::ParseUniversalGpuId(L"id,2.0:ZZZZ,00000100,GF").ok);    // not hexadecimal
+    CHECK(!cd::ParseUniversalGpuId(L"id,2.0:,00000100,GF").ok);        // empty field
+    CHECK(!cd::ParseUniversalGpuId(L"id,2.0:2B8510DEE,00000100,GF").ok);   // nine digits is not a 32-bit id
+}
+
+void Test_AK2_TheKeyCarriesTheDeviceId() {
+    Case("AK2 an adapter key is the device id NVAPI reports, written the other way round");
+    unsigned long id = 0;
+    CHECK(cd::DeviceIdFromAdapterKey(cudatest::kKey5090, id));
+    CHECK_EQ((unsigned int)id, 0x2B8510DEu);
+    CHECK(cd::DeviceIdFromAdapterKey(cudatest::kKey4090, id));
+    CHECK_EQ((unsigned int)id, 0x268410DEu);
+    CHECK(cd::IsNvidiaAdapterKey(cudatest::kKey5090));
+    CHECK(cd::IsNvidiaAdapterKey(cudatest::kKey4090));
+    CHECK(!cd::IsNvidiaAdapterKey(cudatest::kKeyAmd));
+    // Not adapter keys at all, and none of them may be read as one.
+    CHECK(!cd::IsNvidiaAdapterKey(L""));
+    CHECK(!cd::IsNvidiaAdapterKey(cd::WindowsPowerSavingKey()));
+    CHECK(!cd::IsNvidiaAdapterKey(cd::WindowsHighPerformanceKey()));
+    CHECK(!cd::IsNvidiaAdapterKey(cd::UnreadableChoiceKey()));
+    CHECK(!cd::DeviceIdFromAdapterKey(L"10DE-2B85-53021462", id));
+    CHECK(!cd::DeviceIdFromAdapterKey(L"GGGG&2B85&53021462", id));
+}
+
+void Test_AK3_MatchUniversalId() {
+    Case("AK3 a card is joined to its id string by device id AND bus id, or not at all");
+    const std::vector<cd::NvidiaGpu> gpus = cudatest::TwoCards();
+    const std::vector<std::wstring> ids = cudatest::BothIds();
+
+    const cd::CudaMatch hit = cd::MatchUniversalId(cudatest::kKey5090, gpus, ids);
+    CHECK(hit.refusal == cd::CudaRefusal::None);
+    CHECK_EQ(hit.id, std::wstring(cudatest::kId5090));   // VERBATIM: the tail is never rebuilt
+    CHECK_EQ(cd::MatchUniversalId(cudatest::kKey4090, gpus, ids).id, std::wstring(cudatest::kId4090));
+
+    Case("AK3b every refusal MatchUniversalId can give");
+    CHECK(cd::MatchUniversalId(cudatest::kKey5090, std::vector<cd::NvidiaGpu>(), ids).refusal ==
+          cd::CudaRefusal::NoNvidiaDriver);
+    CHECK(cd::MatchUniversalId(cudatest::kKeyAmd, gpus, ids).refusal == cd::CudaRefusal::NoNvidiaGpuForKey);
+    {
+        std::vector<cd::NvidiaGpu> twins = gpus;
+        twins[1].adapterKey = cudatest::kKey5090;   // two physically identical cards
+        CHECK(cd::MatchUniversalId(cudatest::kKey5090, twins, ids).refusal ==
+              cd::CudaRefusal::AmbiguousIdenticalCards);
+    }
+    {
+        std::vector<std::wstring> only4090;
+        only4090.push_back(cudatest::kId4090);
+        CHECK(cd::MatchUniversalId(cudatest::kKey5090, gpus, only4090).refusal == cd::CudaRefusal::NoIdForGpu);
+        CHECK(cd::MatchUniversalId(cudatest::kKey5090, gpus, std::vector<std::wstring>()).refusal ==
+              cd::CudaRefusal::NoIdForGpu);
+    }
+    {
+        std::vector<std::wstring> twice = ids;
+        twice.push_back(cudatest::kId5090);
+        CHECK(cd::MatchUniversalId(cudatest::kKey5090, gpus, twice).refusal == cd::CudaRefusal::SeveralIdsForGpu);
+    }
+    Case("AK3c the bus id is part of the join, not decoration");
+    {
+        std::vector<cd::NvidiaGpu> moved = gpus;
+        moved[0].busId = 9;   // same card id, another slot: the driver's string no longer names it
+        CHECK(cd::MatchUniversalId(cudatest::kKey5090, moved, ids).refusal == cd::CudaRefusal::NoIdForGpu);
+    }
+}
+
+void Test_AK4_CudaPlanFor() {
+    Case("AK4 a non-NVIDIA target is silence, not a refusal (founder decision 18)");
+    const std::vector<cd::NvidiaGpu> gpus = cudatest::TwoCards();
+    const cd::CudaPlan amd = cd::CudaPlanFor(cudatest::kKeyAmd, gpus);
+    CHECK(!amd.act);
+    CHECK(amd.refusal == cd::CudaRefusal::None);
+    CHECK(amd.excludeKeys.empty());
+    for (int k = 0; k < 4; ++k) {
+        const std::wstring key = k == 0 ? std::wstring()
+                                        : k == 1 ? cd::WindowsPowerSavingKey()
+                                                 : k == 2 ? cd::WindowsHighPerformanceKey()
+                                                          : cd::UnreadableChoiceKey();
+        const cd::CudaPlan p = cd::CudaPlanFor(key, gpus);
+        CHECK(!p.act);
+        CHECK(p.refusal == cd::CudaRefusal::None);
+    }
+
+    Case("AK4b an NVIDIA target excludes every other NVIDIA card, each once");
+    const cd::CudaPlan two = cd::CudaPlanFor(cudatest::kKey4090, gpus);
+    CHECK(two.act);
+    CHECK_EQ(two.excludeKeys.size(), (size_t)1);
+    CHECK_EQ(two.excludeKeys[0], std::wstring(cudatest::kKey5090));
+
+    Case("AK4c one NVIDIA card: nothing is excluded, and that is still a plan");
+    {
+        std::vector<cd::NvidiaGpu> one;
+        one.push_back(gpus[0]);
+        const cd::CudaPlan p = cd::CudaPlanFor(cudatest::kKey5090, one);
+        CHECK(p.act);
+        CHECK(p.excludeKeys.empty());
+    }
+
+    Case("AK4d an NVIDIA target the driver cannot account for IS said");
+    CHECK(cd::CudaPlanFor(cudatest::kKey5090, std::vector<cd::NvidiaGpu>()).refusal ==
+          cd::CudaRefusal::NoNvidiaDriver);
+    {
+        std::vector<cd::NvidiaGpu> only4090;
+        only4090.push_back(gpus[1]);
+        CHECK(cd::CudaPlanFor(cudatest::kKey5090, only4090).refusal == cd::CudaRefusal::NoNvidiaGpuForKey);
+    }
+
+    Case("AK4e three NVIDIA cards refuse: the separator between two ids is unmeasured");
+    {
+        std::vector<cd::NvidiaGpu> three = gpus;
+        cd::NvidiaGpu c;
+        c.adapterKey = L"10DE&2204&38821043";
+        c.busId = 5;
+        three.push_back(c);
+        const cd::CudaPlan p = cd::CudaPlanFor(cudatest::kKey5090, three);
+        CHECK(!p.act);
+        CHECK(p.refusal == cd::CudaRefusal::SeveralToExclude);
+    }
+
+    Case("AK4f two entries of the SAME other card count once, so a twin listing is not three cards");
+    {
+        std::vector<cd::NvidiaGpu> twice = gpus;
+        twice.push_back(gpus[0]);
+        const cd::CudaPlan p = cd::CudaPlanFor(cudatest::kKey4090, twice);
+        CHECK(p.act);
+        CHECK_EQ(p.excludeKeys.size(), (size_t)1);
+    }
+}
+
+void Test_AK5_CudaTargetFor() {
+    Case("AK5 the one value a target implies");
+    const std::vector<cd::NvidiaGpu> gpus = cudatest::TwoCards();
+    const std::vector<std::wstring> ids = cudatest::BothIds();
+    const cd::CudaTarget t = cd::CudaTargetFor(cudatest::kKey4090, gpus, ids);
+    CHECK(t.act);
+    CHECK_EQ(t.value, std::wstring(cudatest::kId5090));   // exclude the OTHER card
+    CHECK(t.refusal == cd::CudaRefusal::None);
+
+    Case("AK5b the only NVIDIA card there is: CUDA may use everything, written as NVIDIA's own word");
+    {
+        std::vector<cd::NvidiaGpu> one;
+        one.push_back(gpus[0]);
+        const cd::CudaTarget solo = cd::CudaTargetFor(cudatest::kKey5090, one, ids);
+        CHECK(solo.act);
+        CHECK_EQ(solo.value, cd::CudaNoneValue());
+    }
+
+    Case("AK5c a refusal anywhere below leaves act false and the reason intact");
+    CHECK(!cd::CudaTargetFor(cudatest::kKeyAmd, gpus, ids).act);
+    CHECK(cd::CudaTargetFor(cudatest::kKeyAmd, gpus, ids).refusal == cd::CudaRefusal::None);
+    CHECK(cd::CudaTargetFor(cudatest::kKey4090, gpus, std::vector<std::wstring>()).refusal ==
+          cd::CudaRefusal::NoIdForGpu);
+    CHECK(!cd::CudaTargetFor(cudatest::kKey4090, gpus, std::vector<std::wstring>()).act);
+}
+
+// 🔴 E1: THE PRODUCT WRITES CUDA ONLY WHERE IT OWNS THE PROFILE EXCLUSIVELY. Everything else is a refusal
+// that names the entry and counts the programs it covers, and leaves the driver database untouched.
+void Test_AK6_WriteCudaForRow() {
+    Case("AK6 E1 first case: NVIDIA has no entry, so one of ours is made, written, recorded and saved");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    cudatest::Fake f;
+    f.gpus = cudatest::TwoCards();
+    f.ids = cudatest::BothIds();
+    const cd::CudaOps ops = cudatest::OpsOf(f);
+    const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids);
+    cudatest::Rec rec;
+
+    const cd::CudaRowResult made = cudatest::Apply(exe, target, ops, rec);
+    CHECK(made.outcome == cd::CudaOutcome::Written);
+    CHECK(made.recorded);
+    CHECK(!made.hadPrevious);                                  // there was no entry at all
+    CHECK_EQ(f.creates, 1);
+    CHECK_EQ(f.saves, 1);
+    CHECK_EQ(f.settings[cd::CudaProfileNameFor(exe)], std::wstring(cudatest::kId5090));
+    // 🔴 E2: THE LINE IS THE WHOLE RECORD - entry, value, time. There is no original to keep, because
+    // before this row NVIDIA had no entry for the application at all.
+    CHECK_EQ(rec.record.rows.size(), (size_t)1);
+    CHECK_EQ(rec.record.rows[0].profileName, cd::CudaProfileNameFor(exe));
+    CHECK_EQ(rec.record.rows[0].appEntry, cd::CudaAppKeyFor(exe));
+    CHECK_EQ(rec.record.rows[0].lastWrote, std::wstring(cudatest::kId5090));
+    CHECK(!rec.record.rows[0].when.empty());
+
+    Case("AK6b running it again changes nothing, writes nothing and records nothing");
+    const int savesBefore = rec.saves;
+    const cd::CudaRowResult again = cudatest::Apply(exe, target, ops, rec);
+    CHECK(again.outcome == cd::CudaOutcome::AlreadySet);
+    CHECK_EQ(f.saves, 1);
+    CHECK_EQ(f.written.size(), (size_t)1);
+    CHECK_EQ(rec.saves, savesBefore);                          // the line already says exactly this
+
+    Case("AK6c a second Apply on our own entry moves the line's value, and there is still one line");
+    const cd::CudaTarget other = cd::CudaTargetFor(cudatest::kKey5090, f.gpus, f.ids);
+    const cd::CudaRowResult swapped = cudatest::Apply(exe, other, ops, rec);
+    CHECK(swapped.outcome == cd::CudaOutcome::Written);
+    CHECK(swapped.hadPrevious);
+    CHECK_EQ(swapped.previousValue, std::wstring(cudatest::kId5090));
+    CHECK_EQ(f.settings[cd::CudaProfileNameFor(exe)], std::wstring(cudatest::kId4090));
+    CHECK_EQ(rec.record.rows.size(), (size_t)1);
+    CHECK_EQ(rec.record.rows[0].lastWrote, std::wstring(cudatest::kId4090));
+    CHECK_EQ(f.creates, 1);                                    // nothing was made a second time
+
+    Case("AK6d 🔴 E1: NVIDIA'S OWN ENTRY IS NOT WRITTEN, and the refusal names it and counts its programs");
+    {
+        cudatest::Fake s;
+        s.gpus = cudatest::TwoCards();
+        s.ids = cudatest::BothIds();
+        cudatest::Own(s, L"C:\\Chrome\\chrome.exe", L"Google Chrome", L"chrome.exe", true, 2);
+        s.settings[L"Google Chrome"] = cudatest::kId4090;
+        cudatest::Rec srec;
+        const cd::CudaRowResult r = cudatest::Apply(
+            L"C:\\Chrome\\chrome.exe", cd::CudaTargetFor(cudatest::kKey4090, s.gpus, s.ids),
+            cudatest::OpsOf(s), srec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NvidiaManagesIt);
+        CHECK_EQ(s.creates, 0);
+        CHECK(s.written.empty());
+        CHECK_EQ(s.saves, 0);
+        CHECK(srec.record.rows.empty());
+        CHECK_EQ(s.settings[L"Google Chrome"], std::wstring(cudatest::kId4090));   // theirs, untouched
+        // The sentence E9 requires, built from what the row itself answered.
+        CHECK_EQ(r.profileName, std::wstring(L"Google Chrome"));
+        CHECK_EQ(r.otherApps, (size_t)2);
+        const std::wstring says = cd::CudaRowRefusalText(r);
+        CHECK(says.find(L"Google Chrome") != std::wstring::npos);
+        CHECK(says.find(L"2 other programs") != std::wstring::npos);
+        CHECK(says.find(L"NVIDIA Control Panel") != std::wstring::npos);
+    }
+
+    Case("AK6e every refusal a write can meet, and none of them writes anything");
+    {
+        cudatest::Fake n;
+        n.available = false;
+        n.openRefusal = cd::CudaRefusal::NoNvidiaDriver;
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NoNvidiaDriver);
+        CHECK(n.written.empty());
+    }
+    {
+        cudatest::Fake n;
+        n.available = false;
+        n.openRefusal = cd::CudaRefusal::SessionRefused;
+        cudatest::Rec nrec;
+        CHECK(cudatest::Apply(exe, target, cudatest::OpsOf(n), nrec).refusal == cd::CudaRefusal::SessionRefused);
+    }
+    {
+        // 🔴 E7: -167 ARRIVES AFTER THE PROFILE IS MADE, AND THE PROFILE GOES AGAIN. Without that an empty
+        // "Game Optimizer - <path>" sits in the open session and the NEXT row's save commits it.
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        n.createAnswer = cd::CudaCreate::AlreadyInUse;
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NameAlreadyInUse);
+        CHECK(n.written.empty());
+        CHECK_EQ(n.saves, 0);
+        CHECK(nrec.record.rows.empty());
+        CHECK(n.profiles.empty());                             // E7: nothing was left behind
+        CHECK_EQ(n.deletes, 1);
+    }
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        n.createAnswer = cd::CudaCreate::Failed;
+        cudatest::Rec nrec;
+        CHECK(cudatest::Apply(exe, target, cudatest::OpsOf(n), nrec).refusal == cd::CudaRefusal::ProfileNotCreated);
+        CHECK(n.profiles.empty());                             // E7 again: the same clean-up
+    }
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        n.writeFails = true;
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::SettingNotWritten);
+        CHECK_EQ(n.saves, 0);
+        CHECK_EQ(nrec.saves, 0);
+        CHECK(r.profileDeleted);                               // and the entry it made went with it
+    }
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        n.saveFails = true;
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotSaved);
+    }
+
+    Case("AK6f a target that does nothing asks the driver nothing at all");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKeyAmd, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::NotAsked);
+        CHECK(r.refusal == cd::CudaRefusal::None);
+        CHECK(n.written.empty());
+        CHECK_EQ(n.creates, 0);
+    }
+
+    Case("AK6g the line goes down BEFORE the save, and a record that refuses takes the change back out");
+    {
+        // 🔴 The old order was write, save, then record - so a record that could not take the row left a
+        // change on disk that Remove assignment could not even see. The line goes first now: a row whose
+        // line cannot be written is undone in the driver instead of being left there unrecorded.
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::Rec nrec;
+        nrec.fails = true;
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotRecorded);
+        CHECK(!r.recorded);
+        CHECK(r.undone);
+        CHECK_EQ(nrec.saves, 1);                                 // the record WAS asked, and refused
+        CHECK_EQ(n.saves, 0);                                    // 🔴 and nothing was ever saved
+        CHECK(n.saved.empty());
+        CHECK_EQ(n.settings.count(cd::CudaProfileNameFor(exe)), (size_t)0);
+        CHECK_EQ(n.byExe.count(cd::ToLower(exe)), (size_t)0);    // the entry it made went with it
+        CHECK(n.profiles.empty());
+        CHECK(nrec.record.rows.empty());
+    }
+
+    Case("AK6h 🔴 an entry of ours that already holds the target still has its LINE brought up to date");
+    {
+        // Apply to card A. The user then sets exactly the value a second Apply would write, in NVIDIA's own
+        // Control Panel. Without this the line still claims card A's value, and the next Remove compares
+        // the driver with a value nobody holds and reports a conflict this product itself caused.
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        const cd::CudaOps nops = cudatest::OpsOf(n);
+        cudatest::Rec nrec;
+        cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), nops, nrec);
+        CHECK_EQ(nrec.record.rows[0].lastWrote, std::wstring(cudatest::kId5090));
+        n.settings[cd::CudaProfileNameFor(exe)] = cudatest::kId4090;   // the user, in NVIDIA's own panel
+        const int writesBefore = n.writes;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey5090, n.gpus, n.ids), nops, nrec);
+        CHECK(r.outcome == cd::CudaOutcome::AlreadySet);
+        CHECK(r.recorded);
+        CHECK_EQ(n.writes, writesBefore);                        // nothing was written to the driver
+        CHECK_EQ(nrec.record.rows.size(), (size_t)1);
+        CHECK_EQ(nrec.record.rows[0].lastWrote, std::wstring(cudatest::kId4090));
+        // And the restore that follows it finds no conflict at all.
+        CHECK(cd::RestoreCudaForRow(exe, *cd::CudaLineFor(nrec.record, exe), nops).outcome ==
+              cd::CudaOutcome::Written);
+    }
+}
+
+// 🔴 E3: THE UNDO IS THE ENTRY, NOT THE VALUE. Before this product there was no entry at all, so putting
+// it back means taking the whole entry away - and only while it is still ours and still holds what we left.
+void Test_AK7_RestoreCudaForRow() {
+    Case("AK7 E3 first case: our own entry, still ours, still holding our value - it goes, and is confirmed");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    const std::wstring entry = cd::CudaAppKeyFor(exe);
+    const cd::CudaRecordRow line = cudatest::Line(ours, entry, cudatest::kId5090);
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK(r.profileDeleted);
+        CHECK_EQ(f.deletes, 1);
+        CHECK_EQ(f.saves, 1);
+        CHECK(f.profiles.empty());
+        CHECK(f.settings.empty());
+        CHECK_EQ(f.byExe.count(cd::ToLower(exe)), (size_t)0);
+    }
+
+    Case("AK7b E3 second case: a value somebody else set since is a CONFLICT - nothing is written");
+    {
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        n.settings[ours] = cd::CudaNoneValue();   // chosen in NVIDIA's own panel since
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n));
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::ChangedSinceWritten);
+        CHECK_EQ(n.deletes, 0);
+        CHECK_EQ(n.saves, 0);
+        CHECK_EQ(n.settings[ours], cd::CudaNoneValue());
+    }
+    {
+        cudatest::Fake n;   // the setting is gone entirely: also not ours to take an entry away over
+        cudatest::Own(n, exe, ours, entry);
+        CHECK(cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n)).refusal == cd::CudaRefusal::ChangedSinceWritten);
+    }
+    {
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        n.settings[ours] = cudatest::kId5090;
+        n.readFails = true;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n));
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotRead);   // a failed read is never "it must still be ours"
+        CHECK_EQ(n.deletes, 0);
+    }
+
+    Case("AK7c E3 third case: the entry is already gone, which is ABSENT and is not a failure");
+    {
+        cudatest::Fake n;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n));
+        CHECK(r.outcome == cd::CudaOutcome::Absent);
+        CHECK(r.refusal == cd::CudaRefusal::None);
+        CHECK(n.written.empty());
+        CHECK_EQ(n.saves, 0);
+        CHECK_EQ(n.deletes, 0);
+    }
+
+    Case("AK7d no driver, a damaged note and a lookup nobody could make are each said, and touch nothing");
+    {
+        cudatest::Fake n;
+        n.available = false;
+        n.openRefusal = cd::CudaRefusal::SessionRefused;
+        CHECK(cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n)).refusal == cd::CudaRefusal::SessionRefused);
+    }
+    {
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        n.settings[ours] = cudatest::kId5090;
+        cd::CudaRecordRow bad = line;
+        bad.lastWrote = L"not a gpu id at all";
+        CHECK(cd::RestoreCudaForRow(exe, bad, cudatest::OpsOf(n)).refusal == cd::CudaRefusal::RecordUnusable);
+        bad = line;
+        bad.lastWrote.clear();                   // nothing to compare the driver with
+        CHECK(cd::RestoreCudaForRow(exe, bad, cudatest::OpsOf(n)).refusal == cd::CudaRefusal::RecordUnusable);
+        bad = line;
+        bad.profileName.clear();
+        CHECK(cd::RestoreCudaForRow(exe, bad, cudatest::OpsOf(n)).refusal == cd::CudaRefusal::RecordUnusable);
+        bad = line;
+        bad.appEntry.clear();
+        CHECK(cd::RestoreCudaForRow(exe, bad, cudatest::OpsOf(n)).refusal == cd::CudaRefusal::RecordUnusable);
+        CHECK(n.written.empty());
+        CHECK_EQ(n.deletes, 0);
+        // NVIDIA's own word for "nothing is excluded" IS a legal value and must not be read as damage.
+        cudatest::Fake ok;
+        cudatest::Own(ok, exe, ours, entry);
+        ok.settings[ours] = cd::CudaNoneValue();
+        cd::CudaRecordRow fine = line;
+        fine.lastWrote = cd::CudaNoneValue();
+        CHECK(cd::RestoreCudaForRow(exe, fine, cudatest::OpsOf(ok)).outcome == cd::CudaOutcome::Written);
+    }
+    {
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        n.settings[ours] = cudatest::kId5090;
+        n.lookupFails = true;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n));
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotLookUp);
+        CHECK_EQ(n.deletes, 0);
+    }
+
+    Case("AK7e an entry that could not be taken away leaves everything as it is, and says which");
+    {
+        // A driver with no way to delete a profile at all: nothing was touched, so a later row may still
+        // save and the run does not have to stop.
+        cudatest::Fake n;
+        n.noDelete = true;
+        cudatest::Own(n, exe, ours, entry);
+        n.settings[ours] = cudatest::kId5090;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n));
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::ProfileNotRemoved);
+        CHECK(!r.sessionDirty);
+        CHECK_EQ(n.settings[ours], std::wstring(cudatest::kId5090));
+    }
+    {
+        // It offers one and refuses. That may have taken the application entry out of the open session on
+        // its way to refusing, so no later row of this run may save.
+        cudatest::Fake n;
+        n.deleteFails = true;
+        cudatest::Own(n, exe, ours, entry);
+        n.settings[ours] = cudatest::kId5090;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n));
+        CHECK(r.refusal == cd::CudaRefusal::ProfileNotRemoved);
+        CHECK(r.sessionDirty);
+        CHECK_EQ(n.saves, 0);
+    }
+    {
+        // The delete landed in the SESSION and the save refused, so nothing reached the database - the line
+        // stays and the run stops rather than letting a later row's save commit it.
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        n.settings[ours] = cudatest::kId5090;
+        n.saveFails = true;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(n));
+        CHECK(r.refusal == cd::CudaRefusal::NotSaved);
+        CHECK(r.sessionDirty);
+        CHECK(!r.profileDeleted);
+        CHECK(n.saved.empty());
+    }
+
+    Case("AK7f a delete the driver claims and does not do is caught by the read-back");
+    {
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        n.settings[ours] = cudatest::kId5090;
+        cd::CudaOps ignoring = cudatest::OpsOf(n);
+        // The driver answers yes and leaves the entry where it is: the second lookup still finds ours.
+        ignoring.deleteProfile = [](const std::wstring&, const std::wstring&) { return true; };
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, ignoring);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotConfirmed);
+        CHECK(!r.profileDeleted);
+    }
+}
+
+void Test_AK8_TheRecordOnDisk() {
+    Case("AK8 E2: a record round-trips, and one line is four fields and nothing more");
+    std::vector<cd::CudaRecordRow> rows;
+    const cd::CudaRecordRow a = cudatest::Line(L"Game Optimizer - C:\\Chrome\\chrome.exe",
+                                               L"c:/chrome/chrome.exe", cudatest::kId4090);
+    rows.push_back(a);
+    cd::CudaRecordRow b = cudatest::Line(L"Game Optimizer - C:\\Apps\\chat\\chat.exe",
+                                         L"c:/apps/chat/chat.exe", cd::CudaNoneValue());
+    b.when = L"2026-09-20 12:00:01";
+    rows.push_back(b);
+
+    const std::wstring text = cd::FormatCudaRecordFile(rows);
+    CHECK(text.find(cd::FormatCudaRecordHeader()) == 0);
+    CHECK(text.find(cd::CudaRecordFileName()) != std::wstring::npos);   // the header names the file
+    CHECK(text.find(L"\r\nGame Optimizer - C:\\Chrome\\chrome.exe\tc:/chrome/chrome.exe\t") != std::wstring::npos);
+    std::vector<cd::CudaRecordRow> back;
+    CHECK(cd::ParseCudaRecordFile(text, back));
+    CHECK_EQ(back.size(), (size_t)2);
+    CHECK_EQ(back[0].profileName, a.profileName);
+    CHECK_EQ(back[0].appEntry, a.appEntry);
+    CHECK_EQ(back[0].lastWrote, a.lastWrote);     // the field Remove compares the driver with
+    CHECK_EQ(back[0].when, a.when);
+    CHECK_EQ(back[1].lastWrote, cd::CudaNoneValue());
+
+    Case("AK8b 🔴 E6: THE FIRST LINE IS A HEADER, and a file without one is UNREADABLE - never empty");
+    {
+        std::vector<cd::CudaRecordRow> out;
+        const std::wstring magic = cd::CudaRecordMagic() + L"\t" + cd::CudaRecordVersion() + L"\r\n";
+        // a header and no rows at all: a real, readable, empty record - the state a spent last line leaves
+        CHECK(cd::ParseCudaRecordFile(magic, out));
+        CHECK(out.empty());
+        CHECK(cd::ParseCudaRecordFile(magic + L"; a comment\r\n\r\nP\tA\tnone\tt\r\n", out));
+        CHECK_EQ(out.size(), (size_t)1);
+        CHECK_EQ(out[0].profileName, std::wstring(L"P"));
+        CHECK_EQ(out[0].appEntry, std::wstring(L"A"));
+        CHECK_EQ(out[0].lastWrote, cd::CudaNoneValue());
+        CHECK_EQ(out[0].when, std::wstring(L"t"));
+        // 🔴 AND EVERY WAY A FILE CAN FAIL TO BE ONE OF OURS ANSWERS false, not "there was nothing".
+        CHECK(!cd::ParseCudaRecordFile(std::wstring(), out));                  // empty
+        CHECK(!cd::ParseCudaRecordFile(L"\r\n\r\n", out));                     // blank lines only
+        CHECK(!cd::ParseCudaRecordFile(L"; only a comment\r\n", out));         // comment-only
+        CHECK(!cd::ParseCudaRecordFile(L"; a comment\r\n" + magic, out));      // the header is not first
+        CHECK(!cd::ParseCudaRecordFile(cd::CudaRecordMagic() + L"\t1\r\n", out));   // an older version
+        CHECK(!cd::ParseCudaRecordFile(cd::CudaRecordMagic() + L"\t3\r\n", out));   // and a newer one
+        CHECK(!cd::ParseCudaRecordFile(L"Some Other Product\t2\r\n", out));
+        // the v0.5.8 round-1 and round-2 formats, which this version must not guess at
+        CHECK(!cd::ParseCudaRecordFile(L"Google Chrome\tchrome.exe\t(none)\tnone\r\n", out));
+        CHECK(!cd::ParseCudaRecordFile(L"1\tP\tA\t0\tnone\tnone\tt\r\n", out));
+        // one field too many, one too few, and a row missing what the compare needs
+        CHECK(!cd::ParseCudaRecordFile(magic + L"P\tA\tnone\tt\textra\r\n", out));
+        CHECK(!cd::ParseCudaRecordFile(magic + L"P\tA\tnone\r\n", out));
+        CHECK(!cd::ParseCudaRecordFile(magic + L"\tA\tnone\tt\r\n", out));
+        CHECK(!cd::ParseCudaRecordFile(magic + L"P\tA\t\tt\r\n", out));
+        // one bad line poisons the whole file, even beside good ones
+        CHECK(!cd::ParseCudaRecordFile(magic + L"P\tA\tnone\tt\r\nrubbish\r\n", out));
+        CHECK(out.empty());
+    }
+
+    Case("AK8c a field with a tab or a line break is never written, nor a row with nothing to compare");
+    {
+        cd::CudaRecordRow bad = a;
+        CHECK(cd::CudaRecordRowIsWritable(bad));
+        bad.profileName = L"has\there";
+        CHECK(!cd::CudaRecordRowIsWritable(bad));
+        bad = a;
+        bad.appEntry = L"has\r\nhere";
+        CHECK(!cd::CudaRecordRowIsWritable(bad));
+        bad = a;
+        bad.lastWrote = L"id\t2";
+        CHECK(!cd::CudaRecordRowIsWritable(bad));
+        bad = a;
+        bad.lastWrote.clear();
+        CHECK(!cd::CudaRecordRowIsWritable(bad));
+        bad = a;
+        bad.appEntry.clear();
+        CHECK(!cd::CudaRecordRowIsWritable(bad));
+        bad = a;
+        bad.when.clear();                       // a line with no time is not one this writes
+        CHECK(!cd::CudaRecordRowIsWritable(bad));
+    }
+
+    Case("AK8d only a value the driver itself could have written is usable");
+    {
+        CHECK(cd::CudaValueIsLegal(cd::CudaNoneValue()));
+        CHECK(cd::CudaValueIsLegal(cudatest::kId5090));
+        CHECK(!cd::CudaValueIsLegal(L""));
+        CHECK(!cd::CudaValueIsLegal(L"(none)"));
+        CHECK(!cd::CudaValueIsLegal(L"autoselect"));
+        CHECK(!cd::CudaValueIsLegal(L"id,2.0:ZZZZ,00000100,GF"));
+        CHECK(cd::CudaRecordRowIsUsable(a));
+        CHECK(cd::CudaRecordRowIsUsable(b));
+    }
+
+    Case("AK8e the one file has a plain name and lives beside config.ini, not beside the .reg");
+    CHECK_EQ(cd::CudaRecordFileName(), std::wstring(L"gpu-cuda-record.txt"));
+    CHECK(cd::CudaRecordFileName().find(L"before") == std::wstring::npos);
+    CHECK_EQ(cd::CudaRecordVersion(), std::wstring(L"2"));
+
+    Case("AK8f our own application entry has ONE form, and a bare file name is never it");
+    CHECK_EQ(cd::CudaAppKeyFor(L"C:\\Apps\\Chat\\chat.exe"), std::wstring(L"c:/apps/chat/chat.exe"));
+    CHECK_EQ(cd::CudaAppKeyFor(L"c:/apps/chat/chat.exe"), std::wstring(L"c:/apps/chat/chat.exe"));
+    CHECK(cd::CudaAppKeyFor(L"C:\\Apps\\Chat\\chat.exe") != std::wstring(L"chat.exe"));
+    CHECK(cd::CudaAppKeyFor(std::wstring()).empty());
+}
+
+void Test_AK9_OneLinePerApplication() {
+    Case("AK9 E2: ONE LINE PER APPLICATION - a second Apply replaces it, it never piles up");
+    cd::CudaRecordRow first = cudatest::Line(L"Game Optimizer - C:\\Chrome\\chrome.exe",
+                                             L"c:/chrome/chrome.exe", cudatest::kId5090);
+    first.when = L"1";
+    std::vector<cd::CudaRecordRow> rows = cd::CudaRowsWith(std::vector<cd::CudaRecordRow>(), first);
+    CHECK_EQ(rows.size(), (size_t)1);
+    cd::CudaRecordRow second = first;
+    second.lastWrote = cudatest::kId4090;
+    second.when = L"2";
+    rows = cd::CudaRowsWith(rows, second);
+    CHECK_EQ(rows.size(), (size_t)1);
+    CHECK_EQ(rows[0].lastWrote, std::wstring(cudatest::kId4090));
+    CHECK_EQ(rows[0].when, std::wstring(L"2"));
+    cd::CudaRecordRow other = first;
+    other.appEntry = L"c:/apps/chat/chat.exe";
+    rows = cd::CudaRowsWith(rows, other);
+    CHECK_EQ(rows.size(), (size_t)2);          // another application is another line
+    CHECK_EQ(rows[0].appEntry, std::wstring(L"c:/chrome/chrome.exe"));   // and the order is kept
+    rows = cd::CudaRowsWithout(rows, L"C:/CHROME/CHROME.EXE");           // the entry is matched without case
+    CHECK_EQ(rows.size(), (size_t)1);
+    CHECK_EQ(rows[0].appEntry, std::wstring(L"c:/apps/chat/chat.exe"));
+    CHECK_EQ(cd::CudaRowsWithout(rows, L"nothing.exe").size(), (size_t)1);
+
+    Case("AK9b the line for one executable is found by the one form our own entry takes");
+    {
+        cd::CudaRecord record;
+        record.state = cd::CudaRecordState::Ok;
+        record.rows.push_back(cudatest::Line(L"Game Optimizer - C:\\Apps\\Chat\\chat.exe",
+                                             L"c:/apps/chat/chat.exe", cudatest::kId4090));
+        const cd::CudaRecordRow* got = cd::CudaLineFor(record, L"C:\\Apps\\Chat\\chat.exe");
+        CHECK(got != nullptr);
+        CHECK_EQ(got->lastWrote, std::wstring(cudatest::kId4090));
+        // 🔴 ANOTHER COPY OF THE SAME PROGRAM IS ANOTHER PROGRAM. A bare "chat.exe" entry would have
+        // covered it, and this product never makes one.
+        CHECK(cd::CudaLineFor(record, L"C:\\Other\\chat.exe") == nullptr);
+        CHECK(cd::CudaLineFor(record, L"C:\\Apps\\other.exe") == nullptr);
+        CHECK(cd::CudaLineFor(record, std::wstring()) == nullptr);
+        cd::CudaRecord bare;
+        bare.state = cd::CudaRecordState::Ok;
+        bare.rows.push_back(cudatest::Line(L"Google Chrome", L"chat.exe", cudatest::kId4090));
+        CHECK(cd::CudaLineFor(bare, L"C:\\Apps\\Chat\\chat.exe") == nullptr);
+    }
+
+    Case("AK9c the three states a record can be in, and Missing is the only silent one");
+    {
+        cd::CudaRecord fresh;
+        CHECK(fresh.state == cd::CudaRecordState::Missing);
+        CHECK(fresh.rows.empty());
+    }
+}
+
+void Test_AK10_TheWordsTheDialogsUse() {
+    Case("AK10 every refusal has its own sentence, and None has none");
+    const cd::CudaRefusal all[] = {
+        cd::CudaRefusal::NoNvidiaDriver,          cd::CudaRefusal::NoNvidiaGpuForKey,
+        cd::CudaRefusal::AmbiguousIdenticalCards, cd::CudaRefusal::NoIdForGpu,
+        cd::CudaRefusal::SeveralIdsForGpu,        cd::CudaRefusal::SeveralToExclude,
+        cd::CudaRefusal::SessionRefused,          cd::CudaRefusal::NameAlreadyInUse,
+        cd::CudaRefusal::ProfileNameTaken,        cd::CudaRefusal::ProfileNotCreated,
+        cd::CudaRefusal::SettingNotWritten,       cd::CudaRefusal::NotSaved,
+        cd::CudaRefusal::CouldNotRead,            cd::CudaRefusal::CouldNotLookUp,
+        cd::CudaRefusal::MembershipUnknown,       cd::CudaRefusal::RecordUnreadable,
+        cd::CudaRefusal::RecordUnusable,          cd::CudaRefusal::RecordedProfileChanged,
+        cd::CudaRefusal::ChangedSinceWritten,     cd::CudaRefusal::ProfileNotRemoved,
+        cd::CudaRefusal::NotRecorded,             cd::CudaRefusal::NotConfirmed,
+        cd::CudaRefusal::NotUndone };
+    std::set<std::wstring> seen;
+    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); ++i) {
+        const std::wstring s = cd::CudaRefusalReason(all[i]);
+        CHECK(!s.empty());
+        CHECK(s.find(L"error") == std::wstring::npos);   // no codes: the product's voice, not the driver's
+        seen.insert(s);
+    }
+    CHECK_EQ(seen.size(), sizeof(all) / sizeof(all[0]));   // no two refusals share a sentence
+    CHECK(cd::CudaRefusalReason(cd::CudaRefusal::None).empty());
+    // 🔴 E1's OWN REFUSAL HAS NO FIXED SENTENCE, because it has to name an entry and count its programs.
+    CHECK(cd::CudaRefusalReason(cd::CudaRefusal::NvidiaManagesIt).empty());
+
+    Case("AK10b 🔴 E9: the sentence that names what NVIDIA manages, and counts what goes with it");
+    {
+        const std::wstring none = cd::FormatCudaNvidiaManagesLine(L"Google Chrome", 0);
+        CHECK_EQ(none, std::wstring(L"NVIDIA keeps which GPU CUDA uses for it in its own settings entry "
+                                    L"\"Google Chrome\", which Game Optimizer has no record of making, so "
+                                    L"Game Optimizer left it alone; set that entry in NVIDIA Control Panel"));
+        CHECK(cd::FormatCudaNvidiaManagesLine(L"Microsoft Edge Beta", 1).find(L"1 other program as well") !=
+              std::wstring::npos);
+        const std::wstring six = cd::FormatCudaNvidiaManagesLine(L"Microsoft Edge Beta", 5);
+        CHECK(six.find(L"\"Microsoft Edge Beta\"") != std::wstring::npos);
+        CHECK(six.find(L"5 other programs as well") != std::wstring::npos);
+        CHECK(six.find(L"NVIDIA Control Panel") != std::wstring::npos);
+        // and the row's own refusal picks it, while every other refusal keeps its fixed sentence
+        cd::CudaRowResult r;
+        r.refusal = cd::CudaRefusal::NvidiaManagesIt;
+        r.profileName = L"Microsoft Edge Beta";
+        r.otherApps = 5;
+        CHECK_EQ(cd::CudaRowRefusalText(r), six);
+        r.refusal = cd::CudaRefusal::CouldNotRead;
+        CHECK_EQ(cd::CudaRowRefusalText(r), cd::CudaRefusalReason(cd::CudaRefusal::CouldNotRead));
+    }
+
+    Case("AK10c the Apply question gains ONE line, and only when a CUDA change is planned");
+    CHECK(cd::FormatCudaConfirmLine(false, L"RTX 4090").empty());
+    {
+        const std::wstring plain = cd::FormatCudaConfirmLine(true, L"RTX 4090");
+        // 🔴 IT ASKS, IT DOES NOT PROMISE, and it says out loud what E1 costs the user: a program NVIDIA
+        // already keeps its own settings for is left to NVIDIA Control Panel.
+        CHECK_EQ(plain, std::wstring(L"This also asks NVIDIA to use RTX 4090 for the CUDA work of any of them "
+                                     L"that use CUDA. Game Optimizer only does that through a settings entry "
+                                     L"of its own, so a program NVIDIA already keeps its own settings for - "
+                                     L"Chrome, Edge and others - is left to NVIDIA Control Panel. The result "
+                                     L"says which ones changed."));
+        CHECK(plain.find(L"will be set to use") == std::wstring::npos);
+    }
+
+    Case("AK10d a confirm with no CUDA line is byte-identical to the one v0.5.7 asked");
+    {
+        cd::AssignConfirm c;
+        c.count = 2;
+        c.targetName = L"RTX 4090";
+        const std::wstring without = cd::FormatAssignConfirm(c);
+        c.cudaLine = cd::FormatCudaConfirmLine(true, L"RTX 4090");
+        const std::wstring with = cd::FormatAssignConfirm(c);
+        CHECK_EQ(with.compare(0, without.size(), without), 0);
+        CHECK_EQ(with, without + L"\r\n\r\n" + c.cudaLine);
+    }
+
+    Case("AK10e the result says what landed, what did not, and where the record is");
+    {
+        cd::CudaResultText t;
+        CHECK(cd::FormatCudaApplyLines(t).empty());        // nothing happened: nothing is said
+        CHECK(cd::FormatCudaRemoveLines(t).empty());
+        t.changed = 2;
+        t.targetName = L"RTX 4090";
+        t.already = 1;
+        t.recordStarted = true;
+        t.recordPath = L"C:\\d\\gpu-cuda-record.txt";
+        const std::wstring apply = cd::FormatCudaApplyLines(t);
+        CHECK(apply.find(L"2 of them will use RTX 4090 for CUDA as well.") != std::wstring::npos);
+        CHECK(apply.find(L"1 already used it for CUDA") != std::wstring::npos);
+        CHECK(apply.find(L"C:\\d\\gpu-cuda-record.txt") != std::wstring::npos);
+        t.wholeReason = cd::CudaRefusalReason(cd::CudaRefusal::NoNvidiaDriver);
+        t.anyRefused = true;
+        t.refusedLines = L"\r\n    chat.exe - " + cd::FormatCudaNvidiaManagesLine(L"Google Chrome", 3);
+        const std::wstring bad = cd::FormatCudaApplyLines(t);
+        CHECK(bad.find(L"not changed for any of them: this computer has no NVIDIA driver to ask.") !=
+              std::wstring::npos);
+        CHECK(bad.find(L"3 other programs as well") != std::wstring::npos);
+        cd::CudaResultText r;
+        r.changed = 3;
+        CHECK(cd::FormatCudaRemoveLines(r).find(L"put back for 3 of them.") != std::wstring::npos);
+        r.wholeReason = cd::CudaRefusalReason(cd::CudaRefusal::SessionRefused);
+        // 🔴 E4: WHEN THE CUDA HALF CANNOT RUN, NO GPU ASSIGNMENT IS REMOVED EITHER, and the result says it.
+        CHECK(cd::FormatCudaRemoveLines(r).find(L"so no GPU assignment was removed either") !=
+              std::wstring::npos);
+    }
+
+    Case("AK10f 🔴 E5: a change that could not be taken back out is the loudest thing either dialog says");
+    {
+        cd::CudaResultText t;
+        t.anyUnresolved = true;
+        t.unresolvedLines = L"\r\n    chat.exe - " + cd::CudaRefusalReason(cd::CudaRefusal::NotUndone);
+        t.recordPath = L"C:\\d\\gpu-cuda-record.txt";
+        const std::wstring apply = cd::FormatCudaApplyLines(t);
+        CHECK(apply.find(L"was changed and could NOT be put back for:") != std::wstring::npos);
+        CHECK(apply.find(L"chat.exe") != std::wstring::npos);
+        CHECK(apply.find(L"Nothing after that was tried, for the GPU setting or for CUDA.") !=
+              std::wstring::npos);
+        CHECK(apply.find(L"C:\\d\\gpu-cuda-record.txt") != std::wstring::npos);
+        const std::wstring remove = cd::FormatCudaRemoveLines(t);
+        CHECK(remove.find(L"was changed and could NOT be put back for:") != std::wstring::npos);
+        // And a run with nothing unresolved never says any of it.
+        cd::CudaResultText quiet;
+        quiet.changed = 1;
+        quiet.targetName = L"RTX 4090";
+        CHECK(cd::FormatCudaApplyLines(quiet).find(L"could NOT be put back") == std::wstring::npos);
+    }
+
+    Case("AK10g Remove's own CUDA line says what goes away, for how many, and that the box does not stop it");
+    {
+        // Nothing of ours on record for any ticked row: Remove's question says nothing about CUDA at all.
+        CHECK(cd::FormatCudaRestoreConfirmLine(0, false, std::wstring()).empty());
+        CHECK(cd::FormatCudaRestoreConfirmLine(0, true, std::wstring()).empty());
+        const std::wstring one = cd::FormatCudaRestoreConfirmLine(1, false, std::wstring());
+        CHECK_EQ(one, std::wstring(L"This also takes away the NVIDIA settings entry Game Optimizer made for 1 "
+                                   L"of them, so which GPU CUDA uses goes back to what it was before. The "
+                                   L"result says which ones changed."));
+        CHECK(cd::FormatCudaRestoreConfirmLine(2, false, std::wstring()).find(L"for 2 of them") !=
+              std::wstring::npos);
+        // 🔴 WITH THE CHECK BOX CLEARED, THE QUESTION SAYS THE UNDO HAPPENS ANYWAY. The box gates Apply's
+        // writes only - if it gated this too, the one switch a user flips to stop this touching CUDA would
+        // also be the switch that makes an earlier CUDA change permanent.
+        const std::wstring off = cd::FormatCudaRestoreConfirmLine(1, true, std::wstring());
+        CHECK_EQ(off, one + L" Game Optimizer does that whether or not \"Also set which GPU CUDA uses\" is "
+                            L"ticked, so a change it made can always be undone.");
+        CHECK(one.find(L"whether or not") == std::wstring::npos);   // and it is not said when the box is ticked
+    }
+
+    Case("AK10h 🔴 E4: a Remove that cannot put CUDA back says BEFORE Yes that nothing is removed");
+    {
+        const std::wstring blocked =
+            cd::FormatCudaRestoreConfirmLine(3, false, cd::CudaRefusalReason(cd::CudaRefusal::RecordUnreadable));
+        CHECK(blocked.find(L"Nothing is removed at all") == 0);
+        CHECK(blocked.find(cd::CudaRefusalReason(cd::CudaRefusal::RecordUnreadable)) != std::wstring::npos);
+        CHECK(blocked.find(L"would leave no way back") != std::wstring::npos);
+        CHECK(blocked.find(L"takes away the NVIDIA settings entry") == std::wstring::npos);
+        // and it is said even when no ticked row has a line, because nothing is removed either way
+        CHECK(!cd::FormatCudaRestoreConfirmLine(0, false,
+                                                cd::CudaRefusalReason(cd::CudaRefusal::NoNvidiaDriver)).empty());
+        cd::RemoveConfirm c;
+        c.count = 3;
+        c.cudaLine = blocked;
+        CHECK(cd::FormatRemoveConfirm(c).find(L"Nothing is removed at all") != std::wstring::npos);
+    }
+
+    Case("AK10i a restore whose record could not be updated afterwards is named, not left quiet");
+    {
+        cd::CudaResultText u;
+        u.changed = 1;
+        u.anyUnrecorded = true;
+        u.unrecordedLines = L"\r\n    chat.exe - the record could not be updated";
+        const std::wstring s = cd::FormatCudaRemoveLines(u);
+        CHECK(s.find(L"put back for 1 of them.") != std::wstring::npos);
+        CHECK(s.find(L"the record of it could not be updated") != std::wstring::npos);
+    }
+
+    Case("AK10j a Remove refusal says the GPU assignment was left in place, so it can be tried again");
+    {
+        cd::CudaResultText t;
+        t.anyRefused = true;
+        t.refusedLines = L"\r\n    chat.exe - " + cd::CudaRefusalReason(cd::CudaRefusal::ChangedSinceWritten);
+        const std::wstring s = cd::FormatCudaRemoveLines(t);
+        CHECK(s.find(L"their GPU assignment was left in place and Remove assignment can try again") !=
+              std::wstring::npos);
+    }
+}
+
+void Test_AK11_TheSettingRoundTrips() {
+    Case("AK11 'Also set which GPU CUDA uses' is ON by default and survives a save and load");
+    cd::Config c;
+    CHECK(c.setCudaGpu);
+    c.setCudaGpu = false;
+    cd::Config back;
+    std::wstring err;
+    CHECK(cd::ParseConfig(cd::SerializeConfig(c), back, &err));
+    CHECK(!back.setCudaGpu);
+    c.setCudaGpu = true;
+    CHECK(cd::ParseConfig(cd::SerializeConfig(c), back, &err));
+    CHECK(back.setCudaGpu);
+    // An older config has no such key, and the default must not flip to off because it is missing.
+    cd::Config old;
+    CHECK(cd::ParseConfig(L"[gpus]\r\nauto_isolate=true\r\n", old, &err));
+    CHECK(old.setCudaGpu);
+}
+
+// The branches the Council's three rounds put into the product, one test each: a mutant that takes any of
+// them out has to go red here.
+void Test_AK12_AFailedReadIsNeverNoSetting() {
+    Case("AK12 a CUDA setting on OUR OWN entry that could not be read REFUSES the row");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    cudatest::Fake f;
+    f.gpus = cudatest::TwoCards();
+    f.ids = cudatest::BothIds();
+    cudatest::Own(f, exe, cd::CudaProfileNameFor(exe), cd::CudaAppKeyFor(exe));
+    f.settings[cd::CudaProfileNameFor(exe)] = cudatest::kId4090;
+    f.readFails = true;
+    const cd::CudaOps ops = cudatest::OpsOf(f);
+    const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids);
+    cudatest::Rec rec;
+    rec.record.rows.push_back(cudatest::Line(cd::CudaProfileNameFor(exe), cd::CudaAppKeyFor(exe),
+                                             cudatest::kId4090));
+
+    const cd::CudaRowPlan p = cd::PlanCudaForRow(exe, target, ops, rec.record);
+    CHECK(!p.act);
+    CHECK(p.refusal == cd::CudaRefusal::CouldNotRead);
+    CHECK(!p.hadPrevious);                               // and above all NOT "there was none"
+    const cd::CudaRowResult r = cudatest::Apply(exe, target, ops, rec);
+    CHECK(r.outcome == cd::CudaOutcome::Refused);
+    CHECK(r.refusal == cd::CudaRefusal::CouldNotRead);
+    CHECK(f.written.empty());                            // nothing written over what nobody can see
+    CHECK_EQ(f.saves, 0);
+
+    Case("AK12b our own entry holding no such setting is still 'there was none'");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::Own(n, exe, cd::CudaProfileNameFor(exe), cd::CudaAppKeyFor(exe));
+        cudatest::Rec nrec;
+        nrec.record.rows.push_back(cudatest::Line(cd::CudaProfileNameFor(exe), cd::CudaAppKeyFor(exe),
+                                                  cd::CudaNoneValue()));
+        const cd::CudaRowResult r2 =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r2.outcome == cd::CudaOutcome::Written);
+        CHECK(!r2.hadPrevious);
+        CHECK_EQ(n.settings[cd::CudaProfileNameFor(exe)], std::wstring(cudatest::kId5090));
+    }
+
+    Case("AK12c no reader at all is a failed read, not an empty one");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::Own(n, exe, cd::CudaProfileNameFor(exe), cd::CudaAppKeyFor(exe));
+        cd::CudaOps bare = cudatest::OpsOf(n);
+        bare.readSetting = nullptr;
+        cudatest::Rec nrec;
+        nrec.record.rows.push_back(cudatest::Line(cd::CudaProfileNameFor(exe), cd::CudaAppKeyFor(exe),
+                                                  cudatest::kId4090));
+        CHECK(cd::WriteCudaForRow(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), bare, nrec.record,
+                                  cudatest::InputsOf(nrec))
+                  .refusal == cd::CudaRefusal::CouldNotRead);
+        CHECK(n.written.empty());
+    }
+
+    Case("AK12d a LIVE value the driver could not have written counts as could-not-read");
+    {
+        // 🔴 Recording it would make a note Remove must later refuse as damaged, so the overwrite could
+        // never be undone through this product. Refusing the row leaves the strange value alone instead.
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::Own(n, exe, cd::CudaProfileNameFor(exe), cd::CudaAppKeyFor(exe));
+        n.settings[cd::CudaProfileNameFor(exe)] = L"autoselect";   // not a CUDA_EXCLUDED_GPUS_ID value
+        cudatest::Rec nrec;
+        nrec.record.rows.push_back(cudatest::Line(cd::CudaProfileNameFor(exe), cd::CudaAppKeyFor(exe),
+                                                  cudatest::kId4090));
+        const cd::CudaRowResult r2 =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r2.outcome == cd::CudaOutcome::Refused);
+        CHECK(r2.refusal == cd::CudaRefusal::CouldNotRead);
+        CHECK(n.written.empty());
+        CHECK_EQ(n.saves, 0);
+        CHECK_EQ(n.settings[cd::CudaProfileNameFor(exe)], std::wstring(L"autoselect"));
+        // an empty string is the same thing, and NVIDIA's own "none" is not
+        n.settings[cd::CudaProfileNameFor(exe)] = std::wstring();
+        CHECK(cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec)
+                  .refusal == cd::CudaRefusal::CouldNotRead);
+        n.settings[cd::CudaProfileNameFor(exe)] = cd::CudaNoneValue();
+        CHECK(cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec)
+                  .outcome == cd::CudaOutcome::Written);
+    }
+}
+
+void Test_AK13_MembershipAndIdenticalCards() {
+    Case("AK13 an entry whose applications could not all be listed refuses the row, and claims no count");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    cudatest::Fake f;
+    f.gpus = cudatest::TwoCards();
+    f.ids = cudatest::BothIds();
+    cudatest::Own(f, exe, L"Microsoft Edge Beta", L"chat.exe", false, 1);
+    f.byExe[cd::ToLower(exe)].appsComplete = false;
+    const cd::CudaOps ops = cudatest::OpsOf(f);
+    const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids);
+    cudatest::Rec rec;
+    const cd::CudaRowPlan p = cd::PlanCudaForRow(exe, target, ops, rec.record);
+    CHECK(!p.act);
+    CHECK(p.refusal == cd::CudaRefusal::MembershipUnknown);
+    CHECK_EQ(p.otherApps, (size_t)0);    // 🔴 half a count is never carried out as if it were the whole one
+    const cd::CudaRowResult r = cudatest::Apply(exe, target, ops, rec);
+    CHECK(r.refusal == cd::CudaRefusal::MembershipUnknown);
+    CHECK(f.written.empty());
+    CHECK_EQ(f.saves, 0);
+    CHECK_EQ(f.creates, 0);
+    // 🔴 R5-7: AND THE SENTENCE NAMES THE ENTRY, because the lookup found it and only its membership could
+    // not be listed. It still states no COUNT - that is the number nobody measured.
+    CHECK_EQ(cd::CudaRowRefusalText(r),
+             cd::FormatCudaMembershipUnknownLine(L"Microsoft Edge Beta"));
+    CHECK(cd::CudaRowRefusalText(r).find(L"\"Microsoft Edge Beta\"") != std::wstring::npos);
+    CHECK(cd::CudaRowRefusalText(r).find(L"other program") == std::wstring::npos);
+
+    Case("AK13b an entry whose list IS complete is still NVIDIA's, and is still not written (E1)");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::Own(n, exe, L"Microsoft Edge Beta", L"chat.exe", false, 1);
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r2 =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r2.outcome == cd::CudaOutcome::Refused);
+        CHECK(r2.refusal == cd::CudaRefusal::NvidiaManagesIt);
+        CHECK_EQ(r2.otherApps, (size_t)1);
+        CHECK(n.settings.empty());
+    }
+
+    Case("AK13c two cards carrying the target key refuse rather than excluding nothing");
+    {
+        std::vector<cd::NvidiaGpu> twins = cudatest::TwoCards();
+        twins[1].adapterKey = cudatest::kKey5090;   // two of the same card, one key between them
+        const cd::CudaPlan p2 = cd::CudaPlanFor(cudatest::kKey5090, twins);
+        CHECK(!p2.act);
+        CHECK(p2.refusal == cd::CudaRefusal::AmbiguousIdenticalCards);
+        CHECK(p2.excludeKeys.empty());
+        const cd::CudaTarget t = cd::CudaTargetFor(cudatest::kKey5090, twins, cudatest::BothIds());
+        CHECK(!t.act);
+        CHECK(t.refusal == cd::CudaRefusal::AmbiguousIdenticalCards);
+        CHECK(t.value.empty());   // NOT NVIDIA's "nothing is excluded", which is what it used to write
+    }
+}
+
+void Test_AK14_AFailedSaveLeavesNothingBehind() {
+    Case("AK14 a row whose save failed is taken back out of the session");
+    const std::wstring first = L"C:\\Apps\\one\\one.exe";
+    const std::wstring second = L"C:\\Apps\\two\\two.exe";
+    cudatest::Fake f;
+    f.gpus = cudatest::TwoCards();
+    f.ids = cudatest::BothIds();
+    f.saveFails = true;
+    const cd::CudaOps ops = cudatest::OpsOf(f);
+    const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids);
+    cudatest::Rec rec;
+
+    const cd::CudaRowResult a = cudatest::Apply(first, target, ops, rec);
+    CHECK(a.outcome == cd::CudaOutcome::Refused);
+    CHECK(a.refusal == cd::CudaRefusal::NotSaved);
+    CHECK(a.undone);
+    CHECK(!a.unresolved);
+    CHECK_EQ(f.settings.count(cd::CudaProfileNameFor(first)), (size_t)0);   // gone from the SESSION
+    CHECK_EQ(f.byExe.count(cd::ToLower(first)), (size_t)0);                 // and so is the entry it made
+    CHECK(f.saved.empty());
+
+    Case("AK14b so the NEXT row's save cannot commit it, which is the whole point of the rollback");
+    f.saveFails = false;
+    const cd::CudaRowResult b = cudatest::Apply(second, target, ops, rec);
+    CHECK(b.outcome == cd::CudaOutcome::Written);
+    CHECK_EQ(f.saved.count(cd::CudaProfileNameFor(second)), (size_t)1);
+    CHECK_EQ(f.saved.count(cd::CudaProfileNameFor(first)), (size_t)0);
+    CHECK_EQ(f.saved.size(), (size_t)1);
+
+    Case("AK14c undoing a row on an entry of ours that already held a value puts THAT value back");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::Own(n, first, cd::CudaProfileNameFor(first), cd::CudaAppKeyFor(first));
+        n.settings[cd::CudaProfileNameFor(first)] = cudatest::kId4090;   // what an earlier Apply left
+        n.saveFails = true;
+        cudatest::Rec nrec;
+        nrec.record.rows.push_back(cudatest::Line(cd::CudaProfileNameFor(first), cd::CudaAppKeyFor(first),
+                                                  cudatest::kId4090));
+        const cd::CudaRowResult r =
+            cudatest::Apply(first, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.refusal == cd::CudaRefusal::NotSaved);
+        CHECK(r.undone);
+        CHECK_EQ(n.settings[cd::CudaProfileNameFor(first)], std::wstring(cudatest::kId4090));   // NOT cleared
+        CHECK_EQ(n.deletes, 0);                                                                 // NOT deleted
+    }
+
+    Case("AK14d a save that works but a value that does not read back is refused and undone too");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        n.writeIgnored = true;   // the driver answers yes and changes nothing
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(first, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotConfirmed);
+        CHECK(r.undone);
+        CHECK(!r.unresolved);
+        CHECK_EQ(n.byExe.count(cd::ToLower(first)), (size_t)0);   // the entry it made went with it
+        CHECK(n.profiles.empty());
+    }
+
+    Case("AK14e 🔴 E5: A ROLLBACK THAT ITSELF FAILS IS NOT 'undone' - it is unresolved, and it stops the run");
+    {
+        // 🔴 The old UndoCudaWrite wrote the old value back and reported undone=true whatever the driver
+        // answered, so a rollback that failed looked exactly like one that worked - and the next row's
+        // save then committed the change nobody had taken out.
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        n.saveFails = true;
+        n.failWriteNumber = 2;   // the row's own write lands; the rollback's write does not
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(first, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotUndone);
+        CHECK(!r.undone);
+        CHECK(r.unresolved);
+        CHECK(r.recorded);                                       // the line was written before the save
+        CHECK_EQ(nrec.record.rows.size(), (size_t)1);
+        // and the value is still sitting in the session, which is exactly why no later row may be tried
+        CHECK_EQ(n.settings[cd::CudaProfileNameFor(first)], std::wstring(cudatest::kId5090));
+    }
+    {
+        // The same shape on the read-back path: the write landed on disk, and the undo's save refuses.
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        n.writeIgnored = true;     // so the read-back cannot confirm it
+        n.failSaveNumber = 2;      // the row saves; the rollback's save does not
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(first, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.refusal == cd::CudaRefusal::NotUndone);
+        CHECK(r.unresolved);
+        CHECK(!r.undone);
+    }
+}
+
+void Test_AK15_WhatRemoveSaysWhenThereWasNothingToPutBack() {
+    Case("AK15 'there was no record' is SAID, and is not the sentence 'it could not be read'");
+    cd::CudaResultText t;
+    t.noRecord = 3;
+    const std::wstring quiet = cd::FormatCudaRemoveLines(t);
+    CHECK(quiet.find(L"3 of them never had their CUDA GPU changed here") != std::wstring::npos);
+    CHECK(quiet.find(L"was not put back for") == std::wstring::npos);
+    t.anyRefused = true;
+    t.refusedLines = L"\r\n    chat.exe - " + cd::CudaRefusalReason(cd::CudaRefusal::RecordUnreadable);
+    const std::wstring loud = cd::FormatCudaRemoveLines(t);
+    CHECK(loud.find(L"Which GPU CUDA uses was not put back for the applications below") != std::wstring::npos);
+    CHECK(loud.find(cd::CudaRefusalReason(cd::CudaRefusal::RecordUnreadable)) != std::wstring::npos);
+    CHECK(cd::CudaRefusalReason(cd::CudaRefusal::RecordUnreadable) !=
+          cd::CudaRefusalReason(cd::CudaRefusal::RecordUnusable));
+
+    Case("AK15b an entry that is gone is said as 'nothing to put back', not as a failure");
+    {
+        cd::CudaResultText u;
+        u.already = 1;
+        const std::wstring one = cd::FormatCudaRemoveLines(u);
+        CHECK(one.find(L"no longer has NVIDIA settings of its own") != std::wstring::npos);
+        CHECK(one.find(L"not put back for") == std::wstring::npos);
+        u.already = 2;
+        CHECK(cd::FormatCudaRemoveLines(u).find(L"no longer have NVIDIA settings of their own") !=
+              std::wstring::npos);
+    }
+
+    Case("AK15c a Remove where nothing at all happened still says nothing at all");
+    CHECK(cd::FormatCudaRemoveLines(cd::CudaResultText()).empty());
+}
+
+// A LOOKUP that failed must never be taken for "NVIDIA has no settings entry for it yet" - which is worse
+// than a failed READ, because that answer does not stop the row, it makes a new entry for a program NVIDIA
+// may already manage.
+void Test_AK16_AFailedLookupIsNeverNoProfile() {
+    Case("AK16 a profile lookup that FAILED refuses the row and makes nothing");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    cudatest::Fake f;
+    f.gpus = cudatest::TwoCards();
+    f.ids = cudatest::BothIds();
+    f.settings[L"Google Chrome"] = cudatest::kId4090;   // whatever NVIDIA may already keep for that name
+    f.lookupFails = true;
+    const cd::CudaOps ops = cudatest::OpsOf(f);
+    const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids);
+    cudatest::Rec rec;
+
+    const cd::CudaRowPlan p = cd::PlanCudaForRow(exe, target, ops, rec.record);
+    CHECK(!p.act);
+    CHECK(p.refusal == cd::CudaRefusal::CouldNotLookUp);
+    CHECK(!p.profileExists);                             // and above all NOT "so one must be made"
+    CHECK(p.profileName.empty());
+    const cd::CudaRowResult r = cudatest::Apply(exe, target, ops, rec);
+    CHECK(r.outcome == cd::CudaOutcome::Refused);
+    CHECK(r.refusal == cd::CudaRefusal::CouldNotLookUp);
+    CHECK_EQ(f.creates, 0);                              // THE COST OF THE OLD ANSWER: a whole new entry
+    CHECK(f.written.empty());
+    CHECK_EQ(f.saves, 0);
+    CHECK(rec.record.rows.empty());
+    CHECK_EQ(f.settings[L"Google Chrome"], std::wstring(cudatest::kId4090));
+
+    Case("AK16b the driver SAYING it has no entry still means 'make one'");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r2 =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r2.outcome == cd::CudaOutcome::Written);
+        CHECK_EQ(n.creates, 1);
+        CHECK(!r2.hadPrevious);
+        CHECK_EQ(n.settings[cd::CudaProfileNameFor(exe)], std::wstring(cudatest::kId5090));
+    }
+
+    Case("AK16c no lookup at all is a failed lookup, not an empty one");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cd::CudaOps bare = cudatest::OpsOf(n);
+        bare.findProfileForExe = nullptr;
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r3 = cd::WriteCudaForRow(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids),
+                                                         bare, nrec.record, cudatest::InputsOf(nrec));
+        CHECK(r3.outcome == cd::CudaOutcome::Refused);
+        CHECK(r3.refusal == cd::CudaRefusal::CouldNotLookUp);
+        CHECK_EQ(n.creates, 0);
+        CHECK(n.written.empty());
+    }
+}
+
+// 🔴 THE ROUND-2 BLOCKER, IN ONE TEST. Assign an application to NVIDIA card A, later assign it to card B,
+// then Remove. The old per-run journal compared the driver against what the FIRST Apply wrote, saw the
+// SECOND Apply's value, and announced that somebody else had changed it.
+void Test_AK17_TwoAppliesThenRemove() {
+    Case("AK17 assign to one NVIDIA card, then the other, then Remove: our entry goes, with no conflict");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    cudatest::Fake f;
+    f.gpus = cudatest::TwoCards();
+    f.ids = cudatest::BothIds();
+    const cd::CudaOps ops = cudatest::OpsOf(f);
+    cudatest::Rec rec;
+
+    const cd::CudaRowResult one =
+        cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), ops, rec);
+    CHECK(one.outcome == cd::CudaOutcome::Written);
+    CHECK_EQ(f.settings[cd::CudaProfileNameFor(exe)], std::wstring(cudatest::kId5090));
+    CHECK_EQ(rec.record.rows.size(), (size_t)1);
+
+    const cd::CudaRowResult two =
+        cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey5090, f.gpus, f.ids), ops, rec);
+    CHECK(two.outcome == cd::CudaOutcome::Written);
+    CHECK_EQ(f.settings[cd::CudaProfileNameFor(exe)], std::wstring(cudatest::kId4090));
+    // 🔴 STILL ONE LINE, and it names the value the LAST Apply wrote - which is what Remove compares.
+    CHECK_EQ(rec.record.rows.size(), (size_t)1);
+    CHECK_EQ(rec.record.rows[0].lastWrote, std::wstring(cudatest::kId4090));
+
+    const cd::CudaRecordRow* line = cd::CudaLineFor(rec.record, exe);
+    CHECK(line != nullptr);
+    const cd::CudaRowResult back = cd::RestoreCudaForRow(exe, *line, ops);
+    CHECK(back.outcome == cd::CudaOutcome::Written);
+    CHECK(back.refusal != cd::CudaRefusal::ChangedSinceWritten);   // 🔴 the false conflict is gone
+    CHECK(f.settings.empty());                                     // and the entry went with the setting
+    CHECK(f.profiles.empty());
+
+    Case("AK17b and the line is spent, so a second Remove finds nothing of ours to put back");
+    rec.record.rows = cd::CudaRowsWithout(rec.record.rows, line->appEntry);
+    CHECK(rec.record.rows.empty());
+    CHECK(cd::CudaLineFor(rec.record, exe) == nullptr);
+
+    Case("AK17c a real change by somebody else IS still a conflict, and is left alone");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        const cd::CudaOps nops = cudatest::OpsOf(n);
+        cudatest::Rec nrec;
+        cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), nops, nrec);
+        n.settings[cd::CudaProfileNameFor(exe)] = cudatest::kId4090;   // the user, in NVIDIA's own panel
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, *cd::CudaLineFor(nrec.record, exe), nops);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::ChangedSinceWritten);
+        CHECK_EQ(n.settings[cd::CudaProfileNameFor(exe)], std::wstring(cudatest::kId4090));
+        CHECK_EQ(nrec.record.rows.size(), (size_t)1);       // and the line is KEPT, so it can be retried
+        CHECK_EQ(n.deletes, 0);
+    }
+}
+
+// 🔴 E1 IS THE WHOLE OF v0.5.8, so it gets the test that enumerates every shape of entry there is.
+void Test_AK18_OnlyAnEntryWeOwn() {
+    Case("AK18 E1: the six shapes an entry can have, and the ONE this product writes on");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    const std::wstring entry = cd::CudaAppKeyFor(exe);
+    const cd::CudaRecordRow line = cudatest::Line(ours, entry, cudatest::kId5090);
+    {
+        // 1. NO ENTRY AT ALL -> one of ours is made. (AK6 proves the write; this proves the ruling.)
+        cudatest::Fake n;
+        cd::CudaResolved res = cd::ResolveCudaProfile(exe, cudatest::OpsOf(n));
+        CHECK(res.state == cd::CudaLookup::Absent);
+    }
+    {
+        // 2. OUR OWN ENTRY, ONE MEMBER, NAMED IN THE RECORD -> written.
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        const cd::CudaResolved res = cd::ResolveCudaProfile(exe, cudatest::OpsOf(n));
+        CHECK(cd::CudaOwnershipRefusal(res, exe, ours) == cd::CudaRefusal::None);
+        // 🔴 AND THE RECORD IS PART OF THE TEST. Without a line naming it, an entry carrying our own name
+        // is one an earlier run - or a user - left behind, and it is not ours to write on.
+        CHECK(cd::CudaOwnershipRefusal(res, exe, std::wstring()) == cd::CudaRefusal::NvidiaManagesIt);
+        CHECK(cd::CudaOwnershipRefusal(res, exe, L"Google Chrome") == cd::CudaRefusal::NvidiaManagesIt);
+    }
+    {
+        // 3. A PREDEFINED NVIDIA ENTRY -> never written, whatever it is called.
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry, true);
+        const cd::CudaResolved res = cd::ResolveCudaProfile(exe, cudatest::OpsOf(n));
+        CHECK(cd::CudaOwnershipRefusal(res, exe, ours) == cd::CudaRefusal::NvidiaManagesIt);
+    }
+    {
+        // 4. AN ENTRY WITH A SECOND MEMBER -> never written: the other member cannot be given a different
+        // CUDA GPU, which is the root founder decision 22 answers.
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry, false, 1);
+        const cd::CudaResolved res = cd::ResolveCudaProfile(exe, cudatest::OpsOf(n));
+        CHECK(cd::CudaOwnershipRefusal(res, exe, ours) == cd::CudaRefusal::NvidiaManagesIt);
+    }
+    {
+        // 5. A MEMBERSHIP THAT COULD NOT BE LISTED -> never written, and no count is claimed.
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        n.byExe[cd::ToLower(exe)].appsComplete = false;
+        const cd::CudaResolved res = cd::ResolveCudaProfile(exe, cudatest::OpsOf(n));
+        CHECK(cd::CudaOwnershipRefusal(res, exe, ours) == cd::CudaRefusal::MembershipUnknown);
+    }
+    {
+        // 6. AN ENTRY MATCHED BY BARE FILE NAME -> never ours: our own entry is always the full path.
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, L"chat.exe");
+        const cd::CudaResolved res = cd::ResolveCudaProfile(exe, cudatest::OpsOf(n));
+        CHECK(cd::CudaOwnershipRefusal(res, exe, ours) == cd::CudaRefusal::NvidiaManagesIt);
+    }
+    {
+        // and a lookup nobody could make is neither of the six
+        cudatest::Fake dead;
+        dead.available = false;
+        const cd::CudaResolved none = cd::ResolveCudaProfile(exe, cudatest::OpsOf(dead));
+        CHECK(none.state == cd::CudaLookup::Failed);
+        CHECK(cd::CudaOwnershipRefusal(none, exe, ours) == cd::CudaRefusal::CouldNotLookUp);
+    }
+
+    Case("AK18b an entry carrying our name that no line claims is NOT adopted, and nothing is changed");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::LeftBehind(n, exe);            // the profile is there; it covers no application
+        cudatest::Rec nrec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::ProfileNameTaken);
+        CHECK(n.written.empty());
+        CHECK_EQ(n.saves, 0);
+        CHECK(nrec.record.rows.empty());
+        CHECK_EQ(n.byExe.count(cd::ToLower(exe)), (size_t)0);   // its application entry was NOT put back
+        CHECK_EQ(n.profiles.count(ours), (size_t)1);            // and the entry itself is untouched
+    }
+
+    Case("AK18c the SAME entry, with a line of ours naming it, IS adopted - and read before it is written");
+    {
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::LeftBehind(n, exe);
+        n.settings[ours] = cudatest::kId4090;    // a value that earlier run left in it
+        cudatest::Rec nrec;
+        nrec.record.rows.push_back(line);
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK(r.hadPrevious);
+        CHECK_EQ(r.previousValue, std::wstring(cudatest::kId4090));
+        CHECK_EQ(n.settings[ours], std::wstring(cudatest::kId5090));
+        CHECK_EQ(nrec.record.rows.size(), (size_t)1);
+        CHECK_EQ(nrec.record.rows[0].lastWrote, std::wstring(cudatest::kId5090));
+    }
+    {
+        // An adopted entry whose setting cannot be read refuses the row, exactly as a found one does.
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::LeftBehind(n, exe);
+        n.readFails = true;
+        cudatest::Rec nrec;
+        nrec.record.rows.push_back(line);
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotRead);
+        CHECK(n.written.empty());
+        CHECK_EQ(n.saves, 0);
+    }
+    {
+        // 🔴 AND AN ADOPTED ENTRY IS NOT DELETED WHEN THE ROW ROLLS BACK: this run did not create it.
+        cudatest::Fake n;
+        n.gpus = cudatest::TwoCards();
+        n.ids = cudatest::BothIds();
+        cudatest::LeftBehind(n, exe);
+        n.saveFails = true;
+        cudatest::Rec nrec;
+        nrec.record.rows.push_back(line);
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), nrec);
+        CHECK(r.refusal == cd::CudaRefusal::NotSaved);
+        CHECK(r.undone);
+        CHECK(!r.profileDeleted);
+        CHECK_EQ(n.deletes, 0);
+        CHECK_EQ(n.profiles.count(ours), (size_t)1);
+    }
+
+    Case("AK18d the delete carries the application entry, and nothing else is ever deleted");
+    {
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, L"c:/somebody/else.exe");   // our name, another program's entry
+        CHECK(!cd::DropCudaProfileWeMade(ours, entry, cudatest::OpsOf(n)));
+        CHECK_EQ(n.deletes, 1);                                 // asked, and refused by the driver's guard
+        CHECK_EQ(n.byExe.size(), (size_t)1);
+    }
+    {
+        cudatest::Fake n;
+        cudatest::Own(n, exe, ours, entry);
+        // Never asked at all: no entry, or a name this feature does not make.
+        CHECK(!cd::DropCudaProfileWeMade(ours, std::wstring(), cudatest::OpsOf(n)));
+        CHECK(!cd::DropCudaProfileWeMade(L"Google Chrome", entry, cudatest::OpsOf(n)));
+        CHECK_EQ(n.deletes, 0);   // 🔴 NEITHER of them even reaches the driver: the guards are asked first
+        CHECK(cd::DropCudaProfileWeMade(ours, entry, cudatest::OpsOf(n)));
+        CHECK_EQ(n.deletes, 1);
+    }
+}
+
+// Remove fails closed on exactly what Apply fails closed on. Until round 3 it wrote on a profile NAME
+// taken out of a file and asked the driver nothing at all.
+void Test_AK19_RemoveFailsClosedOnIdentity() {
+    Case("AK19 Remove refuses every entry that is not still the one our line names");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    const std::wstring entry = cd::CudaAppKeyFor(exe);
+    const cd::CudaRecordRow rec = cudatest::Line(ours, entry, cudatest::kId5090);
+    {
+        cudatest::Fake n;                                     // another entry answers for it now
+        cudatest::Own(n, exe, L"Google Chrome", L"chat.exe", true);
+        n.settings[ours] = cudatest::kId5090;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, rec, cudatest::OpsOf(n));
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::RecordedProfileChanged);
+        CHECK_EQ(n.deletes, 0);
+        CHECK_EQ(n.settings[ours], std::wstring(cudatest::kId5090));
+    }
+    {
+        cudatest::Fake n;                                     // ours, and it has gained a second member
+        cudatest::Own(n, exe, ours, entry, false, 1);
+        n.settings[ours] = cudatest::kId5090;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, rec, cudatest::OpsOf(n));
+        CHECK(r.refusal == cd::CudaRefusal::RecordedProfileChanged);
+        CHECK_EQ(n.deletes, 0);
+    }
+    {
+        cudatest::Fake n;                                     // ours, and NVIDIA now calls it predefined
+        cudatest::Own(n, exe, ours, entry, true);
+        n.settings[ours] = cudatest::kId5090;
+        CHECK(cd::RestoreCudaForRow(exe, rec, cudatest::OpsOf(n)).refusal ==
+              cd::CudaRefusal::RecordedProfileChanged);
+    }
+    {
+        cudatest::Fake n;                                     // it no longer covers our application entry
+        cudatest::Own(n, exe, ours, L"chat.exe");
+        n.settings[ours] = cudatest::kId5090;
+        CHECK(cd::RestoreCudaForRow(exe, rec, cudatest::OpsOf(n)).refusal ==
+              cd::CudaRefusal::RecordedProfileChanged);
+    }
+    {
+        cudatest::Fake n;                                     // a membership it would not finish listing
+        cudatest::Own(n, exe, ours, entry);
+        n.byExe[cd::ToLower(exe)].appsComplete = false;
+        n.settings[ours] = cudatest::kId5090;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, rec, cudatest::OpsOf(n));
+        CHECK(r.refusal == cd::CudaRefusal::MembershipUnknown);
+        CHECK_EQ(r.otherApps, (size_t)0);
+        CHECK_EQ(n.deletes, 0);
+    }
+}
+
+// 🔴 E4 AND E5 AT THE LEVEL THE ROWS ARE RUN AT. The CUDA half used to run in a second pass over the
+// results, so a Remove could strip an assignment before finding out the NVIDIA entry had to stay, and an
+// Apply whose rollback failed carried on writing later applications.
+void Test_AK20_TheCudaGateDecidesTheRow() {
+    Case("AK20 E4: on Remove a CUDA refusal leaves the row's GPU assignment exactly where it is");
+    std::map<std::wstring, std::wstring> prefs;
+    prefs[L"a.exe"] = L"GpuPreference=2;";
+    prefs[L"b.exe"] = L"GpuPreference=2;";
+    std::vector<cd::GpuEditItem> items;
+    cd::GpuEditItem a;
+    a.exePath = L"a.exe";
+    a.present = true;
+    a.existing = L"GpuPreference=2;";
+    items.push_back(a);
+    cd::GpuEditItem b = a;
+    b.exePath = L"b.exe";
+    items.push_back(b);
+    std::vector<size_t> asked;
+    cd::GpuEditOps ops;
+    ops.write = [&prefs](const std::wstring& path, bool, const std::wstring&, bool deleting,
+                         const std::wstring& value, unsigned long&, bool) {
+        if (deleting) prefs.erase(path);
+        else prefs[path] = value;
+        return cd::GuardedWriteResult::Written;
+    };
+    ops.read = [&prefs](const std::wstring& path, std::wstring& value, bool& unreadable) {
+        unreadable = false;
+        const std::map<std::wstring, std::wstring>::const_iterator it = prefs.find(path);
+        value = it == prefs.end() ? std::wstring() : it->second;
+        return it != prefs.end();
+    };
+    ops.record = [](const cd::GpuPreferenceBefore&) { return true; };
+    ops.cudaRow = [&asked](size_t index, std::wstring& reason) {
+        asked.push_back(index);
+        if (index != 0) return cd::GpuRowGate::Go;
+        reason = L"its GPU assignment was left in place because which GPU CUDA uses could not be put back";
+        return cd::GpuRowGate::SkipRow;
+    };
+    const std::vector<cd::GpuEditResult> out = cd::RunGpuEdits(items, true, std::wstring(), ops);
+    CHECK(out[0].outcome == cd::GpuEditOutcome::Refused);
+    CHECK(out[0].reason.find(L"left in place") != std::wstring::npos);
+    CHECK_EQ(prefs.count(L"a.exe"), (size_t)1);       // 🔴 the assignment is still there, so Remove stays lit
+    CHECK(out[1].outcome == cd::GpuEditOutcome::Done);
+    CHECK_EQ(prefs.count(L"b.exe"), (size_t)0);       // and a row the CUDA half was happy with still went
+    CHECK_EQ(asked.size(), (size_t)2);
+
+    Case("AK20b E5: a CUDA change that could not be taken back out stops every later row, GPU included");
+    {
+        prefs.clear();
+        prefs[L"a.exe"] = L"AppStatus=1;";
+        prefs[L"b.exe"] = L"AppStatus=1;";
+        asked.clear();
+        cd::GpuEditOps apply = ops;
+        apply.cudaRow = [&asked](size_t index, std::wstring&) {
+            asked.push_back(index);
+            return index == 0 ? cd::GpuRowGate::StopRun : cd::GpuRowGate::Go;
+        };
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(items, false, L"10DE&2684&40BF1458", apply);
+        CHECK(r[0].outcome == cd::GpuEditOutcome::Done);                  // its own write landed first
+        CHECK(r[1].outcome == cd::GpuEditOutcome::NotAttempted);
+        CHECK(r[1].reason.find(L"which GPU CUDA uses was changed for an application before it") !=
+              std::wstring::npos);
+        CHECK_EQ(asked.size(), (size_t)1);            // 🔴 the later row's CUDA half is not asked either
+        CHECK(prefs[L"b.exe"].find(L"GpuPreference") == std::wstring::npos);
+    }
+
+    Case("AK20c with no CUDA half at all, both actions behave exactly as v0.5.7's did");
+    {
+        prefs.clear();
+        prefs[L"a.exe"] = L"AppStatus=1;";
+        prefs[L"b.exe"] = L"AppStatus=1;";
+        cd::GpuEditOps plain = ops;
+        plain.cudaRow = nullptr;
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(items, false, L"10DE&2684&40BF1458", plain);
+        CHECK(r[0].outcome == cd::GpuEditOutcome::Done);
+        CHECK(r[1].outcome == cd::GpuEditOutcome::Done);
+    }
+
+    // 🔴 R5-3: THE ROUND-4 FINDING BOTH SEATS MADE, AND THE ONE THE OPERATOR WOULD HAVE MET FIRST. Every
+    // application v0.5.6 and v0.5.7 pinned is a row whose Windows GPU preference ALREADY equals what this
+    // Apply intends - AlreadyDone - and the CUDA half was gated on Done, so "GPU assignment shall also
+    // change the CUDA dedication GPU" did nothing at all for them, in silence.
+    Case("AK20d 🔴 R5-3: APPLY RUNS THE CUDA HALF FOR A ROW ALREADY PINNED TO THE TARGET");
+    {
+        const std::wstring target = L"10DE&2684&40BF1458";
+        const std::wstring pinned = cd::MergeGpuPreferenceValue(std::wstring(), target);
+        prefs.clear();
+        prefs[L"a.exe"] = pinned;             // already exactly what this Apply would write
+        prefs[L"b.exe"] = L"AppStatus=1;";    // and one that really changes
+        std::vector<cd::GpuEditItem> two;
+        cd::GpuEditItem already;
+        already.exePath = L"a.exe";
+        already.present = true;
+        already.existing = pinned;
+        two.push_back(already);
+        cd::GpuEditItem moves;
+        moves.exePath = L"b.exe";
+        moves.present = true;
+        moves.existing = L"AppStatus=1;";
+        two.push_back(moves);
+        asked.clear();
+        cd::GpuEditOps apply = ops;
+        apply.cudaRow = [&asked](size_t index, std::wstring&) {
+            asked.push_back(index);
+            return cd::GpuRowGate::Go;
+        };
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(two, false, target, apply);
+        CHECK(r[0].outcome == cd::GpuEditOutcome::AlreadyDone);
+        CHECK(r[1].outcome == cd::GpuEditOutcome::Done);
+        // 🔴 BOTH rows, not only the one that was written - and one && chain, so a mutant that asks for
+        // fewer makes this go RED rather than read past the end of the vector.
+        CHECK(asked.size() == 2 && asked[0] == 0 && asked[1] == 1);
+    }
+
+    Case("AK20e and an AlreadyDone row's CUDA half can stop the run exactly as a Done row's can (E5)");
+    {
+        const std::wstring target = L"10DE&2684&40BF1458";
+        const std::wstring pinned = cd::MergeGpuPreferenceValue(std::wstring(), target);
+        prefs.clear();
+        prefs[L"a.exe"] = pinned;
+        prefs[L"b.exe"] = L"AppStatus=1;";
+        std::vector<cd::GpuEditItem> two;
+        cd::GpuEditItem already;
+        already.exePath = L"a.exe";
+        already.present = true;
+        already.existing = pinned;
+        two.push_back(already);
+        cd::GpuEditItem moves;
+        moves.exePath = L"b.exe";
+        moves.present = true;
+        moves.existing = L"AppStatus=1;";
+        two.push_back(moves);
+        asked.clear();
+        cd::GpuEditOps apply = ops;
+        apply.cudaRow = [&asked](size_t index, std::wstring&) {
+            asked.push_back(index);
+            return index == 0 ? cd::GpuRowGate::StopRun : cd::GpuRowGate::Go;
+        };
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(two, false, target, apply);
+        CHECK(r[1].outcome == cd::GpuEditOutcome::NotAttempted);
+        CHECK_EQ(asked.size(), (size_t)1);
+        CHECK(prefs[L"b.exe"].find(L"GpuPreference") == std::wstring::npos);
+    }
+
+    Case("AK20f but a Refused, Unconfirmed or NotAttempted row still drags NO CUDA change");
+    {
+        // The row's guarded write refuses, so its Windows GPU preference is NOT what this run wants - and
+        // its CUDA setting must not move either. This is the half of R5-3 that did NOT change.
+        prefs.clear();
+        prefs[L"a.exe"] = L"AppStatus=1;";
+        prefs[L"b.exe"] = L"AppStatus=1;";
+        asked.clear();
+        cd::GpuEditOps apply = ops;
+        apply.write = [](const std::wstring&, bool, const std::wstring&, bool, const std::wstring&,
+                         unsigned long&, bool) { return cd::GuardedWriteResult::Changed; };
+        apply.cudaRow = [&asked](size_t index, std::wstring&) {
+            asked.push_back(index);
+            return cd::GpuRowGate::Go;
+        };
+        const std::vector<cd::GpuEditResult> r = cd::RunGpuEdits(items, false, L"10DE&2684&40BF1458", apply);
+        CHECK(r[0].outcome == cd::GpuEditOutcome::Refused);
+        CHECK(r[1].outcome == cd::GpuEditOutcome::Refused);
+        CHECK(asked.empty());
+    }
+}
+
+// 🔴 R5-1, THE ROUND-4 BLOCKER (adversarial review, round 4). NVIDIA keeps EVERY per-application setting in one profile, so the
+// entry this product made for an executable is also where NVIDIA Control Panel puts that executable's
+// other settings. Remove used to delete the whole profile and take them with it.
+void Test_AK21_OnlyOurOwnSettingIsRemoved() {
+    Case("AK21 R5-1: an entry holding settings this product did not write is NEVER deleted");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    const std::wstring entry = cd::CudaAppKeyFor(exe);
+    const cd::CudaRecordRow line = cudatest::Line(ours, entry, cudatest::kId5090);
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.otherSettings[ours] = 2;              // the user's own two settings, in the SAME entry
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Written);      // it IS a successful restore
+        CHECK(r.settingCleared);
+        CHECK(!r.profileDeleted);
+        CHECK_EQ(f.deletes, 0);                            // 🔴 the delete was never even asked for
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);       // the entry is still there
+        CHECK_EQ(f.byExe.count(cd::ToLower(exe)), (size_t)1);   // with its application still in it
+        CHECK_EQ(f.otherSettings[ours], (size_t)2);        // and the user's settings untouched
+        CHECK_EQ(f.settings.count(ours), (size_t)0);       // only ours went
+        // ONE && CHAIN, NOT TWO CHECKS: the second half indexes the vector the first half sizes, and a
+        // mutant that empties it must make this go RED rather than read past the end.
+        CHECK(f.written.size() == 1 && f.written[0] == ours + L"=CLEAR");
+        CHECK_EQ(f.saves, 1);                              // and it was saved and read back
+    }
+
+    Case("AK21b an entry holding NOTHING but ours still goes whole, exactly as it did before");
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK(r.profileDeleted);
+        CHECK(!r.settingCleared);
+        CHECK_EQ(f.deletes, 1);
+        CHECK(f.profiles.empty());
+    }
+
+    Case("AK21c 🔴 THE HEADER'S OWN BRANCH IS WHAT SAVES THEM, not the driver wrapper's guard");
+    {
+        // A deleteProfile that deletes whatever it is handed - what DeleteOwnProfile would be without its
+        // numOfSettings guard. The decision in gpu_cuda.h must be the one that keeps the entry.
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.otherSettings[ours] = 1;
+        int asked = 0;
+        cd::CudaOps eager = cudatest::OpsOf(f);
+        eager.deleteProfile = [&asked, &f](const std::wstring& name, const std::wstring&) {
+            ++asked;
+            f.profiles.erase(name);
+            f.settings.erase(name);
+            f.otherSettings.erase(name);
+            return true;
+        };
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, eager);
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK(r.settingCleared);
+        CHECK_EQ(asked, 0);                                // 🔴 it was never asked
+        CHECK_EQ(f.otherSettings[ours], (size_t)1);        // so the user's setting is still there
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);
+    }
+
+    Case("AK21d every way the clear can fail is said, and none of them reports a restore");
+    {
+        cudatest::Fake f;                                  // the driver refuses the clear
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.otherSettings[ours] = 1;
+        f.writeFails = true;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::SettingNotRemoved);
+        CHECK(!r.settingCleared);
+        CHECK_EQ(f.settings[ours], std::wstring(cudatest::kId5090));
+        CHECK_EQ(f.saves, 0);
+    }
+    {
+        cudatest::Fake f;                                  // the clear lands in the session, the save refuses
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.otherSettings[ours] = 1;
+        f.saveFails = true;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotSaved);
+        CHECK(r.sessionDirty);                             // so no later row of this run may save
+        CHECK(f.saved.empty());
+    }
+    {
+        cudatest::Fake f;                                  // the driver says yes and the setting is still there
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.otherSettings[ours] = 1;
+        f.writeIgnored = true;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotConfirmed);
+        CHECK(!r.settingCleared);
+    }
+
+    Case("AK21e the result says WHICH of the two restores happened");
+    {
+        cd::CudaResultText t;
+        t.changed = 2;
+        t.keptEntry = 1;
+        const std::wstring s = cd::FormatCudaRemoveLines(t);
+        CHECK(s.find(L"put back for 2 of them.") != std::wstring::npos);
+        CHECK(s.find(L"only Game Optimizer's own CUDA setting was taken out of it and the entry itself was "
+                     L"left standing.") != std::wstring::npos);
+        cd::CudaResultText plain;
+        plain.changed = 2;
+        CHECK(cd::FormatCudaRemoveLines(plain).find(L"left standing") == std::wstring::npos);
+        cd::CudaResultText many;
+        many.changed = 3;
+        many.keptEntry = 2;
+        CHECK(cd::FormatCudaRemoveLines(many).find(L"those entries were left standing.") != std::wstring::npos);
+    }
+}
+
+// 🔴 R5-2, THE ROUND-4 HIGH (adversarial review, round 4). The adopt path took "a profile of that name exists" straight to
+// CreateApplication with no GetProfileInfo at all, and then reported otherApps = 0 as a constant.
+void Test_AK22_TheAdoptPathPassesTheOwnershipCheck() {
+    Case("AK22 R5-2: the one shape that may be adopted, and the four that may not");
+    {
+        cd::CudaProfile empty;                       // the leftover of a half-finished earlier run
+        CHECK(cd::CudaAdoptRefusal(empty, true) == cd::CudaRefusal::None);
+        // 🔴 and not without a line of ours naming it, however it is spelled
+        CHECK(cd::CudaAdoptRefusal(empty, false) == cd::CudaRefusal::ProfileNameTaken);
+    }
+    {
+        cd::CudaProfile joined;
+        joined.otherApps = 1;                        // another program has joined it since
+        CHECK(cd::CudaAdoptRefusal(joined, true) == cd::CudaRefusal::NvidiaManagesIt);
+    }
+    {
+        cd::CudaProfile theirs;
+        theirs.isPredefined = true;
+        CHECK(cd::CudaAdoptRefusal(theirs, true) == cd::CudaRefusal::NvidiaManagesIt);
+    }
+    {
+        cd::CudaProfile unknown;                     // a membership the driver would not finish listing
+        unknown.appsComplete = false;
+        unknown.otherApps = 3;
+        CHECK(cd::CudaAdoptRefusal(unknown, true) == cd::CudaRefusal::MembershipUnknown);
+    }
+
+    Case("AK22b 🔴 an entry of our name that ANOTHER PROGRAM has joined is refused, named and counted");
+    {
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        const std::wstring ours = cd::CudaProfileNameFor(exe);
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        // somebody else's program is in the entry that carries our name - and the lookup for OUR executable
+        // still answers Absent, which is exactly how the old code got here
+        cudatest::Own(f, L"C:\\Other\\other.exe", ours, L"c:/other/other.exe");
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, cd::CudaAppKeyFor(exe), cudatest::kId5090));
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NvidiaManagesIt);
+        CHECK_EQ(r.profileName, ours);
+        CHECK_EQ(r.otherApps, (size_t)1);            // 🔴 MEASURED, not the constant zero
+        CHECK_EQ(f.creates, 0);                      // and CreateApplication was never reached
+        CHECK(f.written.empty());
+        CHECK_EQ(f.saves, 0);
+        CHECK(rec.record.rows.size() == 1);
+        CHECK(cd::CudaRowRefusalText(r).find(L"1 other program as well") != std::wstring::npos);
+    }
+
+    Case("AK22c an entry of our name NVIDIA calls its own is refused too");
+    {
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        const std::wstring ours = cd::CudaProfileNameFor(exe);
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        cudatest::Own(f, L"C:\\Other\\other.exe", ours, L"c:/other/other.exe", true);
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, cd::CudaAppKeyFor(exe), cudatest::kId5090));
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::NvidiaManagesIt);
+        CHECK_EQ(f.creates, 0);
+    }
+
+    Case("AK22d a by-name membership nobody could list refuses, and claims no count");
+    {
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        const std::wstring ours = cd::CudaProfileNameFor(exe);
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        f.nameAppsIncomplete = true;
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, cd::CudaAppKeyFor(exe), cudatest::kId5090));
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::MembershipUnknown);
+        CHECK_EQ(r.otherApps, (size_t)0);
+        CHECK_EQ(f.creates, 0);
+        CHECK(cd::CudaRowRefusalText(r).find(ours) != std::wstring::npos);   // R5-7: and it is named
+    }
+
+    Case("AK22e a by-name lookup the driver would not answer makes nothing and adopts nothing");
+    {
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.nameLookupFails = true;
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotLookUp);
+        CHECK_EQ(f.creates, 0);
+        CHECK(f.profiles.empty());
+        CHECK(rec.record.rows.empty());
+    }
+    {
+        // and no such op at all is a failed lookup, never "there is no entry of that name"
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cd::CudaOps bare = cudatest::OpsOf(f);
+        bare.findProfileByName = nullptr;
+        cudatest::Rec rec;
+        const cd::CudaRowResult r = cd::WriteCudaForRow(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids),
+                                                        bare, rec.record, cudatest::InputsOf(rec));
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotLookUp);
+        CHECK_EQ(f.creates, 0);
+    }
+}
+
+// 🔴 R5-4: A CLEAN-UP THAT FAILED IS UNRESOLVED. The profile this row created is still in the open session
+// and NvAPI_DRS_SaveSettings commits the WHOLE session, so a later row's save would commit it.
+void Test_AK23_ACleanupThatFailedStopsTheRun() {
+    Case("AK23 R5-4: a rollback whose profile delete fails is unresolved, dirty, and stops the run");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.saveFails = true;      // the row's save refuses, so the row rolls back
+        f.deleteFails = true;    // and the profile it made will not go
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotUndone);
+        CHECK(!r.undone);
+        CHECK(r.unresolved);         // 🔴 which is what stops the whole run (E5's own gate)
+        CHECK(r.sessionDirty);       // 🔴 and what stops any later row from saving
+        CHECK_EQ(f.profiles.count(cd::CudaProfileNameFor(exe)), (size_t)1);   // it really is still there
+    }
+
+    Case("AK23b the same when the application would not go into the profile this row just made (E7)");
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.createAnswer = cd::CudaCreate::AlreadyInUse;
+        f.deleteFails = true;
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::ProfileNotRemoved);
+        CHECK(r.unresolved);
+        CHECK(r.sessionDirty);
+        CHECK(!r.profileDeleted);
+        CHECK_EQ(f.saves, 0);
+    }
+
+    Case("AK23c and the same when the setting would not be written at all");
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.writeFails = true;
+        f.deleteFails = true;
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::ProfileNotRemoved);
+        CHECK(r.unresolved);
+        CHECK(r.sessionDirty);
+    }
+
+    Case("AK23d a clean-up that WORKS is none of those, and the run carries on");
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.createAnswer = cd::CudaCreate::AlreadyInUse;
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::NameAlreadyInUse);
+        CHECK(r.profileDeleted);
+        CHECK(!r.unresolved);
+        CHECK(!r.sessionDirty);
+        CHECK(f.profiles.empty());
+    }
+}
+
+// The sentences round 5 made specific, and the two guards that keep the record and the driver honest.
+void Test_AK24_TheSentencesThatMustNameSomething() {
+    Case("AK24 🔴 R5-7: -167 names the entry that holds the file name, or says it could not be named");
+    {
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.createAnswer = cd::CudaCreate::AlreadyInUse;
+        // the driver keeps that BASE NAME - not the full path - under somebody else's entry, which is
+        // exactly what -167 means [M]
+        cudatest::Own(f, L"chat.exe", L"Some Other Game", L"chat.exe", false, 2);
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::NameAlreadyInUse);
+        CHECK_EQ(r.profileName, std::wstring(L"Some Other Game"));
+        const std::wstring says = cd::CudaRowRefusalText(r);
+        CHECK(says.find(L"\"Some Other Game\"") != std::wstring::npos);
+        CHECK(says.find(L"NVIDIA Control Panel") != std::wstring::npos);
+        CHECK(says != cd::CudaRefusalReason(cd::CudaRefusal::NameAlreadyInUse));
+    }
+    {
+        // and when it cannot be found, the sentence says THAT - it does not pretend there is no entry
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.createAnswer = cd::CudaCreate::AlreadyInUse;
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::NameAlreadyInUse);
+        CHECK(r.profileName.empty());
+        CHECK_EQ(cd::CudaRowRefusalText(r), cd::CudaRefusalReason(cd::CudaRefusal::NameAlreadyInUse));
+        CHECK(cd::CudaRowRefusalText(r).find(L"could not be named") != std::wstring::npos);
+    }
+    CHECK_EQ(cd::FormatCudaNameInUseLine(std::wstring(), 0),
+             cd::CudaRefusalReason(cd::CudaRefusal::NameAlreadyInUse));
+    CHECK_EQ(cd::FormatCudaNameInUseLine(std::wstring(), 3),
+             cd::CudaRefusalReason(cd::CudaRefusal::NameAlreadyInUse));   // no name, so no count either
+    CHECK(cd::FormatCudaMembershipUnknownLine(std::wstring()) ==
+          cd::CudaRefusalReason(cd::CudaRefusal::MembershipUnknown));
+    CHECK(cd::FormatCudaMembershipUnknownLine(L"Microsoft Edge Beta").find(L"\"Microsoft Edge Beta\"") !=
+          std::wstring::npos);
+
+    Case("AK24b 🔴 R5-6: the unreadable-note reason names the folder AND the legacy file pattern");
+    {
+        const std::wstring s = cd::CudaWholeRunReason(cd::CudaRefusal::RecordUnreadable, L"C:\\d\\cfg");
+        CHECK(s.find(cd::CudaRefusalReason(cd::CudaRefusal::RecordUnreadable)) == 0);
+        CHECK(s.find(L"C:\\d\\cfg") != std::wstring::npos);
+        CHECK(s.find(L"gpu-cuda-before-*.txt") != std::wstring::npos);
+        CHECK(s.find(cd::CudaRecordFileName()) != std::wstring::npos);
+        // 🔴 pre-publish review: the record is the only note of what to undo, so the sentence tells the user to
+        // KEEP it and names only the gpu-cuda-before-*.txt files as the ones to move - never "those two"
+        CHECK(s.find(L"move any gpu-cuda-before-*.txt file out") != std::wstring::npos);
+        CHECK(s.find(L"keep " + cd::CudaRecordFileName() + L" where it is") != std::wstring::npos);
+        CHECK(s.find(L"those two") == std::wstring::npos);
+        CHECK(s.find(L"earlier version") == std::wstring::npos);
+        // every other refusal keeps its fixed sentence, folder or no folder
+        CHECK_EQ(cd::CudaWholeRunReason(cd::CudaRefusal::NoNvidiaDriver, L"C:\\d\\cfg"),
+                 cd::CudaRefusalReason(cd::CudaRefusal::NoNvidiaDriver));
+        CHECK_EQ(cd::CudaWholeRunReason(cd::CudaRefusal::RecordUnreadable, std::wstring()),
+                 cd::CudaRefusalReason(cd::CudaRefusal::RecordUnreadable));
+        // and it reaches the question Remove asks BEFORE Yes (E4)
+        const std::wstring asked = cd::FormatCudaRestoreConfirmLine(2, false, s);
+        CHECK(asked.find(L"Nothing is removed at all") == 0);
+        CHECK(asked.find(L"gpu-cuda-before-*.txt") != std::wstring::npos);
+    }
+
+    Case("AK24c 🔴 R5-5: an entry of our name that no note claims is SAID, and nothing is done about it");
+    {
+        const std::wstring s = cd::FormatCudaOrphanEntryLine(L"Game Optimizer - C:\\Apps\\chat\\chat.exe");
+        CHECK(s.find(L"\"Game Optimizer - C:\\Apps\\chat\\chat.exe\"") != std::wstring::npos);
+        CHECK(s.find(L"has no note of making") != std::wstring::npos);
+        CHECK(s.find(L"the GPU assignment was removed anyway") != std::wstring::npos);
+        CHECK(s.find(L"NVIDIA Control Panel") != std::wstring::npos);
+        cd::CudaResultText t;
+        t.anyOrphan = true;
+        t.orphanLines = L"\r\n    chat.exe - " + s;
+        const std::wstring said = cd::FormatCudaRemoveLines(t);
+        CHECK(said.find(L"Nothing was done to those entries:") != std::wstring::npos);
+        CHECK(said.find(L"chat.exe") != std::wstring::npos);
+        // 🔴 and it is NOT the "never had their CUDA GPU changed here" sentence, which claims the opposite
+        CHECK(said.find(L"never had their CUDA GPU changed here") == std::wstring::npos);
+        CHECK(cd::FormatCudaRemoveLines(cd::CudaResultText()).empty());
+    }
+}
+
+// ===========================================================================
+// ROUND 6. The one idea: a COUNT is not an IDENTITY, and round 4 already proved it for APPLICATIONS.
+// Round 5 made the same mistake one level down for SETTINGS, and a third time for CAPABILITY - a rule
+// written where the tests reach, against a seam the .cpp always filled.
+// ===========================================================================
+
+// 🔴 R6-1. The delete decision is taken on WHICH settings an entry holds, never on how many.
+void Test_AK26_SettingsAreIdentifiedNotCounted() {
+    Case("AK26 🔴 R6-1: JudgeCudaSettings rules on the ids, and ZERO is not a safe answer");
+    {
+        std::vector<unsigned long> ids;
+        // an EMPTY enumeration while the read just returned our value: the value is inherited
+        CHECK(cd::JudgeCudaSettings(ids) == cd::CudaSettingsVerdict::NotOurs);
+        ids.push_back(cd::CudaSettingId());
+        CHECK(cd::JudgeCudaSettings(ids) == cd::CudaSettingsVerdict::OnlyOurs);
+        ids.push_back(0x20D0F3E6ul);
+        CHECK(cd::JudgeCudaSettings(ids) == cd::CudaSettingsVerdict::AlsoOthers);
+        // 🔴 ONE SETTING, AND IT IS NOT OURS - the exact shape `numSettings == 1` read as "it is mine"
+        std::vector<unsigned long> theirs;
+        theirs.push_back(0x20D0F3E6ul);
+        CHECK(cd::JudgeCudaSettings(theirs) == cd::CudaSettingsVerdict::NotOurs);
+        // and the id itself is the one NVIDIA documents
+        CHECK_EQ((unsigned int)cd::CudaSettingId(), 0x10354FF8u);
+    }
+
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    const std::wstring entry = cd::CudaAppKeyFor(exe);
+    const cd::CudaRecordRow line = cudatest::Line(ours, entry, cudatest::kId5090);
+
+    Case("AK26b 🔴 ONE setting that is NOT ours: the entry is never deleted, whatever the read answered");
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;   // what NvAPI_DRS_GetSetting answers
+        f.inherited.insert(ours);               // ... from NVIDIA's general settings, not this entry
+        f.otherSettings[ours] = 1;              // the ONE setting it really holds is the user's
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::SettingNotOurs);
+        CHECK(!r.profileDeleted);
+        CHECK(!r.settingCleared);
+        CHECK_EQ(f.deletes, 0);                          // 🔴 never even asked
+        CHECK(f.written.empty());                        // and no clear either: there is nothing to clear
+        CHECK_EQ(f.saves, 0);
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);
+        CHECK_EQ(f.otherSettings[ours], (size_t)1);
+        CHECK(!r.sessionDirty);
+    }
+
+    Case("AK26c ZERO of its own settings while the read returns our value is the same contradiction");
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.inherited.insert(ours);               // and nothing else on it at all
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.refusal == cd::CudaRefusal::SettingNotOurs);
+        CHECK_EQ(f.deletes, 0);
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);
+        CHECK(!cd::CudaRefusalReason(cd::CudaRefusal::SettingNotOurs).empty());
+    }
+
+    Case("AK26d an enumeration the driver REFUSED is never read as 'it holds none'");
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.settingsListFails = true;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::SettingsUnknown);
+        CHECK_EQ(f.deletes, 0);
+        CHECK(f.written.empty());
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);
+        CHECK(!cd::CudaRefusalReason(cd::CudaRefusal::SettingsUnknown).empty());
+    }
+
+    Case("AK26e 🔴 R6-2: and a driver that does not OFFER the enumeration answers the same way");
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.noEnumSettings = true;
+        const cd::CudaOps ops = cudatest::OpsOf(f);
+        CHECK(!ops.listSettingIds);            // 🔴 the operation is EMPTY, not a lambda that cannot work
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, ops);
+        CHECK(r.refusal == cd::CudaRefusal::SettingsUnknown);
+        CHECK_EQ(f.deletes, 0);
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);
+    }
+
+    Case("AK26f the two answers that DO act still act, and the driver guard agrees with the decision");
+    {
+        cudatest::Fake f;                                  // exactly ours: the entry goes whole
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK(r.profileDeleted);
+        CHECK(f.profiles.empty());
+    }
+    {
+        cudatest::Fake f;                                  // ours AND the user's: only ours comes out
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.otherSettings[ours] = 2;
+        const cd::CudaRowResult r = cd::RestoreCudaForRow(exe, line, cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK(r.settingCleared);
+        CHECK(!r.profileDeleted);
+        CHECK_EQ(f.deletes, 0);
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);
+    }
+    {
+        // 🔴 AND THE DRIVER WRAPPER REFUSES IT TOO, so a caller that asked anyway would still be told no.
+        // This is the guard in gpu_cuda.cpp's DeleteOwnProfile, mirrored by the fake above.
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.settings[ours] = cudatest::kId5090;
+        f.otherSettings[ours] = 1;
+        const cd::CudaOps ops = cudatest::OpsOf(f);
+        CHECK(!cd::DropCudaProfileWeMade(ours, entry, ops));
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);
+        CHECK_EQ(f.otherSettings[ours], (size_t)1);
+    }
+}
+
+// 🔴 R6-2. The capability gate, which is the round-4 defect shape one more time: a rule written where the
+// tests reach, against a seam MakeCudaOps always filled.
+void Test_AK27_CapabilityIsHonestAtTheSeam() {
+    Case("AK27 🔴 R6-2: taking an entry away needs BOTH calls, and one without the other is no capability");
+    {
+        cd::CudaDriverCalls c;
+        CHECK(!cd::CudaCanDeleteProfile(c));
+        c.deleteProfile = true;
+        CHECK(!cd::CudaCanDeleteProfile(c));       // DeleteApplicationEx is still missing
+        c.deleteProfile = false;
+        c.deleteApplication = true;
+        CHECK(!cd::CudaCanDeleteProfile(c));       // and DeleteProfile is
+        c.deleteProfile = true;
+        CHECK(cd::CudaCanDeleteProfile(c));
+        CHECK(!cd::CudaCanListSettings(c));
+        c.enumSettings = true;
+        CHECK(cd::CudaCanListSettings(c));
+    }
+
+    Case("AK27b 🔴 the gate EMPTIES the operation, which is what MakeCudaOps used to fail to do");
+    {
+        // An ops with everything installed, exactly as MakeCudaOps writes it before the gate runs.
+        cd::CudaOps ops;
+        ops.deleteProfile = [](const std::wstring&, const std::wstring&) { return true; };
+        ops.listSettingIds = [](const std::wstring&, std::vector<unsigned long>&) { return true; };
+        cd::CudaDriverCalls none;
+        cd::ApplyCudaDriverCalls(ops, none);
+        CHECK(!ops.deleteProfile);                 // 🔴 the null PlanCudaForRow refuses NoWayToUndo on
+        CHECK(!ops.listSettingIds);                // 🔴 and the null RestoreCudaForRow refuses on
+    }
+    {
+        cd::CudaOps ops;
+        ops.deleteProfile = [](const std::wstring&, const std::wstring&) { return true; };
+        ops.listSettingIds = [](const std::wstring&, std::vector<unsigned long>&) { return true; };
+        cd::CudaDriverCalls all;
+        all.deleteProfile = true;
+        all.deleteApplication = true;
+        all.enumSettings = true;
+        cd::ApplyCudaDriverCalls(ops, all);
+        CHECK(!!ops.deleteProfile);                // a driver that has them keeps them
+        CHECK(!!ops.listSettingIds);
+    }
+    {
+        // half a delete capability is no delete capability, and the gate is what says so
+        cd::CudaOps ops;
+        ops.deleteProfile = [](const std::wstring&, const std::wstring&) { return true; };
+        cd::CudaDriverCalls half;
+        half.deleteProfile = true;                 // DeleteApplicationEx did not resolve
+        cd::ApplyCudaDriverCalls(ops, half);
+        CHECK(!ops.deleteProfile);
+    }
+
+    Case("AK27c and the refusal the gate makes REACHABLE: no delete calls means no entry is ever made");
+    {
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.noDelete = true;
+        const cd::CudaOps ops = cudatest::OpsOf(f);
+        CHECK(!ops.deleteProfile);                 // 🔴 the gate ran, not an `if` of the test's own
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), ops, rec);
+        CHECK(r.refusal == cd::CudaRefusal::NoWayToUndo);
+        CHECK_EQ(f.creates, 0);
+        CHECK(f.profiles.empty());
+    }
+
+    Case("AK27d 🔴 pre-publish review: no settings enumeration means no entry is ever made either");
+    {
+        // Remove refuses an entry whose settings it cannot list (AK26e), so Apply must not make one it could
+        // never take back. Refused in the PLAN, exactly where the missing delete calls are refused.
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.noEnumSettings = true;
+        const cd::CudaOps ops = cudatest::OpsOf(f);
+        CHECK(!ops.listSettingIds);                // 🔴 the gate ran, not an `if` of the test's own
+        CHECK(!!ops.deleteProfile);                // and the delete calls ARE there: this is the other refusal
+        const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids);
+        cudatest::Rec rec;
+        const cd::CudaRowPlan p = cd::PlanCudaForRow(exe, target, ops, rec.record);
+        CHECK(!p.act);
+        CHECK(p.refusal == cd::CudaRefusal::NoWayToListSettings);
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, ops, rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NoWayToListSettings);
+        CHECK_EQ(f.creates, 0);
+        CHECK(f.profiles.empty());
+        CHECK(f.written.empty());
+        CHECK_EQ(f.saves, 0);
+        CHECK(rec.record.rows.empty());
+        const std::wstring said = cd::CudaRefusalReason(cd::CudaRefusal::NoWayToListSettings);
+        CHECK(said.find(L"list which settings") != std::wstring::npos);
+        CHECK(said != cd::CudaRefusalReason(cd::CudaRefusal::NoWayToUndo));   // it names ITS call, not the other
+    }
+
+    Case("AK27e 🔴 and an entry of ours that ALREADY EXISTS is refused too: Remove could not undo that write either");
+    {
+        // Unlike NoWayToUndo (AK25b's second case), where an existing entry's setting can still be cleared.
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        const std::wstring ours = cd::CudaProfileNameFor(exe);
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.noEnumSettings = true;
+        cudatest::Own(f, exe, ours, cd::CudaAppKeyFor(exe));
+        f.settings[ours] = cudatest::kId4090;
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, cd::CudaAppKeyFor(exe), cudatest::kId4090));
+        const cd::CudaOps ops = cudatest::OpsOf(f);
+        CHECK(!ops.listSettingIds);
+        CHECK(!!ops.deleteProfile);
+        const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids);
+        const cd::CudaRowPlan p = cd::PlanCudaForRow(exe, target, ops, rec.record);
+        CHECK(!p.act);
+        CHECK(p.refusal == cd::CudaRefusal::NoWayToListSettings);
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, ops, rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NoWayToListSettings);
+        CHECK(f.written.empty());
+        CHECK_EQ(f.saves, 0);
+        CHECK_EQ(f.settings[ours], std::wstring(cudatest::kId4090));
+        CHECK(rec.record.rows.size() == 1 && rec.record.rows[0].lastWrote == cudatest::kId4090);
+    }
+}
+
+// 🔴 R6-5. The save that follows a successful delete inside a rollback used to be thrown away.
+void Test_AK28_TheRollbacksOwnSaveIsChecked() {
+    Case("AK28 🔴 R6-5: a rollback whose save refuses is NOT an undo, and it stops the run");
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        // The row's own write and save land, the READ-BACK disagrees, so the row rolls back - and that
+        // rollback has to reach the database too, which is the `onDisk` path R6-5 lives on.
+        f.writeIgnored = true;      // the driver says yes and the value is not there
+        // 🔴 THE THIRD SAVE IS THE ONE R6-5 IS ABOUT. The row's own save is the first; the rollback's
+        // save of the cleared setting is the second, and both of those were already checked. The third is
+        // the save that commits the DELETE of the profile this row made, and its answer was thrown away.
+        f.failSaveNumber = 3;
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotUndone);   // 🔴 not NotConfirmed: the undo did not finish
+        CHECK(!r.undone);
+        CHECK(r.unresolved);        // 🔴 which is what stops the whole run
+        CHECK(r.sessionDirty);      // 🔴 and what stops any later row from committing it
+    }
+
+    Case("AK28b and when that save WORKS the undo is an undo, and the run carries on");
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.writeIgnored = true;
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::NotConfirmed);
+        CHECK(r.undone);
+        CHECK(!r.unresolved);
+        CHECK(!r.sessionDirty);
+        CHECK(f.profiles.empty());
+    }
+}
+
+// 🔴 R6-6. Completeness is unique entries, never raw rows.
+void Test_AK29_MembershipIsJudgedOnUniqueEntries() {
+    Case("AK29 🔴 R6-6: a duplicated row can NEVER satisfy 'we saw them all'");
+    {
+        std::vector<std::wstring> listed;
+        listed.push_back(L"c:/a/one.exe");
+        listed.push_back(L"c:/a/one.exe");           // the driver handed one entry back twice
+        const cd::CudaMembership m = cd::JudgeCudaMembership(listed, 2, std::wstring());
+        CHECK(!m.complete);                          // 🔴 the second member was never listed at all
+        CHECK_EQ(m.otherApps, (size_t)1);
+    }
+    {
+        // and without case, exactly as every other entry comparison in this feature
+        std::vector<std::wstring> listed;
+        listed.push_back(L"c:/a/one.exe");
+        listed.push_back(L"C:/A/ONE.EXE");
+        CHECK(!cd::JudgeCudaMembership(listed, 2, std::wstring()).complete);
+    }
+
+    Case("AK29b an EMPTY application name is 'cannot judge', never a row to step over");
+    {
+        std::vector<std::wstring> listed;
+        listed.push_back(L"c:/a/one.exe");
+        listed.push_back(std::wstring());
+        const cd::CudaMembership m = cd::JudgeCudaMembership(listed, 2, std::wstring());
+        CHECK(!m.complete);
+        CHECK_EQ(m.otherApps, (size_t)1);            // and it names nobody it did not see
+    }
+
+    Case("AK29c the ordinary answers still answer, so this refuses nothing it should not");
+    {
+        std::vector<std::wstring> one;
+        one.push_back(L"c:/a/one.exe");
+        const cd::CudaMembership ours = cd::JudgeCudaMembership(one, 1, L"c:/a/one.exe");
+        CHECK(ours.complete);
+        CHECK_EQ(ours.otherApps, (size_t)0);         // the one entry on it is the one we asked about
+        const cd::CudaMembership theirs = cd::JudgeCudaMembership(one, 1, L"c:/a/two.exe");
+        CHECK(theirs.complete);
+        CHECK_EQ(theirs.otherApps, (size_t)1);
+        // 🔴 AN EMPTY PROFILE IS COMPLETE, and it has to be: the clean-up after a half-finished create
+        // (E7) hands the delete guard exactly that.
+        const cd::CudaMembership empty = cd::JudgeCudaMembership(std::vector<std::wstring>(), 0, L"c:/a/x.exe");
+        CHECK(empty.complete);
+        CHECK_EQ(empty.otherApps, (size_t)0);
+    }
+
+    Case("AK29d fewer unique entries than the driver's own count is INCOMPLETE");
+    {
+        std::vector<std::wstring> listed;
+        listed.push_back(L"c:/a/one.exe");
+        CHECK(!cd::JudgeCudaMembership(listed, 2, std::wstring()).complete);   // it said there were two
+        // and a page exactly as long as the count is complete - the arithmetic, not the loop's exit
+        std::vector<std::wstring> eight;
+        for (int i = 0; i < 8; ++i) eight.push_back(L"c:/a/" + std::to_wstring(i) + L".exe");
+        CHECK(cd::JudgeCudaMembership(eight, 8, std::wstring()).complete);
+        CHECK_EQ(cd::JudgeCudaMembership(eight, 8, std::wstring()).otherApps, (size_t)8);
+    }
+}
+
+// 🔴 R6-7. The clear-only restore keeps its line, so the entry is not stranded.
+void Test_AK30_TheClearOnlyRestoreKeepsItsLine() {
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    const std::wstring entry = cd::CudaAppKeyFor(exe);
+
+    Case("AK30 🔴 R6-7: a line saying 'the entry is ours and holds nothing of ours' is a good line");
+    {
+        cd::CudaRecordRow r = cudatest::Line(ours, entry, cd::CudaNothingWritten());
+        CHECK(cd::CudaRowHoldsNothingOfOurs(r));
+        CHECK(cd::CudaRecordRowIsUsable(r));         // it is never handed to the driver, so it need not be legal
+        CHECK(!cd::CudaValueIsLegal(cd::CudaNothingWritten()));   // 🔴 and it never can be
+        CHECK(cd::CudaRecordRowIsWritable(r));       // it survives one line of a tab-separated record
+        // and it round-trips through the file, so a later run reads it back
+        std::vector<cd::CudaRecordRow> rows;
+        rows.push_back(r);
+        std::vector<cd::CudaRecordRow> back;
+        CHECK(cd::ParseCudaRecordFile(cd::FormatCudaRecordFile(rows), back));
+        CHECK(back.size() == 1 && cd::CudaRowHoldsNothingOfOurs(back[0]));
+        // a line carrying a real value is not one of these
+        CHECK(!cd::CudaRowHoldsNothingOfOurs(cudatest::Line(ours, entry, cudatest::kId5090)));
+    }
+
+    Case("AK30b Remove meets one: nothing taken away, nothing failed, and the LINE IS KEPT");
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, ours, entry);
+        f.otherSettings[ours] = 1;                   // the user's own setting is why it is still standing
+        const cd::CudaRowResult r =
+            cd::RestoreCudaForRow(exe, cudatest::Line(ours, entry, cd::CudaNothingWritten()), cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::NothingOfOurs);
+        CHECK(r.refusal == cd::CudaRefusal::None);   // 🔴 it is not a failure and must never read as one
+        CHECK(!r.profileDeleted);
+        CHECK(!r.settingCleared);
+        CHECK(!r.sessionDirty);
+        CHECK_EQ(f.deletes, 0);
+        CHECK(f.written.empty());
+        CHECK_EQ(f.saves, 0);
+        CHECK_EQ(f.profiles.count(ours), (size_t)1);
+    }
+
+    Case("AK30c but an entry that has GONE still drops its line, and one that changed is still refused");
+    {
+        cudatest::Fake f;                            // nothing in the driver at all
+        const cd::CudaRowResult r =
+            cd::RestoreCudaForRow(exe, cudatest::Line(ours, entry, cd::CudaNothingWritten()), cudatest::OpsOf(f));
+        CHECK(r.outcome == cd::CudaOutcome::Absent); // the line is spent by the caller, as it always was
+    }
+    {
+        cudatest::Fake f;
+        cudatest::Own(f, exe, L"Google Chrome", L"chat.exe", true, 0);
+        const cd::CudaRowResult r =
+            cd::RestoreCudaForRow(exe, cudatest::Line(ours, entry, cd::CudaNothingWritten()), cudatest::OpsOf(f));
+        CHECK(r.refusal == cd::CudaRefusal::RecordedProfileChanged);
+    }
+
+    Case("AK30d 🔴 AND A LATER APPLY OWNS THAT ENTRY AGAIN - which is the whole reason the line is kept");
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::Own(f, exe, ours, entry);
+        f.otherSettings[ours] = 1;
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, entry, cd::CudaNothingWritten()));
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK_EQ(f.settings[ours], std::wstring(cudatest::kId5090));
+        CHECK_EQ(f.creates, 0);                      // nothing was made: the entry was already there
+        CHECK(rec.record.rows.size() == 1 && rec.record.rows[0].lastWrote == cudatest::kId5090);
+    }
+
+    Case("AK30e the sentence for it is true, and is not the 'we never touched this' one");
+    {
+        cd::CudaResultText t;
+        t.nothingOfOurs = 1;
+        const std::wstring one = cd::FormatCudaRemoveLines(t);
+        CHECK(one.find(L"already had nothing of Game Optimizer's in its NVIDIA settings entry") !=
+              std::wstring::npos);
+        CHECK(one.find(L"never had their CUDA GPU changed here") == std::wstring::npos);
+        CHECK(one.find(L"was not put back for") == std::wstring::npos);
+        cd::CudaResultText many;
+        many.nothingOfOurs = 3;
+        CHECK(cd::FormatCudaRemoveLines(many).find(L"those entries were left alone.") != std::wstring::npos);
+        // and it is silent when there are none
+        cd::CudaResultText plain;
+        plain.changed = 1;
+        CHECK(cd::FormatCudaRemoveLines(plain).find(L"already had nothing of Game Optimizer's") ==
+              std::wstring::npos);
+    }
+
+    Case("AK30f 🔴 R6-10: the record file's own header describes BOTH restores, not just the deletion");
+    {
+        const std::wstring head = cd::FormatCudaRecordHeader();
+        CHECK(head.find(L"takes the whole\r\n; entry away") == std::wstring::npos);   // the old, half-true line
+        CHECK(head.find(L"ONE OF TWO WAYS") != std::wstring::npos);
+        CHECK(head.find(L"only Game Optimizer's own CUDA setting is") != std::wstring::npos);
+        CHECK(head.find(L"\"-\" in place of") != std::wstring::npos);
+        CHECK(head.find(cd::CudaRecordFileName()) != std::wstring::npos);
+    }
+}
+
+// 🔴 R6-8, R6-9 and R6-11: the adopt path leaves nothing behind, and two sentences that were wrong.
+void Test_AK31_TheAdoptPathAndTwoWrongSentences() {
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    const std::wstring entry = cd::CudaAppKeyFor(exe);
+
+    Case("AK31 🔴 R6-8: a read this cannot use refuses the row with NOTHING added to the driver");
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);                // the empty entry an earlier run left behind
+        f.readFails = true;                          // and the driver will not say what is in it
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, entry, cudatest::kId4090));   // a line claims it
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotRead);
+        CHECK_EQ(r.profileName, ours);               // and it says WHICH entry
+        // 🔴 THE POINT: the application entry was never put in. It used to be added first and then
+        // abandoned, leaving NVIDIA resolving this executable to an entry nothing recorded.
+        CHECK_EQ(f.creates, 0);
+        CHECK_EQ(f.byExe.count(cd::ToLower(exe)), (size_t)0);
+        CHECK(f.written.empty());
+        CHECK_EQ(f.saves, 0);
+        CHECK_EQ(f.profiles.count(ours), (size_t)1); // the empty entry is left exactly as it was
+    }
+    {
+        // a value that is not one the driver could have written is the same answer
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        f.settings[ours] = L"autoselect";
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, entry, cudatest::kId4090));
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotRead);
+        CHECK_EQ(f.creates, 0);
+        CHECK_EQ(f.byExe.count(cd::ToLower(exe)), (size_t)0);
+    }
+    {
+        // and a read that CAN be used still carries the previous value into the row's own undo
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        f.settings[ours] = cudatest::kId4090;        // an earlier run of ours left this in it
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, entry, cudatest::kId4090));
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK(r.hadPrevious);
+        CHECK_EQ(r.previousValue, std::wstring(cudatest::kId4090));
+        CHECK_EQ(f.creates, 1);
+    }
+
+    Case("AK31b 🔴 R6-9: -167's sentence is GIVEN the count it measured, in three forms");
+    {
+        CHECK(cd::FormatCudaNameInUseLine(L"Some Other Game", 0).find(L"other program") == std::wstring::npos);
+        CHECK(cd::FormatCudaNameInUseLine(L"Some Other Game", 0).find(L"\"Some Other Game\"") !=
+              std::wstring::npos);
+        CHECK(cd::FormatCudaNameInUseLine(L"Some Other Game", 1).find(L"covers 1 other program as well") !=
+              std::wstring::npos);
+        CHECK(cd::FormatCudaNameInUseLine(L"Some Other Game", 4).find(L"covers 4 other programs as well") !=
+              std::wstring::npos);
+        // every form still sends the user somewhere they can act
+        CHECK(cd::FormatCudaNameInUseLine(L"X", 2).find(L"NVIDIA Control Panel") != std::wstring::npos);
+    }
+    {
+        // and the row really carries it through: the base-name lookup found two other programs
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.createAnswer = cd::CudaCreate::AlreadyInUse;
+        cudatest::Own(f, L"chat.exe", L"Some Other Game", L"chat.exe", false, 2);
+        cudatest::Rec rec;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::NameAlreadyInUse);
+        CHECK_EQ(r.otherApps, (size_t)2);
+        CHECK(cd::CudaRowRefusalText(r).find(L"covers 2 other programs as well") != std::wstring::npos);
+    }
+
+    Case("AK31c 🔴 R6-11: an adopt that loses its race is NOT 'we have no record of making it'");
+    {
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        f.adoptRaceLost = true;                      // a member arrived between the lookup and the create
+        f.adoptRaceOtherApps = 2;
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, entry, cudatest::kId4090));   // a line DOES claim it
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NvidiaManagesIt);
+        CHECK_EQ(r.otherApps, (size_t)2);
+        const std::wstring says = cd::CudaRowRefusalText(r);
+        CHECK(says.find(L"covers 2 other programs as well") != std::wstring::npos);
+        // 🔴 the false sentence is gone: a record line claims this entry, so this is not one we never made
+        CHECK(says.find(L"has no record of making") == std::wstring::npos);
+        CHECK(f.written.empty());
+    }
+    {
+        // and when that second guard is the thing that could not be measured, no count is claimed
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        f.adoptRaceLost = true;
+        f.adoptRaceIncomplete = true;
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, entry, cudatest::kId4090));
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::MembershipUnknown);
+        CHECK_EQ(r.otherApps, (size_t)0);
+    }
+    {
+        // 🔴 AND THE OTHER HALF STILL STANDS: with NO line of ours, the name really is taken by something
+        // this product has no record of making, and that sentence is the true one.
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        cudatest::Rec rec;                           // no line at all
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::ProfileNameTaken);
+        CHECK(cd::CudaRefusalReason(cd::CudaRefusal::ProfileNameTaken).find(L"no record of making") !=
+              std::wstring::npos);
+    }
+}
+
+void Test_AK25_TheRecordAndTheDriverGuards() {
+    Case("AK25 🔴 R5-8: two lines for one application make the record UNREADABLE, not 'the first wins'");
+    const std::wstring magic = cd::CudaRecordMagic() + L"\t" + cd::CudaRecordVersion() + L"\r\n";
+    std::vector<cd::CudaRecordRow> out;
+    CHECK(!cd::ParseCudaRecordFile(magic + L"P\tc:/a/chat.exe\tnone\tt\r\nQ\tc:/a/chat.exe\tnone\tu\r\n", out));
+    CHECK(out.empty());
+    // without case, exactly as CudaLineFor matches an entry
+    CHECK(!cd::ParseCudaRecordFile(magic + L"P\tc:/a/chat.exe\tnone\tt\r\nP\tC:/A/CHAT.EXE\tnone\tu\r\n", out));
+    CHECK(out.empty());
+    // and two lines for two DIFFERENT applications are an ordinary record
+    CHECK(cd::ParseCudaRecordFile(magic + L"P\tc:/a/chat.exe\tnone\tt\r\nQ\tc:/b/chat.exe\tnone\tu\r\n", out));
+    CHECK_EQ(out.size(), (size_t)2);
+
+    Case("AK25b 🔴 R5-9: a driver that cannot take a profile away again makes none in the first place");
+    {
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.noDelete = true;                  // NvAPI_DRS_DeleteProfile is not offered by this driver
+        const cd::CudaOps ops = cudatest::OpsOf(f);
+        const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids);
+        cudatest::Rec rec;
+        const cd::CudaRowPlan p = cd::PlanCudaForRow(exe, target, ops, rec.record);
+        CHECK(!p.act);                      // 🔴 refused in the PLAN, before anything can be created
+        CHECK(p.refusal == cd::CudaRefusal::NoWayToUndo);
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, ops, rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NoWayToUndo);
+        CHECK_EQ(f.creates, 0);
+        CHECK(f.profiles.empty());
+        CHECK(f.written.empty());
+        CHECK_EQ(f.saves, 0);
+        CHECK(rec.record.rows.empty());
+        CHECK(!cd::CudaRefusalReason(cd::CudaRefusal::NoWayToUndo).empty());
+    }
+    {
+        // but an entry of ours that ALREADY exists is only written to, never created, so it still works
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        const std::wstring ours = cd::CudaProfileNameFor(exe);
+        cudatest::Fake f;
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        f.noDelete = true;
+        cudatest::Own(f, exe, ours, cd::CudaAppKeyFor(exe));
+        cudatest::Rec rec;
+        rec.record.rows.push_back(cudatest::Line(ours, cd::CudaAppKeyFor(exe), cudatest::kId4090));
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+    }
+
+    Case("AK25c 🔴 R5-10: every profile-name comparison is without case");
+    {
+        CHECK(cd::IsCudaProfileWeMade(L"Game Optimizer - C:\\a\\b.exe"));
+        CHECK(cd::IsCudaProfileWeMade(L"GAME OPTIMIZER - C:\\A\\B.EXE"));
+        CHECK(cd::IsCudaProfileWeMade(L"game optimizer - c:/a/b.exe"));
+        CHECK(!cd::IsCudaProfileWeMade(L"Game Optimizer"));            // the stem alone is not one
+        CHECK(!cd::IsCudaProfileWeMade(L"Google Chrome"));
+        CHECK(!cd::IsCudaProfileWeMade(std::wstring()));
+        // and the ownership ruling agrees with a driver that answers in another case
+        const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+        cudatest::Fake f;
+        cudatest::Own(f, exe, L"GAME OPTIMIZER - C:\\APPS\\CHAT\\CHAT.EXE", cd::CudaAppKeyFor(exe));
+        const cd::CudaResolved res = cd::ResolveCudaProfile(exe, cudatest::OpsOf(f));
+        CHECK(cd::CudaOwnershipRefusal(res, exe, cd::CudaProfileNameFor(exe)) == cd::CudaRefusal::None);
+    }
+}
+
+// 🔴 R6-12: THE ADOPT LOOKUP ASKS FOR THE NAME THE RECORD STORES, BECAUSE THE DRIVER'S LOOKUP HAS CASE.
+//
+// [M] probe S23, against the real driver: NvAPI_DRS_FindProfileByName is CASE-SENSITIVE - the exact name
+// answers Found, and the same name in UPPER CASE or lower case answers Absent with an empty name back.
+// Every ownership comparison in this product is IEquals and STAYS that way (R5-10), so an executable path
+// Windows hands back in another case still reads as OURS - while a profile name RECOMPUTED from that path
+// misses the entry in the driver. The adopt path used to recompute it, so it made a SECOND entry differing
+// from the first only in case: an entry no record line claims, which CudaOwnershipRefusal then answers
+// "NVIDIA manages this one" to forever. That is the very trap R6-7 was built to close, arriving through
+// another door.
+//
+// `Fake::profiles` is a std::set<std::wstring> and `Fake::settings` a std::map keyed the same way, so both
+// lookups have case exactly as the driver's do - which is what makes this test passable only by asking for
+// the recorded spelling.
+void Test_AK32_TheAdoptLookupUsesTheRecordedName() {
+    Case("AK32 🔴 R6-12: a line claims the entry, so the lookup uses ITS spelling, not today's path's");
+    const std::wstring made = L"C:\\Apps\\chat\\chat.exe";    // how the entry was made, and how it is named
+    const std::wstring today = L"C:\\APPS\\CHAT\\CHAT.EXE";   // the same file, as Windows hands it back now
+    const std::wstring ours = cd::CudaProfileNameFor(made);
+    // The two halves of the defect: the line is still matched to this row - the application entry is the
+    // lower-case path either way - while the profile NAMES differ, by letter case alone.
+    CHECK_EQ(cd::CudaAppKeyFor(today), cd::CudaAppKeyFor(made));
+    CHECK_NE(cd::CudaProfileNameFor(today), ours);
+    cudatest::Fake n;
+    n.gpus = cudatest::TwoCards();
+    n.ids = cudatest::BothIds();
+    cudatest::LeftBehind(n, made);            // the entry stands, spelled as it was MADE, covering nobody
+    n.settings[ours] = cudatest::kId4090;     // and holding what an earlier run of ours left in it
+    cudatest::Rec rec;
+    rec.record.rows.push_back(cudatest::Line(ours, cd::CudaAppKeyFor(made), cudatest::kId4090));
+    const cd::CudaRowResult r =
+        cudatest::Apply(today, cd::CudaTargetFor(cudatest::kKey4090, n.gpus, n.ids), cudatest::OpsOf(n), rec);
+    CHECK(r.outcome == cd::CudaOutcome::Written);
+    CHECK_EQ(r.profileName, ours);                              // the RECORDED spelling, never today's
+    // 🔴 THE ENTRY THAT WAS ALREADY THERE IS THE ONE THAT WAS READ AND WRITTEN. A lookup by the recomputed
+    // name would have answered Absent about both, so neither of these could be true by accident.
+    CHECK(r.hadPrevious);
+    CHECK_EQ(r.previousValue, std::wstring(cudatest::kId4090));
+    CHECK_EQ(n.settings[ours], std::wstring(cudatest::kId5090));
+    // 🔴 AND NO SECOND ENTRY DIFFERING ONLY IN CASE - which is the whole defect.
+    CHECK_EQ(n.profiles.size(), (size_t)1);
+    CHECK_EQ(n.profiles.count(ours), (size_t)1);
+    CHECK_EQ(n.profiles.count(cd::CudaProfileNameFor(today)), (size_t)0);
+    CHECK_EQ(n.creates, 1);                                     // asked once, and it ADOPTED
+    CHECK(!r.profileDeleted);
+    CHECK_EQ(rec.record.rows.size(), (size_t)1);                // still one line, still naming that entry
+    CHECK_EQ(rec.record.rows[0].profileName, ours);
+    CHECK_EQ(rec.record.rows[0].lastWrote, std::wstring(cudatest::kId5090));
+
+    Case("AK32b where NO line claims it the recomputed name is still the only one there is");
+    {
+        cudatest::Fake m;
+        m.gpus = cudatest::TwoCards();
+        m.ids = cudatest::BothIds();
+        cudatest::Rec none;
+        const cd::CudaRowResult s = cudatest::Apply(
+            today, cd::CudaTargetFor(cudatest::kKey4090, m.gpus, m.ids), cudatest::OpsOf(m), none);
+        CHECK(s.outcome == cd::CudaOutcome::Written);
+        CHECK_EQ(s.profileName, cd::CudaProfileNameFor(today));   // today's spelling: nothing else to use
+        CHECK_EQ(m.profiles.count(cd::CudaProfileNameFor(today)), (size_t)1);
+        CHECK_EQ(m.profiles.size(), (size_t)1);
+    }
+    {
+        // 🔴 AND A LINE NAMING AN ENTRY THE DRIVER DOES NOT HOLD ADOPTS NOTHING. The lookup asks for
+        // exactly what the line says; Absent is Absent, so one is made under today's name and no entry of
+        // anybody else's is joined on the strength of a name that merely resembles it.
+        cudatest::Fake m;
+        m.gpus = cudatest::TwoCards();
+        m.ids = cudatest::BothIds();
+        cudatest::Rec stale;
+        stale.record.rows.push_back(cudatest::Line(ours, cd::CudaAppKeyFor(made), cudatest::kId4090));
+        const cd::CudaRowResult s = cudatest::Apply(
+            today, cd::CudaTargetFor(cudatest::kKey4090, m.gpus, m.ids), cudatest::OpsOf(m), stale);
+        CHECK(s.outcome == cd::CudaOutcome::Written);
+        CHECK_EQ(s.profileName, cd::CudaProfileNameFor(today));
+        CHECK_EQ(m.profiles.size(), (size_t)1);
+        CHECK_EQ(m.creates, 1);
+    }
+}
+
+// 🔴 Pre-publish review of v0.5.9: a driver that says a page holds more entries than the buffer it was
+// handed. Both of gpu_cuda.cpp's readers (OtherAppCountOf, SettingIdsOf) walk the driver's pages through
+// WalkCudaPages, so this drives the walk they really run, with a scripted driver in place of NVAPI.
+void Test_AK33_AnOverReportedPageIsAFailedEnumeration() {
+    struct Run {
+        cd::CudaWalk walk = cd::CudaWalk::Refused;
+        std::vector<unsigned long> starts;   // every `start` the walk asked the driver for
+        size_t taken = 0;                    // entries it copied out of the pages
+        bool outOfPage = false;              // an entry index at or past the page size was copied
+    };
+    // `script` is what the driver answers, one request at a time; past its end every page is full.
+    const auto walk = [](unsigned long pageSize, unsigned long cap,
+                         const std::vector<std::pair<cd::CudaPage, unsigned long> >& script) {
+        Run run;
+        size_t next = 0;
+        run.walk = cd::WalkCudaPages(
+            pageSize, cap,
+            [&](unsigned long start, unsigned long& count) {
+                run.starts.push_back(start);
+                if (next >= script.size()) {
+                    count = pageSize;
+                    return cd::CudaPage::Filled;
+                }
+                count = script[next].second;
+                return script[next++].first;
+            },
+            [&](unsigned long k) {
+                ++run.taken;
+                if (k >= pageSize) run.outOfPage = true;
+            });
+        return run;
+    };
+    typedef std::pair<cd::CudaPage, unsigned long> P;
+    const cd::CudaPage F = cd::CudaPage::Filled;
+
+    Case("AK33 🔴 a page the driver says is longer than its buffer fails the walk, before anything is copied");
+    {
+        const Run r = walk(4, 256, {P(F, 5)});
+        CHECK(r.walk == cd::CudaWalk::Overran);
+        CHECK_EQ(r.taken, (size_t)0);            // nothing copied out of the over-reported page
+        CHECK_EQ(r.starts.size(), (size_t)1);    // and the walk did not advance past it
+    }
+    {
+        // on a LATER page too: the first page is kept, and the answer is still a failure, not a short list
+        const Run r = walk(4, 256, {P(F, 4), P(F, 9)});
+        CHECK(r.walk == cd::CudaWalk::Overran);
+        CHECK_EQ(r.taken, (size_t)4);
+        CHECK_EQ(r.starts.size(), (size_t)2);
+        CHECK(!r.outOfPage);
+    }
+
+    Case("AK33b the walks that DO end well still end well, and no copy ever leaves the page");
+    {
+        const Run r = walk(4, 256, {P(F, 4), P(F, 2)});            // a short page ends it
+        CHECK(r.walk == cd::CudaWalk::Complete);
+        CHECK_EQ(r.taken, (size_t)6);
+        CHECK(r.starts.size() == 2 && r.starts[0] == 0 && r.starts[1] == 4);
+    }
+    {
+        const Run r = walk(4, 256, {P(F, 4), P(cd::CudaPage::End, 0)});   // "that is all of them"
+        CHECK(r.walk == cd::CudaWalk::Complete);
+        CHECK_EQ(r.taken, (size_t)4);
+    }
+    {
+        const Run r = walk(4, 256, {P(F, 4), P(F, 0)});            // an empty page ends it too
+        CHECK(r.walk == cd::CudaWalk::Complete);
+        CHECK_EQ(r.taken, (size_t)4);
+    }
+    {
+        const Run r = walk(4, 256, {P(F, 4), P(cd::CudaPage::Refused, 4)});
+        CHECK(r.walk == cd::CudaWalk::Refused);                     // never read as the end of the list
+    }
+    {
+        const Run r = walk(4, 12, {});                              // full pages to the cap
+        CHECK(r.walk == cd::CudaWalk::Capped);
+        CHECK_EQ(r.taken, (size_t)12);
+        CHECK(r.starts.size() == 3 && r.starts[2] == 8);
+        CHECK(!r.outOfPage);
+    }
+}
+
+// 🔴 Pre-publish review of v0.5.9: the adopt path took an INHERITED value for the entry's previous one.
+// NvAPI_DRS_GetSetting answers from NVIDIA's general settings when the entry has none of its own, so a failed
+// Apply's rollback wrote that value into the entry as a local setting that had never existed.
+void Test_AK34_TheAdoptedPreviousValueIsTheEntrysOwn() {
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    // An entry of ours an earlier run left behind, claimed by the record, reading back kId4090; the Apply writes
+    // kId5090 and its own save refuses, so the row is rolled back.
+    const auto setUp = [&](cudatest::Fake& f, cudatest::Rec& rec) {
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::LeftBehind(f, exe);
+        f.settings[ours] = cudatest::kId4090;
+        rec.record.rows.push_back(cudatest::Line(ours, cd::CudaAppKeyFor(exe), cudatest::kId4090));
+    };
+    const auto wrote = [](const cudatest::Fake& f, const std::wstring& what) {
+        for (size_t i = 0; i < f.written.size(); ++i)
+            if (f.written[i] == what) return true;
+        return false;
+    };
+
+    Case("AK34 🔴 an inherited value is no previous value: the rollback CLEARS, it never writes it in");
+    {
+        cudatest::Fake f;
+        cudatest::Rec rec;
+        setUp(f, rec);
+        f.inherited.insert(ours);             // the read answers, and the entry's own ids do not list it
+        f.failSaveNumber = 1;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Refused);
+        CHECK(r.refusal == cd::CudaRefusal::NotSaved);
+        CHECK(r.undone);
+        CHECK(!r.hadPrevious);
+        CHECK(!wrote(f, ours + L"=" + cudatest::kId4090));   // 🔴 the inherited value is never written as local
+        CHECK(!f.written.empty() && f.written.back() == ours + L"=CLEAR");
+    }
+    {
+        // control: a value that IS the entry's own is still put back exactly
+        cudatest::Fake f;
+        cudatest::Rec rec;
+        setUp(f, rec);
+        f.failSaveNumber = 1;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.undone);
+        CHECK(r.hadPrevious);
+        CHECK_EQ(r.previousValue, std::wstring(cudatest::kId4090));
+        CHECK(!f.written.empty() && f.written.back() == ours + L"=" + cudatest::kId4090);
+    }
+
+    Case("AK34b ids nobody could list, or ids that contradict the read, refuse BEFORE the entry is adopted");
+    {
+        cudatest::Fake f;
+        cudatest::Rec rec;
+        setUp(f, rec);
+        f.settingsListFails = true;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotRead);
+        CHECK_EQ(f.creates, 0);                   // nothing was added to the entry
+        CHECK(f.written.empty());
+        CHECK(f.byExe.empty());
+    }
+    {
+        cudatest::Fake f;
+        cudatest::Rec rec;
+        setUp(f, rec);                            // the ids list our setting ...
+        cd::CudaOps ops = cudatest::OpsOf(f);
+        ops.readSetting = [](const std::wstring&, std::wstring& v) {   // ... and the read says there is none
+            v.clear();
+            return cd::CudaRead::Absent;
+        };
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), ops, rec);
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotRead);
+        CHECK_EQ(f.creates, 0);
+        CHECK(f.written.empty());
+    }
+}
+
+// 🔴 Pre-publish review of v0.5.9, the sibling path: PlanCudaForRow decided "already set" and "previous value"
+// from the read alone. One rule now decides it for both paths, from the entry's own setting ids.
+void Test_AK35_TheLocalSettingRuleIsShared() {
+    const std::wstring exe = L"C:\\Apps\\chat\\chat.exe";
+    const std::wstring ours = cd::CudaProfileNameFor(exe);
+    const std::wstring entry = cd::CudaAppKeyFor(exe);
+    const std::wstring v = cudatest::kId5090;
+    std::vector<unsigned long> mine, others, none;
+    mine.push_back(cd::CudaSettingId());
+    mine.push_back(0x20D0F3E6ul);
+    others.push_back(0x20D0F3E6ul);
+
+    Case("AK35 JudgeCudaLocalSetting: Present, Absent and Undecidable");
+    {
+        CHECK(cd::JudgeCudaLocalSetting(true, mine, cd::CudaRead::Value, v) == cd::CudaLocalSetting::Present);
+        // 🔴 a value the ids do not list is INHERITED, not the entry's own
+        CHECK(cd::JudgeCudaLocalSetting(true, others, cd::CudaRead::Value, v) == cd::CudaLocalSetting::Absent);
+        CHECK(cd::JudgeCudaLocalSetting(true, none, cd::CudaRead::Absent, L"") == cd::CudaLocalSetting::Absent);
+        CHECK(cd::JudgeCudaLocalSetting(false, mine, cd::CudaRead::Value, v) == cd::CudaLocalSetting::Undecidable);
+        CHECK(cd::JudgeCudaLocalSetting(true, mine, cd::CudaRead::Failed, L"") == cd::CudaLocalSetting::Undecidable);
+        CHECK(cd::JudgeCudaLocalSetting(true, mine, cd::CudaRead::Absent, L"") == cd::CudaLocalSetting::Undecidable);
+        CHECK(cd::JudgeCudaLocalSetting(true, others, cd::CudaRead::Value, L"autoselect") ==
+              cd::CudaLocalSetting::Undecidable);
+    }
+
+    // An entry of ours an earlier clear-only Remove emptied (R6-7): the user's own setting keeps it standing,
+    // it holds NO CUDA setting of its own, and the read answers with NVIDIA's general value.
+    const auto setUp = [&](cudatest::Fake& f, cudatest::Rec& rec, const std::wstring& inheritedValue) {
+        f.gpus = cudatest::TwoCards();
+        f.ids = cudatest::BothIds();
+        cudatest::Own(f, exe, ours, entry);
+        f.otherSettings[ours] = 1;
+        f.settings[ours] = inheritedValue;
+        f.inherited.insert(ours);
+        rec.record.rows.push_back(cudatest::Line(ours, entry, cd::CudaNothingWritten()));
+    };
+
+    Case("AK35b 🔴 an inherited value equal to the target is NOT 'already set': the entry's own setting is written");
+    {
+        cudatest::Fake f;
+        cudatest::Rec rec;
+        const cd::CudaTarget target = cd::CudaTargetFor(cudatest::kKey4090, cudatest::TwoCards(), cudatest::BothIds());
+        CHECK(target.act);
+        setUp(f, rec, target.value);
+        const cd::CudaRowPlan p = cd::PlanCudaForRow(exe, target, cudatest::OpsOf(f), rec.record);
+        CHECK(p.act);
+        CHECK(!p.alreadySet);
+        CHECK(!p.hadPrevious);
+        const cd::CudaRowResult r = cudatest::Apply(exe, target, cudatest::OpsOf(f), rec);
+        CHECK(r.outcome == cd::CudaOutcome::Written);
+        CHECK(f.written.size() == 1 && f.written[0] == ours + L"=" + target.value);
+        CHECK(rec.record.rows.size() == 1 && rec.record.rows[0].lastWrote == target.value);
+    }
+
+    Case("AK35c and a failed Apply on it CLEARS on rollback, never writing the inherited value in as its own");
+    {
+        cudatest::Fake f;
+        cudatest::Rec rec;
+        setUp(f, rec, cudatest::kId4090);
+        f.failSaveNumber = 1;
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec);
+        CHECK(r.refusal == cd::CudaRefusal::NotSaved);
+        CHECK(r.undone);
+        CHECK(!r.hadPrevious);
+        CHECK(!f.written.empty() && f.written.back() == ours + L"=CLEAR");
+    }
+
+    Case("AK35d ids nobody could list, or ids naming our setting while the read says none, refuse on this path too");
+    {
+        cudatest::Fake f;
+        cudatest::Rec rec;
+        setUp(f, rec, cudatest::kId4090);
+        f.settingsListFails = true;
+        const cd::CudaRowPlan p =
+            cd::PlanCudaForRow(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), cudatest::OpsOf(f), rec.record);
+        CHECK(!p.act);
+        CHECK(p.refusal == cd::CudaRefusal::CouldNotRead);
+    }
+    {
+        cudatest::Fake f;
+        cudatest::Rec rec;
+        setUp(f, rec, cudatest::kId4090);
+        f.inherited.clear();                          // the ids list our setting ...
+        cd::CudaOps ops = cudatest::OpsOf(f);
+        ops.readSetting = [](const std::wstring&, std::wstring& got) {   // ... and the read says there is none
+            got.clear();
+            return cd::CudaRead::Absent;
+        };
+        const cd::CudaRowResult r =
+            cudatest::Apply(exe, cd::CudaTargetFor(cudatest::kKey4090, f.gpus, f.ids), ops, rec);
+        CHECK(r.refusal == cd::CudaRefusal::CouldNotRead);
+        CHECK(f.written.empty());
+    }
+}
+
+// ===========================================================================
+// AL. The line a run shows while it walks its rows (v0.5.9)
+// ===========================================================================
+//
+// Apply and Remove used to leave the tab silent for the whole run - per row a transacted registry
+// write, a read-back, a whole-file rewrite of the .reg journal, and on an NVIDIA target a full
+// driver-database save. This is the sentence that says where the run has got to.
+void Test_AL1_TheRunProgressLine() {
+    Case("AL1 the counter names the action and carries both numbers");
+    CHECK_EQ(cd::FormatRunProgressLine(false, 7, 40, false), std::wstring(L"Assigning 7 of 40."));
+    CHECK_EQ(cd::FormatRunProgressLine(true, 7, 40, false), std::wstring(L"Removing 7 of 40."));
+    CHECK_EQ(cd::FormatRunProgressLine(false, 1, 1, false), std::wstring(L"Assigning 1 of 1."));
+    CHECK_EQ(cd::FormatRunProgressLine(true, 1, 1, false), std::wstring(L"Removing 1 of 1."));
+
+    Case("AL1b 🔴 founder decision 18: with no CUDA half the words NVIDIA and CUDA appear nowhere");
+    const std::wstring off = cd::FormatRunProgressLine(false, 3, 9, false);
+    CHECK(off.find(L"NVIDIA") == std::wstring::npos);
+    CHECK(off.find(L"CUDA") == std::wstring::npos);
+    const std::wstring offRemoving = cd::FormatRunProgressLine(true, 3, 9, false);
+    CHECK(offRemoving.find(L"NVIDIA") == std::wstring::npos);
+    CHECK(offRemoving.find(L"CUDA") == std::wstring::npos);
+
+    Case("AL1c and with one, the same count carries the reason it is slow");
+    const std::wstring on = cd::FormatRunProgressLine(false, 3, 9, true);
+    CHECK_EQ(on.substr(0, off.size()), off);   // the count is untouched; the sentence is appended
+    CHECK_NE(on, off);
+    CHECK(on.find(L"NVIDIA's settings are saved once for each application, so this takes a moment.") !=
+          std::wstring::npos);
+    CHECK_EQ(cd::FormatRunProgressLine(true, 3, 9, true).find(L"Removing 3 of 9."), (size_t)0);
+}
+
 int main() {
     std::printf("Game Optimizer unit tests\n");
     std::printf("=======================\n");
@@ -9771,6 +13447,7 @@ int main() {
     Test_AH1_FormatRowGpu();
     Test_AH2_RowState();
     Test_AH3_SelectForBackground();
+    Test_AH4_SelectAllTicks();
     Test_AJ_GpuPolicy();
     Test_AH5_StatusLine();
     Test_AH6_RowsNeedingRestart();
@@ -9778,6 +13455,46 @@ int main() {
     std::printf("\n== AI. Orphaned GPU assignments ==\n");
     Test_AI1_FindOrphanedAssignments();
     Test_AI2_DriftStatusLine();
+
+    std::printf("\n== AK. Which GPU CUDA uses ==\n");
+    Test_AK1_ParseUniversalGpuId();
+    Test_AK2_TheKeyCarriesTheDeviceId();
+    Test_AK3_MatchUniversalId();
+    Test_AK4_CudaPlanFor();
+    Test_AK5_CudaTargetFor();
+    Test_AK6_WriteCudaForRow();
+    Test_AK7_RestoreCudaForRow();
+    Test_AK8_TheRecordOnDisk();
+    Test_AK9_OneLinePerApplication();
+    Test_AK10_TheWordsTheDialogsUse();
+    Test_AK11_TheSettingRoundTrips();
+    Test_AK12_AFailedReadIsNeverNoSetting();
+    Test_AK13_MembershipAndIdenticalCards();
+    Test_AK14_AFailedSaveLeavesNothingBehind();
+    Test_AK15_WhatRemoveSaysWhenThereWasNothingToPutBack();
+    Test_AK16_AFailedLookupIsNeverNoProfile();
+    Test_AK17_TwoAppliesThenRemove();
+    Test_AK18_OnlyAnEntryWeOwn();
+    Test_AK19_RemoveFailsClosedOnIdentity();
+    Test_AK20_TheCudaGateDecidesTheRow();
+    Test_AK21_OnlyOurOwnSettingIsRemoved();
+    Test_AK22_TheAdoptPathPassesTheOwnershipCheck();
+    Test_AK23_ACleanupThatFailedStopsTheRun();
+    Test_AK24_TheSentencesThatMustNameSomething();
+    Test_AK25_TheRecordAndTheDriverGuards();
+    Test_AK26_SettingsAreIdentifiedNotCounted();
+    Test_AK27_CapabilityIsHonestAtTheSeam();
+    Test_AK28_TheRollbacksOwnSaveIsChecked();
+    Test_AK29_MembershipIsJudgedOnUniqueEntries();
+    Test_AK30_TheClearOnlyRestoreKeepsItsLine();
+    Test_AK31_TheAdoptPathAndTwoWrongSentences();
+    Test_AK32_TheAdoptLookupUsesTheRecordedName();
+    Test_AK33_AnOverReportedPageIsAFailedEnumeration();
+    Test_AK34_TheAdoptedPreviousValueIsTheEntrysOwn();
+    Test_AK35_TheLocalSettingRuleIsShared();
+
+    std::printf("\n== AL. What a run says while it walks its rows (v0.5.9) ==\n");
+    Test_AL1_TheRunProgressLine();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

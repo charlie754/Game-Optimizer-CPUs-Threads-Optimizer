@@ -148,9 +148,43 @@ page ever disagree with the constants in `src\sponsor.h`.
 
 The panel's natural size is measured rather than estimated, by `tools\measure-panel.py`.
 
+## NVIDIA NVAPI — struct layouts and interface ids, not code
+
+`src\gpu_cuda.cpp` talks to the NVIDIA display driver's settings database (DRS) to set which GPU
+CUDA may use for one application. To do that it must agree with the driver's ABI: the layout of
+`NVDRS_SETTING`, `NVDRS_SETTING_VALUES`, `NVDRS_PROFILE` and `NVDRS_APPLICATION`, the numeric
+interface ids that `nvapi_QueryInterface` answers to, and the setting id `CUDA_EXCLUDED_GPUS_ID`
+(0x10354FF8).
+
+**Where those facts come from:** NVIDIA's own public headers at
+[github.com/NVIDIA/nvapi](https://github.com/NVIDIA/nvapi) (`nvapi.h`,
+`NvApiDriverSettings.h`), which are licensed **MIT**:
+
+> Copyright (c) NVIDIA Corporation. All rights reserved.
+>
+> Permission is hereby granted, free of charge, to any person obtaining a copy of this software
+> and associated documentation files (the "Software"), to deal in the Software without
+> restriction, including without limitation the rights to use, copy, modify, merge, publish,
+> distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the
+> Software is furnished to do so, subject to the following conditions:
+>
+> The above copyright notice and this permission notice shall be included in all copies or
+> substantial portions of the Software.
+
+**What was taken:** the ABI facts above — structure layouts, field order, version constants and
+interface ids. They are re-declared in `src\gpu_cuda.cpp` in this project's own style, with a
+`static_assert` on every structure size, rather than vendored: **no NVIDIA header file is present
+in this repository and none is included by the build.** Nothing links against `nvapi.lib`;
+`nvapi64.dll` is opened at run time with `LoadLibraryEx` and is entirely optional, so the
+application starts and works on a machine with no NVIDIA driver at all.
+
+The notice above is reproduced because the ABI description is a substantial enough borrowing that
+reproducing it is the safe reading of the licence, not because any NVIDIA source file was copied.
+
 ## Other third-party code in this repository
 
-**None.** Apart from the loader above, Game Optimizer links only against the Windows SDK import
+**None.** Apart from the WebView2 loader and the NVAPI ABI facts described above, Game Optimizer
+links only against the Windows SDK import
 libraries shipped with the platform toolchain (`user32`, `shell32`, `gdi32`, `advapi32`,
 `comctl32`, `ole32`, `shlwapi`, `psapi`, `comdlg32`, `msimg32`). There is no vendored source,
 no package manager, and no bundled image asset — the tray icons are drawn with GDI at runtime.

@@ -444,12 +444,84 @@ inline std::vector<GpuRow> SelectForAutoAssign(const std::vector<GpuRow>& rows, 
     return picked;
 }
 
+// ---- "Select all", the tab's OTHER bulk tick (v0.5.9) --------------------------------------------------------------
+//
+// WHAT IT TICKS: everything it is SAFE to tick, and the three exceptions are the operator's own rulings, each already
+// written down above and read from here rather than copied:
+//   - NEVER a game the user has a profile for (`isProfileGame`) - SelectForBackground's own rule, and the operator's
+//     "exclude all other profiles app already existed in our app".
+//   - NEVER an application pinned to the main GPU (IsMainGpuPin), nor one another version of which may hold such a pin
+//     (AnotherVersionMayHoldMainGpuPin) - founder decision, v0.5.6, "Skip them".
+//   - NEVER a Windows image or an excluded binary (`system`, gpuwindow.cpp's Row) - never bulk-selected.
+//
+// 🔴 IT IS NOT AUTO ASSIGN, AND THE DIFFERENCE IS THE POINT. The main GPU being the picker's choice changes nothing,
+// and "would this row actually move" (SelectForBackground's already-correct test) is never asked. Auto assign decides
+// what is worth MOVING; Select all says what is safe to TICK, and what to do with the ticks is then the user's own call.
+// The BUTTON shares two of Auto assign's conditions all the same, and they live in the window rather than here
+// (gpuwindow.cpp, SyncButtons and DoSelectAll): an incomplete preference walk switches it off, and so does having no
+// target - with no main GPU defined, IsMainGpuPin below cannot tell a user's own Windows preference from any other row.
+//
+// 🔴 THE EXCEPTIONS HOLD HERE OR THEY HOLD NOWHERE. A tick made by hand carries autoSelected = false, and BOTH of
+// v0.5.7's re-checks - PrepareEdits, and StillAutoEligible inside the guarded write - deliberately skip such a tick,
+// because that is what makes a hand tick an override. Select all makes hand ticks in bulk, so nothing downstream will
+// catch a row it should not have ticked: every exception has to be applied at selection time.
+//
+// `listed` and `system` are the window's own facts about the row (gpuwindow.cpp's Row): only a row the user can
+// actually see is ever ticked. They are passed in rather than copied into GpuRow so each keeps one owner.
+inline bool SelectAllTicks(const GpuRow& r, bool listed, bool system, const std::wstring& gameKey,
+                           const std::vector<std::pair<std::wstring, std::wstring> >& reg) {
+    if (!listed || system) return false;
+    if (r.isProfileGame) return false;
+    if (IsMainGpuPin(r, gameKey)) return false;
+    if (AnotherVersionMayHoldMainGpuPin(r, reg, gameKey)) return false;
+    return true;
+}
+
+// HOW MANY ROWS SELECT ALL WOULD NEWLY TICK - the count its enabled state reads, so the button greys as soon as there
+// is nothing left for it to do rather than staying lit over a click that changes nothing. A row the rule admits which
+// is ticked ALREADY does not count; no existing helper answered this (MovableCount runs Auto assign's whole policy and
+// needs a target, AnySelected ignores `listed`).
+//
+// `listed` and `system` are parallel to `rows`. A short or missing entry reads as NOT listed and AS system, so a
+// caller that cannot supply them counts nothing rather than everything - the fail-closed direction.
+inline size_t SelectAllPendingCount(const std::vector<GpuRow>& rows, const std::vector<bool>& listed,
+                                    const std::vector<bool>& system, const std::wstring& gameKey,
+                                    const std::vector<std::pair<std::wstring, std::wstring> >& reg) {
+    size_t n = 0;
+    for (size_t i = 0; i < rows.size(); ++i) {
+        const bool isListed = i < listed.size() && listed[i];
+        const bool isSystem = i >= system.size() || system[i];
+        if (!rows[i].selected && SelectAllTicks(rows[i], isListed, isSystem, gameKey, reg)) ++n;
+    }
+    return n;
+}
+
 // The status line while Windows' GPU preferences could not all be read and a background GPU is the target: why Auto
 // assign is grey, said beside it, as FormatMainGpuStatusLine says it for the main GPU. Wording fixed by the Council
 // round 2 fix spec, v0.5.6; AJ45 pins it.
 inline std::wstring FormatIncompleteScanStatusLine() {
     return L"Auto assign GPU for Gaming is off because Windows' GPU settings could not all be read, so an application "
            L"pinned to the main GPU might not be recognised. Tick applications by hand to change them.";
+}
+
+// WHAT THE STATUS LINE SAYS WHILE A RUN IS WALKING ITS ROWS (v0.5.9). Apply and Remove used to leave the tab silent
+// and unpainted for the whole run: per row a transacted registry write, a read-back, a whole-file rewrite of the .reg
+// restore journal and - on an NVIDIA target with the CUDA feature on - a full NVIDIA driver-database save, "one save
+// per row, and NvAPI_DRS_SaveSettings rewrites the whole driver database (about 1.9 MB)" (gpu_cuda.h). v0.5.9's
+// Select all button lets a user tick forty to a hundred applications in one click, which is where Windows paints the
+// "Not Responding" ghost over a window that has stopped answering its queue.
+//
+// `at` is the row being worked on, ONE-BASED, and it never exceeds `total`. A run that stops part-way simply stops
+// counting: RunGpuEdits' after-a-stop fast path deliberately calls nothing, and the result dialog is what explains a
+// stop - it always has.
+//
+// 🔴 THE SECOND SENTENCE ONLY WHEN THE RUN REALLY HAS A CUDA HALF (founder decision 18). A run with the check box
+// off, or against a non-NVIDIA target, must not see the words CUDA or NVIDIA anywhere.
+inline std::wstring FormatRunProgressLine(bool removing, size_t at, size_t total, bool cudaHalf) {
+    std::wstring line = (removing ? std::wstring(L"Removing ") : std::wstring(L"Assigning ")) + std::to_wstring(at) +
+                        L" of " + std::to_wstring(total) + L".";
+    if (cudaHalf) line += L"  NVIDIA's settings are saved once for each application, so this takes a moment.";
+    return line;
 }
 
 // WHAT THE TAB SAYS WHEN AUTO ASSIGN HAS NOTHING TO TICK, while a background GPU is the picker's target: the status

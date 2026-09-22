@@ -326,6 +326,17 @@ std::vector<std::wstring> DefaultExclusions() {
     v.push_back(L"winlogon.exe");
     v.push_back(L"explorer.exe");
     v.push_back(L"MsMpEng.exe");
+    // FOUND ON THE OPERATOR'S MACHINE, IN THEIR OWN HAND TEST OF THE PREVIOUS BUILD: the GPU
+    // feature was applied to eight applications and two of them were Microsoft system components.
+    // Neither is caught by IsWindowsImagePath (gpu_policy.h), which matches only an image under
+    // "X:\windows\" - these live under ProgramData and Program Files instead - so both were freely
+    // selectable, and "Select all" would sweep them in every time.
+    //
+    // Windows Defender's per-session helper, beside the Defender engine above.
+    v.push_back(L"DefenderSessionHelper.exe");
+    // Microsoft GameInput's redistributable service: it serves game controller input, which is the
+    // last path to hand to a background GPU.
+    v.push_back(L"GameInputRedistService.exe");
     v.push_back(L"NVDisplay.Container.exe");
     v.push_back(L"nvcontainer.exe");
     v.push_back(L"AMDRSServ.exe");
@@ -514,6 +525,8 @@ bool ParseConfig(const std::wstring& text, Config& out, std::wstring* error) {
                     out.gameGpu = value;
                 } else if (IEquals(key, std::wstring(L"background_gpu"))) {
                     out.backgroundGpu = value;
+                } else if (IEquals(key, std::wstring(L"set_cuda_gpu"))) {
+                    ParseBoolW(value, out.setCudaGpu);
                 } else {
                     known = false;
                 }
@@ -682,6 +695,7 @@ std::wstring SerializeConfig(const Config& c) {
     AppendKv(out, L"auto_isolate", BoolText(c.autoIsolateGpu));
     AppendKv(out, L"game_gpu", c.gameGpu);
     AppendKv(out, L"background_gpu", c.backgroundGpu);
+    AppendKv(out, L"set_cuda_gpu", BoolText(c.setCudaGpu));
     AppendUnknownFor(out, c, std::wstring(kSecGpus), consumed);
     out += L"\r\n";
 

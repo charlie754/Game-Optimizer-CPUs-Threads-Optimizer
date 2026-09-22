@@ -520,10 +520,32 @@ struct GpuPreferenceBefore {
     std::wstring value;     // the REG_SZ text it held
 };
 
+// The two lines regedit itself needs from a version-5 .reg file for the preference key. Kept apart from the
+// header below because IsCompleteRegRestoreText anchors on exactly these, and on nothing that is only prose.
+inline std::wstring RegRestoreVersionLine() { return L"Windows Registry Editor Version 5.00\r\n"; }
+inline std::wstring RegRestoreKeyLine() {
+    return L"[HKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences]\r\n";
+}
+
 // The opening of a version-5 .reg file for the preference key: the line regedit requires first, then the key.
+//
+// 🔴 AND, SINCE v0.5.8, WHAT THIS FILE CANNOT PUT BACK (Council round 1, F12). This file is the whole undo
+// for Windows' per-application GPU preference, and reads like the whole undo for the change - but which GPU
+// CUDA uses is not a registry value at all. NVIDIA keeps it in its own settings database, so nothing a .reg
+// file can hold will move it, and a user who opens this one and stops there is left with CUDA still pinned.
+// Every added line starts with ';', which regedit treats as a comment, so the file still imports exactly the
+// values below it and nothing else.
 inline std::wstring FormatRegRestoreHeader() {
-    return L"Windows Registry Editor Version 5.00\r\n\r\n"
-           L"[HKEY_CURRENT_USER\\Software\\Microsoft\\DirectX\\UserGpuPreferences]\r\n";
+    return RegRestoreVersionLine() +
+           L"\r\n"
+           L"; Game Optimizer - the GPU preference each of these applications had before the change.\r\n"
+           L"; Opening this file puts those preferences back.\r\n"
+           L";\r\n"
+           L"; WHICH GPU CUDA USES IS NOT IN THIS FILE. NVIDIA keeps that in its own settings, not in the\r\n"
+           L"; registry, so no file like this one can put it back. Use \"Remove assignment\" on Game Optimizer's\r\n"
+           L"; GPU Assignment tab for that - it reads the gpu-cuda-record.txt file kept in this same folder.\r\n"
+           L"\r\n" +
+           RegRestoreKeyLine();
 }
 
 // One value as a .reg line: a present value is set to its old text, an absent one is deleted. Backslashes
@@ -576,14 +598,35 @@ inline std::wstring FormatPendingRestoreFile(const std::vector<GpuPreferenceBefo
     return out;
 }
 
-// True when `text` - a restore file's contents after its byte-order mark - is exactly regedit's heading followed by
-// one or more COMPLETE rows as FormatRegRestoreRow writes them, each ending in CRLF, and nothing else.
+// True when `text` - a restore file's contents after its byte-order mark - is regedit's two heading lines, any
+// comment or blank lines between them, and then one or more COMPLETE rows as FormatRegRestoreRow writes them,
+// each ending in CRLF, and nothing else.
 //
 // 🔴 A FILE THAT EXISTS IS NOT A FILE THAT IS COMPLETE (adversarial review, round 6): the window recommended opening
 // any .reg that was there, and a write stopped part-way leaves one cut off inside a row.
+//
+// 🔴 AND IT ANCHORS ON THE TWO LINES REGEDIT NEEDS, NOT ON THE WHOLE HEADER, because the header's prose changes
+// between versions - v0.5.8 added the CUDA note. Comparing the exact header would call a perfectly good .reg
+// written by an earlier version incomplete, and the window then tells the user NOT to open the only way back
+// they have (FormatUnfinishedNotice). A comment line is skipped wherever it sits above the key.
 inline bool IsCompleteRegRestoreText(const std::wstring& text) {
-    const std::wstring head = FormatRegRestoreHeader();
-    if (text.compare(0, head.size(), head) != 0) return false;
+    const std::wstring version = RegRestoreVersionLine();
+    if (text.compare(0, version.size(), version) != 0) return false;
+    size_t at = version.size();
+    while (at < text.size()) {
+        if (text.compare(at, 2, L"\r\n") == 0) {
+            at += 2;
+        } else if (text[at] == L';') {
+            const size_t nl = text.find(L"\r\n", at);
+            if (nl == std::wstring::npos) return false;
+            at = nl + 2;
+        } else {
+            break;
+        }
+    }
+    const std::wstring key = RegRestoreKeyLine();
+    if (text.compare(at, key.size(), key) != 0) return false;
+    const size_t head = at + key.size();
     struct Quoted {
         // Moves `i` past a quoted string that starts at text[i]; false when it is not one or never closes.
         static bool Skip(const std::wstring& s, size_t& i) {
@@ -602,7 +645,7 @@ inline bool IsCompleteRegRestoreText(const std::wstring& text) {
             return false;
         }
     };
-    size_t i = head.size();
+    size_t i = head;
     size_t rows = 0;
     while (i < text.size()) {
         if (!Quoted::Skip(text, i)) return false;
@@ -660,19 +703,31 @@ std::vector<std::wstring> UnfinishedGpuRestores(const std::wstring& dir);
 // A restore file's text without its byte-order mark. False when it cannot be read or is not UTF-16 with a mark.
 bool ReadRestoreFileText(const std::wstring& path, std::wstring& textOut);
 
+// `text` as a UTF-16 file with a byte-order mark, written to "<path>.tmp", flushed, and moved over `path`
+// in one step. False: `path` is still exactly the previous complete file, or still absent. This is the
+// discipline the .reg restore file is grown by, and gpu-cuda-record.txt in the same folder (gpu_cuda.cpp)
+// uses the same one rather than a second copy of it.
+bool ReplaceTextFile(const std::wstring& path, const std::wstring& text);
+
 // ---- A change that cannot replace another program's change -------------------------------------------
 enum class GuardedWriteResult {
     Written,          // committed: the value now holds exactly what was asked
     Changed,          // it was no longer what the caller read, so nothing was written
     CheckUnreadable,  // it could not be read again to compare, so nothing was written
-    NotCommitted,     // Windows did not commit it - error 6704 when another writer changed it meanwhile
+    NotCommitted,     // Windows did not commit it - error 6704 when another writer changed this key (any value) meanwhile
     Unavailable,      // a registry transaction could not be started, so nothing was written
-    Failed            // the change itself was refused, so nothing was written
+    Failed,           // the change itself was refused, so nothing was written
+    NoLongerAllowed   // the value was as read, but the caller's own check (GuardedWriteCheck) said no: nothing was written
 };
 
 // Called between the steps of a guarded write, for the write probe only: stage 1 after the change is made
 // inside the transaction, stage 2 after the comparison and before the commit. The product passes none.
 typedef void (*GuardedWriteHook)(int stage, void* context);
+
+// Asked once, after the comparison has passed and before the commit: may the change still be made? True = it may.
+// The GPU Assignment tab passes one for a row Auto assign ticked (v0.5.7): it reads Windows' GPU preferences again and
+// asks Auto assign's own rule whether the row is still one it would tick.
+typedef bool (*GuardedWriteCheck)(void* context);  // true = the change is still allowed
 
 // Sets `exePath`'s value to `newValue`, or deletes it when `deleteValue`, ONLY if it is still exactly what
 // the caller read (`expectPresent`, `expectValue`).
@@ -686,10 +741,27 @@ typedef void (*GuardedWriteHook)(int stage, void* context);
 // still succeeded.
 // `*error` (optional) receives the Windows error code behind Unavailable, Failed and NotCommitted, else 0.
 // ponytail: the other writer in the probes was a second handle in the same process, one step at a time.
+//
+// `stillAllowed` (optional) is asked with `checkContext` AFTER the comparison passes and BEFORE the commit; false rolls
+// the change back and answers NoLongerAllowed. WHAT IT GUARANTEES: a change the check can see - one already committed
+// when it runs - stops this write, which the comparison alone cannot do for a value other than `exePath`'s (v0.5.7: the
+// sibling-pin race, where another version of the application was pinned to the main GPU after Apply prepared the row).
+// The check reads committed state OUTSIDE the transaction, so it sees nothing written after it runs - the commit covers
+// that instead. [M] txprobe3 (Windows build 26200, 3 runs each): after the transacted change of one value, ANY plain
+// write by another handle to ANY value of this key - creating, overwriting or deleting a DIFFERENT value, before or
+// after the comparison - made CommitTransaction fail with 6704 (NotCommitted); the other writer was never blocked and
+// its change survived; a read by another handle did not abort it. So a sibling change committed before the check runs
+// is seen by the check, and one landing after the transacted change and before the commit makes the commit fail:
+// together they leave no window for a writer of this key (ledger R5, v0.5.7).
+// ponytail: txprobe3's other writer was a second handle in the same process, one step at a time; a writer in another
+// process racing at full speed is not measured.
+// THE SIDE EFFECT, SAID PLAINLY: ANY program writing ANY value of this key between the transacted change and the
+// commit makes this row NotCommitted - safe, since nothing is lost, but it can refuse a row for an unrelated change.
 GuardedWriteResult GuardedWriteGpuPreference(const std::wstring& exePath, bool expectPresent,
                                              const std::wstring& expectValue, bool deleteValue,
                                              const std::wstring& newValue, unsigned long* error = nullptr,
-                                             GuardedWriteHook hook = nullptr, void* hookContext = nullptr);
+                                             GuardedWriteHook hook = nullptr, void* hookContext = nullptr,
+                                             GuardedWriteCheck stillAllowed = nullptr, void* checkContext = nullptr);
 
 // EVERY preference the registry holds, as (full exe path, PreferenceChoiceKey) pairs: an adapter
 // key, a Windows-setting key, or empty for no choice - and an entry with no choice is still

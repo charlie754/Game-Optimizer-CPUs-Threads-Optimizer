@@ -331,17 +331,23 @@ bool BeginGpuRestore(const std::wstring& dir, const std::vector<GpuPreferenceBef
     return true;
 }
 
+bool ReplaceTextFile(const std::wstring& path, const std::wstring& text) {
+    if (path.empty()) return false;
+    const std::wstring tmp = path + L".tmp";
+    DeleteFileW(tmp.c_str());   // a leftover from a stopped run is never reused; if it cannot go, the write below fails
+    if (!WriteNewTextFile(tmp, text)) return false;
+    if (!MoveFileExW(tmp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        DeleteFileW(tmp.c_str());
+        return false;
+    }
+    return true;
+}
+
 bool RecordGpuRestoreRow(GpuRestoreJournal& journal, const GpuPreferenceBefore& row) {
     if (journal.regPath.empty()) return false;
     std::vector<GpuPreferenceBefore> next = journal.recorded;
     next.push_back(row);
-    const std::wstring tmp = journal.regPath + L".tmp";
-    DeleteFileW(tmp.c_str());   // a leftover from a stopped run is never reused; if it cannot go, the write below fails
-    if (!WriteNewTextFile(tmp, FormatRegRestoreFile(next))) return false;
-    if (!MoveFileExW(tmp.c_str(), journal.regPath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        DeleteFileW(tmp.c_str());
-        return false;
-    }
+    if (!ReplaceTextFile(journal.regPath, FormatRegRestoreFile(next))) return false;
     journal.recorded = next;
     journal.regStarted = true;
     return true;
@@ -390,7 +396,8 @@ bool ReadRestoreFileText(const std::wstring& path, std::wstring& textOut) {
 GuardedWriteResult GuardedWriteGpuPreference(const std::wstring& exePath, bool expectPresent,
                                              const std::wstring& expectValue, bool deleteValue,
                                              const std::wstring& newValue, unsigned long* error,
-                                             GuardedWriteHook hook, void* hookContext) {
+                                             GuardedWriteHook hook, void* hookContext,
+                                             GuardedWriteCheck stillAllowed, void* checkContext) {
     if (error) *error = 0;
     wchar_t description[] = L"Game Optimizer GPU preference";
     HANDLE tx = CreateTransaction(nullptr, nullptr, 0, 0, 0, 10000, description);
@@ -435,9 +442,17 @@ GuardedWriteResult GuardedWriteGpuPreference(const std::wstring& exePath, bool e
         CloseHandle(tx);
         return unreadable ? GuardedWriteResult::CheckUnreadable : GuardedWriteResult::Changed;
     }
+    //    ...and the caller's own check, when it passed one, still says yes. It too reads committed state outside the
+    //    transaction; see the header for what that does and does not cover (v0.5.7).
+    if (stillAllowed && !stillAllowed(checkContext)) {
+        RegCloseKey(key);
+        RollbackTransaction(tx);
+        CloseHandle(tx);
+        return GuardedWriteResult::NoLongerAllowed;
+    }
     if (hook) hook(2, hookContext);
-    // 3. only then the commit - which fails if anyone wrote the value after step 1. Its error is kept: a
-    //    conflict and any other failure are not the same thing to tell a user.
+    // 3. only then the commit - which fails if anyone wrote ANY value of this key after step 1 ([M] txprobe3). Its
+    //    error is kept: a conflict and any other failure are not the same thing to tell a user.
     const BOOL committed = CommitTransaction(tx);
     const DWORD commitError = committed ? 0 : GetLastError();
     RegCloseKey(key);

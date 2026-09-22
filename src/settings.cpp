@@ -885,7 +885,8 @@ enum : int {
 };
 
 // Added separately so the stable control ids above keep their numeric values.
-enum : int { IDC_VCACHE_MANAGE = 1600, IDC_VCACHE_RESTORE = 1601, IDC_VCACHE_WARN = 1602 };
+enum : int { IDC_VCACHE_MANAGE = 1600, IDC_VCACHE_RESTORE = 1601, IDC_VCACHE_WARN = 1602,
+             IDC_CUDA_GPU = 1603 };
 
 // The Core map page's "Add mask..." / "Remove mask" buttons. Their own block, above every
 // id that WM_COMMAND already dispatches on, so nothing existing shifts.
@@ -1235,6 +1236,9 @@ struct SettingsState {
     // says what it does; the removed text repeated that and added driver detail that misled.
     HWND hVCacheManage = nullptr, hVCacheRestore = nullptr;
     HWND hVCacheWarn = nullptr;
+    // v0.5.8: whether GPU Assignment also tells NVIDIA which GPU CUDA may use for an application.
+    // An ordinary config preference, committed on OK/Apply like the two above it.
+    HWND hCudaGpu = nullptr;
     HWND hPollLbl = nullptr, hPoll = nullptr;
     HWND hGameModeStatus = nullptr, hVCacheStatus = nullptr, hVCacheRestoreHint = nullptr;
     HWND hVCacheEffect = nullptr;
@@ -2870,6 +2874,7 @@ void StoreGeneralToWork(SettingsState* st) {
     st->work.startWithWindows = IsChecked(st->hStartup);
     st->work.notifications = IsChecked(st->hNotify);
     st->work.showVCacheWarning = IsChecked(st->hVCacheWarn);
+    st->work.setCudaGpu = IsChecked(st->hCudaGpu);
     int v = 0;
     if (ParseIntW(Trim(GetText(st->hPoll)), v)) st->work.pollMs = v;
 }
@@ -3657,8 +3662,8 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         //   * the page content stops at `bottom`, which is at or above the same line.
         //   * NO HEIGHT IS ADDED. The label occupies part of a row that already exists and
         //     was already empty on its left-hand side, so neither WM_GETMINMAXINFO's needH
-        //     nor ShowSettings' wantH changes - see the note in wiki\carried-context.md
-        //     about this window being sized twice.
+        //     nor ShowSettings' wantH changes - this window is sized in both of those
+        //     places, so a height added to one and not the other would disagree.
         //
         // Horizontally it stops a tight gap short of the OK button and draws with
         // DT_END_ELLIPSIS, so even an absurd version string can only ever shorten itself.
@@ -4243,7 +4248,7 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         int iw = W - 2 * PAD;
         // The startup warning preference is independent of stopping the optimizer, so it
         // gets its own row. Reserve that row in the card too, or the poll field spills out.
-        const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW + GT + ROW + GT + ROW;
+        const int cardH = 2 * PAD + HH + GT + ROW + GT + ROW + GT + ROW + GT + ROW + GT + ROW;
         RECT c = AddCard(y, cardH, x0, W);
         int ix = c.left + PAD, iy = c.top + PAD;
         Put(st->hGenHdr, ix, iy, iw, HH);
@@ -4254,6 +4259,8 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
         Put(st->hVCacheManage, ix, iy, iw, ROW);
         iy += ROW + GT;
         Put(st->hVCacheWarn, ix, iy, iw, ROW);
+        iy += ROW + GT;
+        Put(st->hCudaGpu, ix, iy, iw, ROW);
         iy += ROW + GT;
         Put(st->hPollLbl, ix, iy + (ROW - LH) / 2, theme::Dp(150, dpi), LH);
         Put(st->hPoll, ix + theme::Dp(150, dpi), iy + (ROW - RH) / 2,
@@ -4947,7 +4954,7 @@ void PageControls(SettingsState* st, int page, HWND* out, int& n) {
     HWND coremap[]  = { st->hMapHdr, st->hTopoText, st->hMapMaskLbl, st->hMapMask,
                         st->hMapReset, st->hMapAdd, st->hMapRemove, st->hMap, st->hMapFail };
     HWND general[]  = { st->hGenHdr, st->hStartup, st->hNotify,
-                        st->hVCacheManage, st->hVCacheWarn, st->hPollLbl, st->hPoll,
+                        st->hVCacheManage, st->hVCacheWarn, st->hCudaGpu, st->hPollLbl, st->hPoll,
                         st->hGameModeStatus, st->hVCacheStatus, st->hVCacheRestoreHint,
                         st->hVCacheEffect,
                         st->hBlocked, st->hInspect,
@@ -5060,6 +5067,11 @@ void ApplySettingsFonts(SettingsState* st, HWND hwnd) {
 void ActivateGpuPage(SettingsState* st) {
     if (!st->hGpuPanel) return;
     StoreUiToProfile(st);
+    // 🔴 THE SETTING PAGE'S CHECK BOXES REACH THE PANEL BEFORE OK IS PRESSED (v0.5.8). The panel is handed
+    // `st->work`, and "Also set which GPU CUDA uses" lives on the Setting page: without this, ticking that
+    // box and stepping straight to this tab would leave the panel acting on the value the window opened
+    // with. ApplyChanges calls the same function again, so nothing here decides what is saved.
+    StoreGeneralToWork(st);
     RefreshCpuTable(st);
     ActivateGpuPanel(st->hGpuPanel, st->work, st->cpuSnap);
 }
@@ -5177,6 +5189,7 @@ void ApplyChanges(SettingsState* st, HWND hwnd) {
     SetChecked(st->hNotify, st->work.notifications);
     SetChecked(st->hStartup, st->work.startWithWindows);
     SetChecked(st->hVCacheWarn, st->work.showVCacheWarning);
+    SetChecked(st->hCudaGpu, st->work.setCudaGpu);
     SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(ReadServiceStartValue(L"amd3dvcacheSvc")));
     RepaintChrome(hwnd);   // masks may have been repaired, so the stat row may have moved
 }
@@ -5781,6 +5794,22 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 hwnd, L"BUTTON",
                 L"Show the AMD 3D V-Cache warning at startup",
                 BS_AUTOCHECKBOX | WS_TABSTOP, IDC_VCACHE_WARN);
+            // v0.5.8. The caption says what it does and nothing else: Windows' per-application GPU
+            // preference decides which GPU an application DRAWS on, and NVIDIA keeps which GPU its
+            // CUDA work may use in its own settings. With this off, Apply touches only the first and
+            // says nothing about the second.
+            // 🔴 AND IT SAYS "ALSO SET", NOT "ALWAYS SET", WHICH IS THE TRUTH AFTER FOUNDER DECISION 22
+            // (E1): Game Optimizer only sets CUDA through a settings entry it made itself, so a program
+            // NVIDIA already keeps its own entry for - Chrome, Edge, Claude - is left to NVIDIA Control
+            // Panel. Apply's own question says that in full, where the user is about to act on it.
+            // 🔴 IT GATES APPLY'S WRITES ONLY, AND REMOVE'S UNDO IS DELIBERATELY NOT GATED (Council
+            // round 1, F7): a switch that can turn a change on but not off is a trap. Remove assignment
+            // always puts back what this product wrote, and its own question says so when the box is
+            // clear.
+            st->hCudaGpu = Mk(
+                hwnd, L"BUTTON",
+                L"Also set which GPU CUDA uses",
+                BS_AUTOCHECKBOX | WS_TABSTOP, IDC_CUDA_GPU);
             // No description STATIC under the stop checkbox - the operator removed the paragraph,
             // and the control went with it so the layout closes up instead of leaving a gap.
             // The restore control is a safety net for users who used the old disable feature.
@@ -5894,7 +5923,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // are now ours - see CheckBoxProc for why this is a subclass and not
                 // BS_OWNERDRAW, which would destroy BM_GETCHECK on these controls.
                 HWND checks[] = { st->hEnabled, st->hAutoPin, st->hExtreme, st->hStartup,
-                                  st->hNotify, st->hVCacheManage, st->hVCacheWarn };
+                                  st->hNotify, st->hVCacheManage, st->hVCacheWarn, st->hCudaGpu };
                 for (HWND h : checks) {
                     UseClassicChrome(h);
                     if (h) SetWindowSubclass(h, CheckBoxProc, kCheckSubclassId, 0);
@@ -5907,6 +5936,7 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetChecked(st->hStartup, st->work.startWithWindows);
             SetChecked(st->hNotify, st->work.notifications);
             SetChecked(st->hVCacheWarn, st->work.showVCacheWarning);
+            SetChecked(st->hCudaGpu, st->work.setCudaGpu);
             SetChecked(st->hVCacheManage, cd::VCacheStopBoxChecked(ReadServiceStartValue(L"amd3dvcacheSvc")));
             SetWindowTextW(st->hPoll, std::to_wstring(st->work.pollMs).c_str());
 

@@ -111,6 +111,16 @@ struct Config {
     std::wstring gameGpu;            // global default adapter key for game GPU (empty = not set)
     std::wstring backgroundGpu;      // global default adapter key for background GPU (empty = not set)
 
+    // GPU Assignment also tells NVIDIA which GPU CUDA may use for that application (v0.5.8). ON by
+    // default: an application moved to another GPU whose CUDA work stays on the game's card has not
+    // really been moved, which is the whole point of the feature. It changes no registry value of its
+    // own - it only decides whether APPLY also touches NVIDIA's driver profile, and with it off nothing
+    // CUDA-related happens on an Apply and nothing about it is said.
+    // 🔴 IT DOES NOT GATE REMOVE (Council round 1, F7). Remove assignment always puts back what this
+    // product wrote, because a switch that can turn a change on but not off is a trap - clearing this
+    // box would otherwise make every CUDA change already made permanent.
+    bool setCudaGpu = true;
+
     // Verbatim lines from sections/keys this version did not recognise. Key is the
     // section name; value is the raw "key=value" lines. Re-emitted on save.
     std::map<std::wstring, std::vector<std::wstring>> unknown;
