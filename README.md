@@ -90,7 +90,7 @@ These are examples, not a compatibility list — the app reads your machine's to
 - Core i9-13900K, i7-13700K, i5-13600K — Raptor Lake
 - Core i9-12900K, i7-12700K, i5-12600K — Alder Lake
 
-🔴 **Trap — a hybrid generation is not a hybrid CPU.** Plenty of 12th–14th gen parts ship with zero E-cores and land in the single cache domain row instead: i5-12400, i3-12100, i3-12300, i3-13100, i3-14100, Pentium Gold G7400, Celeron G6900. Generation name tells you nothing.
+ a hybrid generation is not a hybrid CPU.** Plenty of 12th–14th gen parts ship with zero E-cores and land in the single cache domain row instead: i5-12400, i3-12100, i3-12300, i3-13100, i3-14100, Pentium Gold G7400, Celeron G6900. Generation name tells you nothing.
 
 **AMD asymmetric cache (X3D)**
 - Ryzen 9 9950X3D — measured directly on a 9950X3D: 96 MB of L3 on one chiplet, 32 MB on the other
@@ -99,9 +99,9 @@ These are examples, not a compatibility list — the app reads your machine's to
 
 Two chiplets, 3D V-Cache stacked on one of them. This is the layout the app exists for.
 
-🔴 **Trap — most X3D parts are not in this row.** Single-chiplet X3D CPUs have one cache domain and nothing to steer between: 9800X3D, 9850X3D, 7800X3D, 5800X3D, 5700X3D, 5600X3D. The X3D name says cache, not asymmetry.
+ — most X3D parts are not in this row.** Single-chiplet X3D CPUs have one cache domain and nothing to steer between: 9800X3D, 9850X3D, 7800X3D, 5800X3D, 5700X3D, 5600X3D. The X3D name says cache, not asymmetry.
 
-🔴 **Trap — the 9950X3D2 Dual Edition is not here either.** V-Cache sits under both chiplets, 96 MB each, so it is Multi-CCD symmetric.
+ — the 9950X3D2 Dual Edition is not here either.** V-Cache sits under both chiplets, 96 MB each, so it is Multi-CCD symmetric.
 
 **Multi-CCD symmetric**
 - Ryzen 9 9950X, 9900X, PRO 9965, PRO 9955, PRO 9945
