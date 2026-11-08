@@ -21,6 +21,11 @@
         }
     }
 
+    function syncActive(plate) {
+        if (hovered || focused) plate.classList.add('is-active');
+        else plate.classList.remove('is-active');
+    }
+
     function adaptPanel(root) {
         var panels = [];
         if (root.classList && root.classList.contains('goat--panel')) panels.push(root);
@@ -37,22 +42,24 @@
         if (!plate) return;
         plate.addEventListener('pointerenter', function () {
             hovered = true;
+            syncActive(plate);
             postPointer(true);
         });
         plate.addEventListener('pointerleave', function () {
             hovered = false;
+            syncActive(plate);
             postPointer(false);
             flushPending();
         });
         plate.addEventListener('focusin', function () {
             focused = true;
-            plate.classList.add('is-active');
+            syncActive(plate);
             postFocus(true);
         });
         plate.addEventListener('focusout', function (event) {
             if (event.relatedTarget && plate.contains(event.relatedTarget)) return;
             focused = false;
-            plate.classList.remove('is-active');
+            syncActive(plate);
             postFocus(false);
             flushPending();
         });

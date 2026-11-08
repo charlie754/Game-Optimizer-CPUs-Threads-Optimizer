@@ -184,6 +184,13 @@ RECT ScaleRectAboutCenter(const RECT& source, double scale) {
              static_cast<LONG>(std::ceil(cy + h / 2.0)) };
 }
 
+POINT ScalePointAboutCenter(const POINT& source, const RECT& box, double scale) {
+    const double cx = (box.left + box.right) / 2.0;
+    const double cy = (box.top + box.bottom) / 2.0;
+    return { RoundI(cx + (source.x - cx) * scale),
+             RoundI(cy + (source.y - cy) * scale) };
+}
+
 inline BYTE Chan(double v) {
     const int i = RoundI(v);
     return static_cast<BYTE>(i < 0 ? 0 : (i > 255 ? 255 : i));
@@ -267,9 +274,9 @@ inline int Sc(int logical) { return IMax(1, RoundI(logical * kStripScale)); }
 // the harness's 96..480 sweep).
 // ---------------------------------------------------------------------------
 constexpr int    kPlateH      = 84;    // 74px QR + 4px edge margin on each side
-constexpr int    kPlateW      = 400;
+constexpr int    kPlateW      = 288;   // the old goat-group slot: 136 + 10 + 288 = 434px
 constexpr int    kPlateRadius = 10;    // border-radius: 10px
-constexpr int    kGroupGap    = 16;    // Star -> the headline
+constexpr int    kGroupGap    = 8;     // the 0.5.9 row gap after the Star control
 constexpr int    kCopyGap     = 10;    // .goat--strip { gap: 10px }: headline -> plate
 constexpr double kCopyPx      = 10.5;  // .goat__line { font-size: 10.5px; line-height: 1.4 }
 constexpr double kCopyLineH   = 1.4;
@@ -280,15 +287,21 @@ constexpr double kNamePx      = 18.0;  // --gc-name, line-height 1
 constexpr double kTagPx       = 8.0;
 constexpr double kTagLineH    = 1.25;
 constexpr double kTagTrackEm  = 0.14;
+// The signed strip follows the WebView's compact online override: a 6px native equivalent
+// (the WebView stage is scaled in the host row) with .04em tracking.
+// Keep the legacy fallback's more generous tracking independent so the live rows do not
+// ellipsize merely because the native renderer used the fallback's micro-caps treatment.
+constexpr double kOnlineTagPx      = 6.0;
+constexpr double kOnlineTagTrackEm = 0.04;
 constexpr int    kWordGap     = 3;     // the wordmark -> the tagline
 constexpr int    kQrSide      = 74;    // 37 modules x 2 px at 96 dpi (web --gc-qr: 72 css px)
-constexpr int    kQrPadR      = 11;    // keep the QR inside the closing viewfinder bracket
+constexpr int    kQrPadR      = 28;    // keep the QR clear of the closing right bracket
 constexpr int    kQrRadius    = 8;     // --gc-qr-r: 8px
 constexpr int    kQrGap       = 8;     // the wordmark and the viewfinder stop this far from the QR
 constexpr int    kVfIn        = 5;     // --gc-vf-in: 5px
 constexpr int    kVfArm       = 8;     // --gc-arm: 8px
 constexpr int    kVfBar       = 2;     // border: 2px
-constexpr int    kVfLock      = 3;     // the hover tightens the viewfinder by 3px
+constexpr int    kVfLock      = 3;     // the web hover inset, applied on all four sides
 constexpr double kOsdPx       = 6.5;   // .gc-osd { font: 500 6.5px/1 mono }
 constexpr double kScrimA      = 0.82;  // the wordmark scrim's peak opacity (--gc-950)
 
@@ -323,6 +336,12 @@ const wchar_t* const kGoatTag  = L"IPHONE APP \u00b7 ON THE APP STORE";
 const wchar_t* const kGoatTag1 = L"IPHONE APP";         // the same tagline on two lines, when
 const wchar_t* const kGoatTag2 = L"ON THE APP STORE";   // one line would reach the QR
 const wchar_t* const kOsd      = L"1080p \u00b7 60 fps";
+
+void DaGoatCopyLines(std::wstring (&lines)[3]) {
+    lines[0] = kDaGoatCopy1;
+    lines[1] = kDaGoatCopy2;
+    lines[2].clear();
+}
 
 // The signed banner's QR is always 37 x 37. Its rows are part of the verified model; the
 // built-in DaGoat strip intentionally has no QR and never consults the old compiled-in asset.
@@ -430,22 +449,25 @@ struct FontSet {
     HFONT labelReg = nullptr;   // the GitHub label, weight 400
     HFONT copy     = nullptr;   // .goat__line, weight 500
     HFONT now      = nullptr;   // .goat__line em - the site h1's gold italic serif NOW
+    HFONT onlineNow = nullptr;  // signed tagline em - the online tag's relative gold italic NOW
     HFONT name     = nullptr;   // "GOAT Cam" in --gc-serif, weight 400, not uppercase
     HFONT tag      = nullptr;   // the tagline, tracked micro-caps, weight 600
+    HFONT onlineTag = nullptr;  // signed tagline; may shrink to fit the narrow GDI plate
     HFONT oldName  = nullptr;   // 71ea5ed Goatproject lockup, sans 300
     HFONT oldTag   = nullptr;   // 71ea5ed People’s Compute Commons, sans 500
     HFONT osd      = nullptr;   // the viewfinder readout, mono 500
 
     int dpi = 0;
     int labelPx = 0, labelH = 0;
-    int namePx = 0, tagPx = 0, oldNamePx = 0, oldTagPx = 0, osdPx = 0;
-    TEXTMETRICW copyTm{}, nameTm{}, tagTm{}, oldNameTm{}, oldTagTm{}, osdTm{};
+    int namePx = 0, tagPx = 0, onlineTagPx = 0, oldNamePx = 0, oldTagPx = 0, osdPx = 0;
+    TEXTMETRICW copyTm{}, nameTm{}, tagTm{}, onlineTagTm{}, oldNameTm{}, oldTagTm{}, osdTm{};
 
     FontSet() {}
     ~FontSet() { Destroy(); }
 
     void Destroy() {
-        HFONT* all[9] = { &label, &labelReg, &copy, &now, &name, &tag, &oldName, &oldTag, &osd };
+        HFONT* all[11] = { &label, &labelReg, &copy, &now, &onlineNow, &name, &tag, &onlineTag,
+                           &oldName, &oldTag, &osd };
         for (HFONT* f : all) {
             if (*f != nullptr) DeleteObject(*f);
             *f = nullptr;
@@ -463,10 +485,13 @@ struct FontSet {
 
         copy = MakeSans(Px(kCopyPx, d), FW_MEDIUM);
         now  = MakeSerif(Px(kCopyPx * kNowEm, d), FW_BOLD, true);
+        onlineNow = MakeSerif(Px(kOnlineTagPx * kNowEm, d), FW_BOLD, true);
         namePx = Px(kNamePx, d);
         name   = MakeSerif(namePx, FW_NORMAL, false);
         tagPx  = Px(kTagPx, d);
         tag    = MakeSans(tagPx, FW_SEMIBOLD);
+        onlineTagPx = Px(kOnlineTagPx, d);
+        onlineTag = MakeSans(onlineTagPx, FW_SEMIBOLD);
         oldName = MakeSans(IMax(theme::Dp(20, d), Px(7.6, d)), FW_LIGHT);
         oldTag  = MakeSans(IMax(theme::Dp(10, d), Px(3.3, d)), FW_MEDIUM);
         osdPx  = Px(kOsdPx, d);
@@ -475,12 +500,24 @@ struct FontSet {
         copyTm = Metrics(copy);
         nameTm = Metrics(name);
         tagTm  = Metrics(tag);
+        onlineTagTm = Metrics(onlineTag);
         oldNamePx = IMax(theme::Dp(20, d), Px(7.6, d));
         oldTagPx = IMax(theme::Dp(10, d), Px(3.3, d));
         oldNameTm = Metrics(oldName);
         oldTagTm = Metrics(oldTag);
         osdTm  = Metrics(osd);
         dpi = d;
+    }
+
+    void SetOnlineTagPx(int px) {
+        px = IMax(1, px);
+        if (onlineTag != nullptr && onlineNow != nullptr && onlineTagPx == px) return;
+        if (onlineTag != nullptr) DeleteObject(onlineTag);
+        if (onlineNow != nullptr) DeleteObject(onlineNow);
+        onlineTag = MakeSans(px, FW_SEMIBOLD);
+        onlineNow = MakeSerif(IMax(1, RoundI(px * kNowEm)), FW_BOLD, true);
+        onlineTagPx = px;
+        onlineTagTm = Metrics(onlineTag);
     }
 
 private:
@@ -1089,7 +1126,8 @@ struct Layout {
     // GOAT Cam
     int   goatLeft = 0, goatRight = 0;   // the whole item, headline + plate
     int   copyX = 0;
-    int   copyBase[2] = {};              // the headline's two baselines
+    int   copyBase[3] = {};              // the headline/fallback caption baselines
+    int   copyLines = 2;
     int   nowW = 0;                      // "NOW", which opens line 2
     int   plateRadius = 0;
     RECT  goatMark{};                    // restored 71ea5ed mark box
@@ -1110,6 +1148,7 @@ struct Layout {
     RECT  scrim{};                       // the local gradient behind it
     RECT  wordmark{};
     RECT  tagline[2]{};
+    std::wstring tagText[2];
     int   tagBaseline[2]{};
     int   tagEmBaseline[2]{};
     bool  taglineHasEm[2]{};
@@ -1178,7 +1217,47 @@ inline int CellTop(int boxTop, int boxH, int tmHeight) {
     return boxTop + (boxH - tmHeight) / 2;
 }
 
-void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout& L,
+int TaglineWidth(HDC dc, const std::wstring& text, const ob::Banner& banner,
+                 HFONT tagFont, HFONT emphasisFont, int track) {
+    if (text.empty()) return 0;
+    if (!banner.hasHeadlineEm || banner.headlineEm.empty())
+        return TextWidth(dc, tagFont, text, track);
+
+    int width = 0;
+    size_t at = 0;
+    for (;;) {
+        const size_t hit = text.find(banner.headlineEm, at);
+        if (hit == std::wstring::npos) {
+            width += TextWidth(dc, tagFont, text.substr(at), track);
+            return width;
+        }
+        width += TextWidth(dc, tagFont, text.substr(at, hit - at), track);
+        width += TextWidth(dc, emphasisFont, banner.headlineEm, 0);
+        at = hit + banner.headlineEm.size();
+    }
+}
+
+std::wstring FitTagline(HDC dc, const std::wstring& text, const ob::Banner& banner,
+                        HFONT tagFont, HFONT emphasisFont, int track, int maxWidth) {
+    if (maxWidth <= 0) return {};
+    if (TaglineWidth(dc, text, banner, tagFont, emphasisFont, track) <= maxWidth) return text;
+
+    const std::wstring ellipsis = L"\u2026";
+    if (TaglineWidth(dc, ellipsis, banner, tagFont, emphasisFont, track) > maxWidth)
+        return {};
+
+    std::wstring fitted;
+    fitted.reserve(text.size());
+    for (wchar_t ch : text) {
+        const std::wstring candidate = fitted + ch + ellipsis;
+        if (TaglineWidth(dc, candidate, banner, tagFont, emphasisFont, track) > maxWidth)
+            break;
+        fitted.push_back(ch);
+    }
+    return fitted + ellipsis;
+}
+
+void ComputeLayout(HDC dc, int dpi, const RECT& client, FontSet& F, Layout& L,
                    const ob::Model* current) {
     using theme::Dp;
 
@@ -1191,11 +1270,15 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
     const int kofiNatural = kofiPadY * 2 + kofiLineH * 2;
 
     L.btnH   = IMax(kofiNatural, Dp(kBtnMarkH, dpi) + Dp(Sc(6), dpi));
-    const int plateH = Dp(kPlateH, dpi);
-    L.stripH = IMax(plateH, L.btnH);
+    // The 0.5.9 row is the compatibility boundary. The new plate must live inside that
+    // same slot; it may not make the control taller just because its artwork is richer.
+    L.stripH = L.btnH;
+    const int plateH = std::min(Dp(kPlateH, dpi), L.stripH);
 
     const int top    = client.top + IMax(0, ((client.bottom - client.top) - L.stripH) / 2);
-    const int btnTop = top + (L.stripH - L.btnH) / 2;
+    // The two fixed controls keep the 0.5.9 y-origin even though the replacement plate is
+    // taller for the QR-safe banner. Their exact x/y/size is a compatibility boundary.
+    const int btnTop = top;
     const int gap    = Dp(Sc(theme::metric::kGap), dpi);
     int x = client.left;
 
@@ -1263,6 +1346,10 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         // GDI's text cell carries more leading below the glyphs than the CSS line box does. Lift
         // the two rendered lines by the measured leading so their ink, rather than their cell,
         // is centred on the strip with the buttons and plate.
+        std::wstring fallbackCopy[3];
+        DaGoatCopyLines(fallbackCopy);
+        const int fallbackLines = 2;
+        const int blockH = lineH * fallbackLines;
         const int blockT = mid - lineH - Dp(6, dpi);
         const int base = (lineH - static_cast<int>(F.copyTm.tmHeight)) / 2 + static_cast<int>(F.copyTm.tmAscent);
         L.copyBase[0] = blockT + base;
@@ -1271,8 +1358,9 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         L.nowW = TextWidth(dc, F.now, kCopyNow, 0);
         const int onlineCopyW = IMax(TextWidth(dc, F.copy, kCopy1, 0),
                                      L.nowW + TextWidth(dc, F.copy, kCopy2, 0));
-        const int fallbackCopyW = IMax(TextWidth(dc, F.copy, kDaGoatCopy1, 0),
-                                       TextWidth(dc, F.copy, kDaGoatCopy2, 0));
+        const int fallbackCopyW = IMax(TextWidth(dc, F.copy, fallbackCopy[0], 0),
+                                       IMax(TextWidth(dc, F.copy, fallbackCopy[1], 0),
+                                            TextWidth(dc, F.copy, fallbackCopy[2], 0)));
         int copyW = onlineCopyW;
         if (current != nullptr && current->online && !current->banner.headline.empty()) {
             auto headlineWidth = [&](const std::wstring& line) {
@@ -1297,9 +1385,19 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
             copyW = fallbackCopyW;
         }
         L.copyX = x;
-        L.fallbackCopy = { L.copyX, blockT, L.copyX + fallbackCopyW, blockT + lineH * 2 };
-        L.copy = L.fallbackCopy;
-        x += copyW + Dp(kCopyGap, dpi);
+        L.copyLines = (current == nullptr || !current->online) ? fallbackLines : 2;
+        const int copyH = lineH * L.copyLines;
+        L.fallbackCopy = { L.copyX, blockT, L.copyX + fallbackCopyW, blockT + copyH };
+        L.copy = { L.copyX, blockT, L.copyX + copyW, blockT + copyH };
+        if (L.copyLines == fallbackLines) {
+            // Leave a measured, DPI-scaled breathing space after Star before the long caption.
+            L.copyX += Dp(12, dpi);
+            L.fallbackCopy.left = L.copyX;
+            L.fallbackCopy.right = L.copyX + fallbackCopyW;
+            L.copy.left = L.copyX;
+            L.copy.right = L.copyX + copyW;
+        }
+        x = L.copy.right + Dp(kCopyGap, dpi);
     }
 
     // ---- GOAT Cam: the plate ----------------------------------------------
@@ -1318,14 +1416,21 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         L.btn[2].right = plateL + plateW;
         L.btn[2].bottom = plateT + plateH;
         L.goatRight = L.btn[2].right;
+        if (onlineLayout) {
+            L.copy.right = plateL - Dp(kCopyGap, dpi);
+        }
 
         // The QR tile: an INTEGER module size, never resampled. The tile grows with the dpi and
         // any slack between it and the code is extra quiet zone, never a fractional module.
         const int inner = plateH - 2;
-        const int side  = std::min(Dp(kQrSide, dpi), inner);
-        L.module = IMax(2, side / kQrN);
+        // The old native row is only 45 device px at 96 dpi. Two device pixels of quiet
+        // margin still leave the complete 37-module code inside the compact plate.
+        const int qrMargin = Dp(6, dpi);
+        const int maxTileSide = IMax(kQrN, inner - qrMargin * 2);
+        const int side  = std::min(Dp(kQrSide, dpi), maxTileSide);
+        L.module = IMax(1, side / kQrN);
         const int qr = L.module * kQrN;
-        const int tileSide = IMax(side, qr);
+        const int tileSide = std::min(IMax(side, qr), maxTileSide);
         const int tileR = L.btn[2].right - 1 - Dp(kQrPadR, dpi);
         const int tileT = plateT + (plateH - tileSide) / 2;
         L.tile.left = tileR - tileSide;     L.tile.top = tileT;
@@ -1354,30 +1459,73 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         L.cup.bottom = static_cast<LONG>(std::ceil(L.photoY + kSrcCupB * s));
 
         // The wordmark: over the laptop's dark screen, centred in what of it the band shows.
-        L.tagTrack = IMax(1, RoundI(kTagTrackEm * F.tagPx));
         const bool online = current != nullptr && current->online;
         const std::wstring wordmark = online && !current->banner.wordmark.empty()
                                           ? current->banner.wordmark : kGoatName;
         std::wstring tags[2] = { kGoatTag1, kGoatTag2 };
+        int tagCount = 2;
         if (online) {
-            for (size_t i = 0; i < current->banner.tagline.size() && i < 2; ++i)
-                tags[i] = current->banner.tagline[i];
-            if (current->banner.tagline.empty()) tags[0] = kGoatTag;
+            tagCount = current->banner.tagline.empty()
+                           ? 1 : std::min(2, static_cast<int>(current->banner.tagline.size()));
+            for (int i = 0; i < tagCount; ++i) {
+                tags[i] = current->banner.tagline.empty() ? kGoatTag
+                                                           : current->banner.tagline[i];
+            }
         }
         const int nameW = TextWidth(dc, F.name, wordmark, 0);
-        const int tagW0 = TextWidth(dc, F.tag, tags[0], L.tagTrack);
-        const int tagW1 = TextWidth(dc, F.tag, tags[1], L.tagTrack);
-        const int tagW  = online && current->banner.tagline.size() > 1 ? IMax(tagW0, tagW1) : tagW0;
-        const int tagW2 = IMax(tagW0, tagW1);
         int textX = RoundI(plateL + (kSrcScreenL + kSrcTextInset) * s);
         // One line only if it ENDS ON THE SCREEN: past the screen's right edge it would sit on the
         // bright hinge and the wood. [M] The first render put "...STORE" there, half lost.
         const int screenR = RoundI(plateL + kSrcScreenR * s) - Dp(4, dpi);
-        L.tagLines = online ? (current->banner.tagline.size() > 1 ? 2 : 1)
-                            : ((textX + tagW <= std::min(stopX, screenR)) ? 1 : 2);
+        const int phoneGap = Dp(6, dpi);
+        const int phoneW = Dp(28, dpi);
+        const int phoneH = Dp(60, dpi);
+        const int phoneReserve = phoneW + 2 * phoneGap;
+        const int phoneTextRight = L.tile.left - phoneReserve;
+        if (online) textX -= Dp(6, dpi);
+        HFONT tagFont = online && F.onlineTag != nullptr ? F.onlineTag : F.tag;
+        HFONT emphasisFont = online && F.onlineNow != nullptr ? F.onlineNow : F.now;
+        const ob::Banner emptyBanner{};
+        const ob::Banner& banner = online ? current->banner : emptyBanner;
+        int tagW0 = 0, tagW1 = 0;
+        if (online) {
+            // Keep a real phone column. Shrink the signed tagline to the available width first;
+            // only the final floor uses an ellipsis, so ordinary live revisions stay readable.
+            const int maxTagWidth = IMax(1, phoneTextRight - textX);
+            const int minTagPx = IMax(1, Px(6.0, dpi));
+            for (int px = F.onlineTagPx; px >= minTagPx; --px) {
+                F.SetOnlineTagPx(px);
+                tagFont = F.onlineTag != nullptr ? F.onlineTag : F.tag;
+                emphasisFont = F.onlineNow != nullptr ? F.onlineNow : F.now;
+                L.tagTrack = IMax(0, RoundI(kOnlineTagTrackEm * F.onlineTagPx));
+                tagW0 = TaglineWidth(dc, tags[0], banner, tagFont, emphasisFont, L.tagTrack);
+                tagW1 = tagCount > 1
+                            ? TaglineWidth(dc, tags[1], banner, tagFont, emphasisFont, L.tagTrack) : 0;
+                if (IMax(tagW0, tagW1) <= maxTagWidth || px == minTagPx) break;
+            }
+            for (int i = 0; i < tagCount; ++i) {
+                tags[i] = FitTagline(dc, tags[i], banner, tagFont, emphasisFont, L.tagTrack,
+                                     maxTagWidth);
+            }
+            tagW0 = TaglineWidth(dc, tags[0], banner, tagFont, emphasisFont, L.tagTrack);
+            tagW1 = tagCount > 1
+                        ? TaglineWidth(dc, tags[1], banner, tagFont, emphasisFont, L.tagTrack) : 0;
+            L.tagLines = tagCount;
+        } else {
+            L.tagTrack = IMax(1, RoundI(kTagTrackEm * F.tagPx));
+            tagW0 = TextWidth(dc, F.tag, tags[0], L.tagTrack);
+            tagW1 = TextWidth(dc, F.tag, tags[1], L.tagTrack);
+            L.tagLines = (textX + tagW0 <= std::min(stopX, screenR)) ? 1 : 2;
+        }
+        L.tagText[0] = tags[0];
+        L.tagText[1] = tagCount > 1 ? tags[1] : std::wstring();
+        const int tagW  = L.tagLines == 1 ? tagW0 : IMax(tagW0, tagW1);
+        const int tagW2 = IMax(tagW0, tagW1);
         const int wordW = IMax(nameW, L.tagLines == 1 ? tagW : tagW2);
         if (textX + wordW > stopX) textX = stopX - wordW;   // never into the QR
-        const int tagLineH = IMax(1, RoundI(kTagLineH * F.tagPx));
+        if (online && textX + wordW > phoneTextRight) textX = phoneTextRight - wordW;
+        const int tagLineH = IMax(1, RoundI(kTagLineH * (online ? F.onlineTagPx : F.tagPx)));
+        const TEXTMETRICW& tagTm = online && F.onlineTag != nullptr ? F.onlineTagTm : F.tagTm;
         const int wordGap  = Dp(kWordGap, dpi);
         const int blockH   = F.namePx + wordGap + L.tagLines * tagLineH;
         const int screenB  = std::min(static_cast<int>(L.btn[2].bottom) - 1, RoundI(L.photoY + kSrcScreenB * s));
@@ -1389,14 +1537,20 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         L.namePt.x = textX;
         L.namePt.y = CellTop(blockT, F.namePx, static_cast<int>(F.nameTm.tmHeight));
         for (int i = 0; i < 2; ++i) {
+            if (i >= L.tagLines) {
+                L.tagline[i] = {};
+                L.tagBaseline[i] = 0;
+                L.tagEmBaseline[i] = 0;
+                L.taglineHasEm[i] = false;
+                continue;
+            }
             const int tagTop = blockT + F.namePx + wordGap + i * tagLineH;
             L.tagPt[i].x = textX;
-            L.tagPt[i].y = CellTop(tagTop, tagLineH,
-                                   static_cast<int>(F.tagTm.tmHeight));
+            L.tagPt[i].y = CellTop(tagTop, tagLineH, static_cast<int>(tagTm.tmHeight));
             const int width = (i == 0) ? tagW0 : tagW1;
             L.tagline[i] = { textX, tagTop, textX + width, tagTop + tagLineH };
-            L.tagBaseline[i] = tagTop + (tagLineH - static_cast<int>(F.tagTm.tmHeight)) / 2 +
-                               static_cast<int>(F.tagTm.tmAscent);
+            L.tagBaseline[i] = tagTop + (tagLineH - static_cast<int>(tagTm.tmHeight)) / 2 +
+                               static_cast<int>(tagTm.tmAscent);
             L.taglineHasEm[i] = online && current->banner.hasHeadlineEm &&
                                 !current->banner.headlineEm.empty() &&
                                 tags[i].find(current->banner.headlineEm) != std::wstring::npos;
@@ -1412,23 +1566,26 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         L.vf.right = L.btn[2].right - 1;
         L.vf.bottom = plateT + plateH - 1;
         L.stage = L.vf;
+        // Leave a real rest margin so the 1.05 hover growth is visible and remains inside the
+        // plate instead of being clipped back to the same box by the capture seam.
+        InflateRect(&L.stage, -Dp(8, dpi), -Dp(5, dpi));
 
-        // The renderer's fixed preview is 60x128. Keep its device-pixel box explicit so the
+        // The web strip's fixed preview is 28x60. Keep its device-pixel box explicit so the
         // capture gate can prove the text/phone and phone/QR clearances at 100/150/200%.
-        const double phoneW = 60.0;
-        const double phoneH = 128.0;
-        const double phoneGap = static_cast<double>(theme::Dp(6, dpi));
-        const double phoneLeft = static_cast<double>(L.text.right) + phoneGap;
-        const double phoneRight = static_cast<double>(L.tile.left) - phoneGap;
-        const double phoneTop = static_cast<double>(L.vf.top) + phoneGap;
-        const double phoneBottom = static_cast<double>(L.vf.bottom) - phoneGap;
+        const double phoneWf = static_cast<double>(phoneW);
+        const double phoneHf = static_cast<double>(phoneH);
+        const double phoneGapf = static_cast<double>(phoneGap);
+        const double phoneLeft = static_cast<double>(L.text.right) + phoneGapf;
+        const double phoneRight = static_cast<double>(L.tile.left) - phoneGapf;
+        const double phoneTop = static_cast<double>(L.vf.top) + phoneGapf;
+        const double phoneBottom = static_cast<double>(L.vf.bottom) - phoneGapf;
         L.iphone = {};
         if (phoneRight > phoneLeft && phoneBottom > phoneTop) {
-            const double phoneScale = std::min((phoneRight - phoneLeft) / phoneW,
-                                               (phoneBottom - phoneTop) / phoneH);
+            const double phoneScale = std::min((phoneRight - phoneLeft) / phoneWf,
+                                               (phoneBottom - phoneTop) / phoneHf);
             if (phoneScale > 0.0) {
-                const double pw = phoneW * phoneScale;
-                const double ph = phoneH * phoneScale;
+                const double pw = phoneWf * phoneScale;
+                const double ph = phoneHf * phoneScale;
                 const double px = phoneLeft + (phoneRight - phoneLeft - pw) / 2.0;
                 const double py = phoneTop + (phoneBottom - phoneTop - ph) / 2.0;
                 L.iphone = { static_cast<LONG>(std::ceil(px)), static_cast<LONG>(std::ceil(py)),
@@ -1457,6 +1614,11 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         L.fallbackTagPt = { L.fallbackNamePt.x,
                             CellTop(cy - colH / 2 + F.oldNamePx + colGap, F.oldTagPx,
                                     static_cast<int>(F.oldTagTm.tmHeight)) };
+        const int tagMaxW = IMax(1, L.btn[2].right - Dp(4, dpi) - L.fallbackTagPt.x);
+        while (L.fallbackTagTrack > 0 &&
+               TextWidth(dc, F.oldTag, kDaGoatTag, L.fallbackTagTrack) > tagMaxW) {
+            --L.fallbackTagTrack;
+        }
         L.fallbackWordmark = { L.fallbackNamePt.x, L.fallbackNamePt.y,
                                L.fallbackNamePt.x +
                                    TextWidth(dc, F.oldName, kDaGoatName, L.fallbackNameTrack),
@@ -1470,7 +1632,9 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
     // ---- the viewfinder and its OSD readout --------------------------------
     {
         L.vfIn   = Dp(kVfIn, dpi);
-        L.vfLock = Dp(kVfLock, dpi);
+        // Floor the fractional device pixel: the logical 3px web inset must stay small enough
+        // to leave the four brackets separated in the compact 0.5.9-height row.
+        L.vfLock = IMax(1, (kVfLock * dpi) / 96);
         L.vfArm  = Dp(kVfArm, dpi);
         L.vfBar  = IMax(1, Dp(kVfBar, dpi));
 
@@ -1487,7 +1651,7 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         const int pillW = padX + dot + gapX + tw + padX;
         const int pillH = padY + F.osdPx + padY;
         L.osdPill.left = L.vf.left + L.vfIn + L.vfArm + Dp(6, dpi);
-        L.osdPill.top  = L.btn[2].top + Dp(3, dpi);
+        L.osdPill.top  = L.btn[2].top + Dp(1, dpi);
         L.osdPill.right  = L.osdPill.left + pillW;
         L.osdPill.bottom = L.osdPill.top + pillH;
         L.osdDot.left = L.osdPill.left + padX;
@@ -1497,11 +1661,24 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, const FontSet& F, Layout
         L.osdText.x = L.osdDot.right + gapX;
         L.osdText.y = CellTop(L.osdPill.top + padY, F.osdPx, static_cast<int>(F.osdTm.tmHeight));
         RECT hit;
-        L.badge = L.osdPill;
+        // A signed badge is optional art. In the 0.5.9-sized native slot the live wordmark can
+        // occupy the same top-left screen area; keep the badge out rather than drawing over it.
+        L.badge = {};
         L.osdOn = !IntersectRect(&hit, &L.osdPill, &L.text) &&
                   L.osdPill.left >= L.btn[2].left && L.osdPill.top >= L.btn[2].top &&
                   L.osdPill.right <= L.btn[2].right && L.osdPill.bottom <= L.btn[2].bottom;
+        if (L.osdOn) L.badge = L.osdPill;
     }
+}
+
+// The OSD is one fixed unit. The content stage grows about its own centre on hover, so test the
+// enlarged text block before painting either the pill/dot layer or the GDI text. A unit that no
+// longer fits is omitted as a whole; never leave its dot behind.
+bool BadgeFits(const Layout& L, double contentScale) {
+    if (!L.osdOn) return false;
+    const RECT content = ScaleRectAboutCenter(L.text, contentScale);
+    RECT overlap{};
+    return !IntersectRect(&overlap, &L.osdPill, &content);
 }
 
 // ===========================================================================
@@ -1909,7 +2086,7 @@ void PaintPlateGdiplus(SponsorState* st, BYTE* bits, int dpi, double now,
         // ---- the photo, edge to edge, pushed in about the cup on hover ----
         if (gp::Bitmap* img = Photo(model)) {
             const float iw = static_cast<float>(img->GetWidth()), ih = static_cast<float>(img->GetHeight());
-            const float k  = static_cast<float>(1.0 + sponsor_motion::kPushScale * push);
+            const float k  = static_cast<float>(1.0 + sponsor_motion::kStageScale * push);
             // The layout measured the photo in its 800-px source pixels; a different decode size
             // is rescaled here so the same source pixels still land in the same place.
             const float s  = L.photoS * static_cast<float>(kSrcW) / iw * k;
@@ -1931,10 +2108,12 @@ void PaintPlateGdiplus(SponsorState* st, BYTE* bits, int dpi, double now,
             const float ih = static_cast<float>(phone->GetHeight());
             if (L.iphone.right > L.iphone.left && L.iphone.bottom > L.iphone.top &&
                 iw > 0.0f && ih > 0.0f) {
-                const gp::RectF dst(static_cast<float>(L.iphone.left),
-                                    static_cast<float>(L.iphone.top),
-                                    static_cast<float>(L.iphone.right - L.iphone.left),
-                                    static_cast<float>(L.iphone.bottom - L.iphone.top));
+                const RECT phoneRect = ScaleRectAboutCenter(
+                    L.iphone, 1.0 + sponsor_motion::kStageScale * push);
+                const gp::RectF dst(static_cast<float>(phoneRect.left),
+                                    static_cast<float>(phoneRect.top),
+                                    static_cast<float>(phoneRect.right - phoneRect.left),
+                                    static_cast<float>(phoneRect.bottom - phoneRect.top));
                 g.DrawImage(phone, dst, 0.0f, 0.0f, iw, ih, gp::UnitPixel);
             }
         }
@@ -1964,9 +2143,7 @@ void PaintPlateGdiplus(SponsorState* st, BYTE* bits, int dpi, double now,
         if (model.banner.viewfinder) {
             g.SetSmoothingMode(gp::SmoothingModeNone);
             g.SetPixelOffsetMode(gp::PixelOffsetModeNone);
-            RECT stage = ScaleRectAboutCenter(L.stage, 1.0 + sponsor_motion::kStageScale * brk);
-            RECT clippedStage{};
-            if (IntersectRect(&clippedStage, &stage, &L.btn[2])) stage = clippedStage;
+            const RECT stage = L.vf;
             const int in = L.vfIn + RoundI(L.vfLock * brk);
             const int arm = L.vfArm, bw = L.vfBar;
             const int l = stage.left + in, t = stage.top + in;
@@ -1988,7 +2165,8 @@ void PaintPlateGdiplus(SponsorState* st, BYTE* bits, int dpi, double now,
             g.SetPixelOffsetMode(gp::PixelOffsetModeHalf);
             g.SetSmoothingMode(gp::SmoothingModeAntiAlias);
 
-            if (L.osdOn) {   // the pill and its gold dot; the dot does not pulse (the timer rule)
+            if (BadgeFits(L, 1.0 + sponsor_motion::kStageScale * push)) {
+                // The pill and its gold dot; the dot does not pulse (the timer rule).
                 gp::GraphicsPath pp;
                 AddRoundRect(pp, ToRectF(L.osdPill), static_cast<float>(theme::Dp(4, dpi)));
                 gp::SolidBrush pb(Gc(kEspresso950, 0.62));
@@ -2084,6 +2262,30 @@ void PaintPlateGdi(HDC dc, const SponsorState* st, int dpi, double now) {
         }
     }
     theme::FillRoundRect(dc, L.tile, theme::Dp(kQrRadius, dpi), Cr(kQrLight));
+
+    // GDI+ is optional. Keep the viewfinder geometry in the plain-GDI path too: the QR and
+    // text below are still useful without the photo, and the four brackets are the contract
+    // that tells the user the plate is a camera preview rather than a blank button.
+    const RECT stage = L.vf;
+    const int in = L.vfIn + RoundI(L.vfLock * st->goat.bracket.At(now));
+    const int l = stage.left + in, t = stage.top + in;
+    const int r = stage.right - in, b = stage.bottom - in;
+    HPEN pen = CreatePen(PS_SOLID, IMax(1, L.vfBar), Cr(st->goat.bracket.At(now) > 0.01 ?
+                                                         kGold : kCream));
+    if (pen != nullptr) {
+        {
+            SelectScope ps(dc, pen);
+            MoveToEx(dc, l, t, nullptr); LineTo(dc, l + L.vfArm, t);
+            MoveToEx(dc, l, t, nullptr); LineTo(dc, l, t + L.vfArm);
+            MoveToEx(dc, r, t, nullptr); LineTo(dc, r - L.vfArm, t);
+            MoveToEx(dc, r, t, nullptr); LineTo(dc, r, t + L.vfArm);
+            MoveToEx(dc, l, b, nullptr); LineTo(dc, l + L.vfArm, b);
+            MoveToEx(dc, l, b, nullptr); LineTo(dc, l, b - L.vfArm);
+            MoveToEx(dc, r, b, nullptr); LineTo(dc, r - L.vfArm, b);
+            MoveToEx(dc, r, b, nullptr); LineTo(dc, r, b - L.vfArm);
+        }
+        DeleteObject(pen);
+    }
 }
 
 void DrawHeadlinePart(HDC dc, int x, int baseline, const std::wstring& text,
@@ -2105,25 +2307,26 @@ void DrawHeadlinePart(HDC dc, int x, int baseline, const std::wstring& text,
 }
 
 void DrawTaglinePart(HDC dc, int x, int baseline, const std::wstring& text,
-                     const ob::Banner& banner, const FontSet& F, COLORREF colour, int track) {
+                     const ob::Banner& banner, const FontSet& F, HFONT tagFont,
+                     HFONT emphasisFont, COLORREF colour, int track) {
     if (text.empty()) return;
     const std::wstring& emphasis = banner.headlineEm;
     if (!banner.hasHeadlineEm || emphasis.empty()) {
-        DrawOnBaseline(dc, x, baseline, text, F.tag, colour, track);
+        DrawOnBaseline(dc, x, baseline, text, tagFont, colour, track);
         return;
     }
     std::size_t at = 0;
     for (;;) {
         const std::size_t hit = text.find(emphasis, at);
         if (hit == std::wstring::npos) {
-            DrawOnBaseline(dc, x, baseline, text.substr(at), F.tag, colour, track);
+            DrawOnBaseline(dc, x, baseline, text.substr(at), tagFont, colour, track);
             return;
         }
         const std::wstring before = text.substr(at, hit - at);
-        DrawOnBaseline(dc, x, baseline, before, F.tag, colour, track);
-        x += TextWidth(dc, F.tag, before, track);
-        DrawOnBaseline(dc, x, baseline, emphasis, F.now, Cr(kGold), 0);
-        x += TextWidth(dc, F.now, emphasis, 0);
+        DrawOnBaseline(dc, x, baseline, before, tagFont, colour, track);
+        x += TextWidth(dc, tagFont, before, track);
+        DrawOnBaseline(dc, x, baseline, emphasis, emphasisFont, Cr(kGold), 0);
+        x += TextWidth(dc, emphasisFont, emphasis, 0);
         at = hit + emphasis.size();
     }
 }
@@ -2143,8 +2346,18 @@ void PaintOnlineGoat(HDC dc, BYTE* bits, SponsorState* st, int dpi, double now,
         while (!line2.empty() && line2.front() == L' ') line2.erase(line2.begin());
     }
     if (line1.empty()) line1 = kCopy1;
-    DrawHeadlinePart(dc, L.copyX, L.copyBase[0], line1, model.banner, F);
-    DrawHeadlinePart(dc, L.copyX, L.copyBase[1], line2, model.banner, F);
+    const auto headlineWidth = [&](const std::wstring& text) {
+        if (!model.banner.hasHeadlineEm || model.banner.headlineEm.empty()) {
+            return TextWidth(dc, F.copy, text, 0);
+        }
+        const size_t em = text.find(model.banner.headlineEm);
+        if (em == std::wstring::npos) return TextWidth(dc, F.copy, text, 0);
+        return TextWidth(dc, F.copy, text.substr(0, em), 0) +
+               TextWidth(dc, F.now, model.banner.headlineEm, 0) +
+               TextWidth(dc, F.copy, text.substr(em + model.banner.headlineEm.size()), 0);
+    };
+    DrawHeadlinePart(dc, L.copy.right - headlineWidth(line1), L.copyBase[0], line1, model.banner, F);
+    DrawHeadlinePart(dc, L.copy.right - headlineWidth(line2), L.copyBase[1], line2, model.banner, F);
 
     // ---- 2. the plate's shapes and photo (GDI+, into the same bits) ----
     // EVERY GDI+ CALL IN THIS FILE IS BEHIND THIS ONE TEST: PaintPlateGdiplus and, through it,
@@ -2156,6 +2369,32 @@ void PaintOnlineGoat(HDC dc, BYTE* bits, SponsorState* st, int dpi, double now,
     } else {
         PaintPlateGdi(dc, st, dpi, now);
     }
+
+    // The badge is a fixed OSD unit beside the viewfinder. Draw its text before the content
+    // transform, matching the pill and dot painted above; BadgeFits made the same all-or-nothing
+    // decision for both layers.
+    if (rich && BadgeFits(L, 1.0 + sponsor_motion::kStageScale * st->goat.push.At(now))) {
+        const std::wstring badge = model.banner.hasBadge && !model.banner.badge.empty()
+                                       ? model.banner.badge : kOsd;
+        DrawWithFont(dc, L.osdText.x, L.osdText.y, badge, F.osd, Cr(kCream), 0);
+    }
+
+    // The remaining in-plate content is one transformable stage. Brackets were drawn by the
+    // plate painter before this point, so they remain crisp and move inward independently.
+    const int contentState = SaveDC(dc);
+    IntersectClipRect(dc, L.btn[2].left, L.btn[2].top, L.btn[2].right, L.btn[2].bottom);
+    const double contentScale = 1.0 + sponsor_motion::kStageScale * st->goat.push.At(now);
+    const double stageCx = (L.stage.left + L.stage.right) * 0.5;
+    const double stageCy = (L.stage.top + L.stage.bottom) * 0.5;
+    XFORM contentTransform;
+    contentTransform.eM11 = static_cast<FLOAT>(contentScale);
+    contentTransform.eM12 = 0.0f;
+    contentTransform.eM21 = 0.0f;
+    contentTransform.eM22 = static_cast<FLOAT>(contentScale);
+    contentTransform.eDx = static_cast<FLOAT>(stageCx - stageCx * contentScale);
+    contentTransform.eDy = static_cast<FLOAT>(stageCy - stageCy * contentScale);
+    SetGraphicsMode(dc, GM_ADVANCED);
+    SetWorldTransform(dc, &contentTransform);
 
     // The signed matrix includes its own quiet zone. Keep all 37x37 module samples on a solid
     // light field; the rounded plate/tile corner must not eat the outer quiet-zone modules.
@@ -2187,26 +2426,18 @@ void PaintOnlineGoat(HDC dc, BYTE* bits, SponsorState* st, int dpi, double now,
             DeleteObject(dark);
         }
     }
-    if (L.osdOn && rich) {  // the signed badge belongs at the photo's top-left
-        const std::wstring badge = model.banner.hasBadge && !model.banner.badge.empty()
-                                       ? model.banner.badge : kOsd;
-        DrawWithFont(dc, L.osdText.x, L.osdText.y, badge, F.osd, Cr(kCream), 0);
-    }
     const std::wstring wordmark = model.banner.wordmark.empty() ? kGoatName : model.banner.wordmark;
     DrawWithFont(dc, L.namePt.x, L.namePt.y, wordmark, F.name, Cr(kCream), 0);
     const COLORREF tagCol = Cr(Mix(kMuted, kCream, st->goat.tag.At(now)));
-    if (!model.banner.tagline.empty()) {
-        for (size_t i = 0; i < model.banner.tagline.size() && i < 2; ++i) {
-            DrawTaglinePart(dc, L.tagPt[i].x, L.tagBaseline[i], model.banner.tagline[i],
-                            model.banner, F, tagCol, L.tagTrack);
-        }
-    } else if (L.tagLines == 1) {
-        DrawWithFont(dc, L.tagPt[0].x, L.tagPt[0].y, kGoatTag, F.tag, tagCol, L.tagTrack);
-    } else {
-        DrawWithFont(dc, L.tagPt[0].x, L.tagPt[0].y, kGoatTag1, F.tag, tagCol, L.tagTrack);
-        DrawWithFont(dc, L.tagPt[1].x, L.tagPt[1].y, kGoatTag2, F.tag, tagCol, L.tagTrack);
+    const HFONT tagFont = F.onlineTag != nullptr ? F.onlineTag : F.tag;
+    const HFONT emphasisFont = F.onlineNow != nullptr ? F.onlineNow : F.now;
+    for (int i = 0; i < 2; ++i) {
+        if (L.tagText[i].empty()) continue;
+        DrawTaglinePart(dc, L.tagPt[i].x, L.tagBaseline[i], L.tagText[i],
+                        model.banner, F, tagFont, emphasisFont, tagCol, L.tagTrack);
     }
     GdiFlush();
+    if (contentState != 0) RestoreDC(dc, contentState);
 }
 
 // DaGoat fallback art restored from 71ea5ed. It deliberately has no signed photo or QR: the
@@ -2360,10 +2591,12 @@ void PaintGoat(HDC dc, BYTE*, SponsorState* st, int dpi, double now) {
     if (st->focus == 2) DrawFocusRing(dc, r, dpi, L.plateRadius);
 
     // The original DaGoat copy is part of the built-in banner, not a network field.
-    DrawWithFont(dc, L.copyX, L.copyBase[0], kDaGoatCopy1,
-                 st->fonts.copy, Cr(kInkCream), 0);
-    DrawWithFont(dc, L.copyX, L.copyBase[1], kDaGoatCopy2,
-                 st->fonts.copy, Cr(kInkCream), 0);
+    std::wstring copy[3];
+    DaGoatCopyLines(copy);
+    for (int i = 0; i < L.copyLines; ++i) {
+        DrawWithFont(dc, L.copy.right - TextWidth(dc, st->fonts.copy, copy[i], 0),
+                     L.copyBase[i], copy[i], st->fonts.copy, Cr(kInkCream), 0);
+    }
 }
 
 // Renders the whole strip into its back buffer at the current time, then copies it to `target`.
@@ -2904,13 +3137,25 @@ bool SponsorGetLayoutForTest(HWND hwnd, SponsorHarnessLayout* out) {
         ReleaseDC(hwnd, dc);
     }
     const Layout& L = st->layout;
+    const ob::Model model = BannerHostCurrent();
+    std::wstring expectedTag[2];
+    if (model.online) {
+        if (model.banner.tagline.empty()) {
+            expectedTag[0] = kGoatTag;
+        } else {
+            for (int i = 0; i < 2 && i < static_cast<int>(model.banner.tagline.size()); ++i)
+                expectedTag[i] = model.banner.tagline[static_cast<size_t>(i)];
+        }
+    }
     for (int i = 0; i < 3; ++i) out->buttons[i] = L.btn[i];
     out->plate = L.btn[2];
+    const double contentScale = 1.0 +
+                                (st->goat.active ? sponsor_motion::kStageScale : 0.0);
     out->viewfinder = L.vf;
-    out->tile = L.tile;
-    out->wordmark = L.wordmark;
-    out->tagline[0] = L.tagline[0];
-    out->tagline[1] = L.tagline[1];
+    out->tile = ScaleRectAboutCenter(L.tile, contentScale);
+    out->wordmark = ScaleRectAboutCenter(L.wordmark, contentScale);
+    out->tagline[0] = ScaleRectAboutCenter(L.tagline[0], contentScale);
+    out->tagline[1] = ScaleRectAboutCenter(L.tagline[1], contentScale);
     out->copy = L.copy;
     out->tagBaseline[0] = L.tagBaseline[0];
     out->tagBaseline[1] = L.tagBaseline[1];
@@ -2918,18 +3163,24 @@ bool SponsorGetLayoutForTest(HWND hwnd, SponsorHarnessLayout* out) {
     out->tagEmBaseline[1] = L.tagEmBaseline[1];
     out->taglineHasEm[0] = L.taglineHasEm[0];
     out->taglineHasEm[1] = L.taglineHasEm[1];
-    out->badge = L.badge;
+    out->taglineTruncated[0] = model.online && !expectedTag[0].empty() &&
+                               L.tagText[0] != expectedTag[0];
+    out->taglineTruncated[1] = model.online && !expectedTag[1].empty() &&
+                               L.tagText[1] != expectedTag[1];
+    // The live badge is optional art. Keep the pill, dot, and text as one unit; omit all of it
+    // only when the hover-scaled text block no longer fits beside the viewfinder.
+    out->badge = BadgeFits(L, contentScale) ? L.badge : RECT{};
     out->stage = ScaleRectAboutCenter(L.stage, st->goat.active ? 1.0 + sponsor_motion::kStageScale : 1.0);
     RECT clippedStage{};
     if (IntersectRect(&clippedStage, &out->stage, &L.btn[2])) out->stage = clippedStage;
     const int bracketInset = L.vfIn + (st->goat.active ? L.vfLock : 0);
-    out->brackets = { out->stage.left + bracketInset, out->stage.top + bracketInset,
-                      out->stage.right - bracketInset, out->stage.bottom - bracketInset };
+    out->brackets = { L.vf.left + bracketInset, L.vf.top + bracketInset,
+                      L.vf.right - bracketInset, L.vf.bottom - bracketInset };
     out->text = L.text;
-    out->iphone = L.iphone;
+    out->iphone = ScaleRectAboutCenter(L.iphone, contentScale);
     out->fallbackWordmark = L.fallbackWordmark;
     out->fallbackTag = L.fallbackTag;
-    out->qrOrigin = L.qrOrg;
+    out->qrOrigin = ScalePointAboutCenter(L.qrOrg, L.stage, contentScale);
     out->module = L.module;
     return true;
 }

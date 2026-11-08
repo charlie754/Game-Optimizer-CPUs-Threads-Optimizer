@@ -111,7 +111,7 @@ constexpr int kOutMs        = 360;   // leaving
 // The GOAT Cam plate (goatcam-banner.css, the :hover / :focus-visible rules).
 constexpr int    kPushInMs    = 1200;   // .gc-photo__frame scale(1) -> scale(1.06), --gc-in
 constexpr double kPushScale   = 0.06;
-constexpr double kStageScale  = 0.03;   // the visible stage grows about its center on hover
+constexpr double kStageScale  = 0.05;   // the visible stage grows about its center on hover
 constexpr int    kBracketInMs = 420;    // .gc-vf inset tightens 3px, --gc-in
 constexpr int    kLockInMs    = 300;    // .gc-vf::after (the gold lock) opacity, linear ...
 constexpr int    kLockDelayMs = 140;    // ... 140ms late
@@ -149,6 +149,7 @@ struct SponsorHarnessLayout {
     int tagBaseline[2]{};
     int tagEmBaseline[2]{};
     bool taglineHasEm[2]{};
+    bool taglineTruncated[2]{};
     RECT badge{};
     RECT stage{};
     RECT brackets{};

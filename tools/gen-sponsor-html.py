@@ -226,7 +226,7 @@ MEASURE = ("--measure" in sys.argv) or (os.environ.get("GEN_SPONSOR_MEASURE") ==
 #               first break at 847px (group-past-row) -> the floor is 848, identical to pass 1
 #
 #     The arithmetic behind 847.39, so it can be re-derived rather than re-measured:
-#       .kofi 137.14 + .gh 140.25 (both at BTN_ZOOM 0.8) + .goat--strip 502.00
+#       .kofi 171.47 + .gh 175.36 (both at native 0.5.9 size) + .goat--strip 434.00
 #       (= the master's copy column 136 + gap 10 + plate 356)
 #       = 779.39 of groups, + 2 * ROW_GAP 20 = 819.39 for the row,
 #       + 26 (.body__pad's 13px a side) + 2 (the shell's 0.5px border, snapped to 1px a side)
@@ -234,7 +234,7 @@ MEASURE = ("--measure" in sys.argv) or (os.environ.get("GEN_SPONSOR_MEASURE") ==
 #       Optimizer row floor").
 #     Height: the plate's PLATE_H 74 + 2 border = 76. Ko-fi (37.86) and Star (37.89) are centred
 #     inside it; the headline is 32.38 - two lines - and centred too.
-SHELL_MIN_W = 848
+SHELL_MIN_W = 849
 SHELL_H = 76
 
 if SHELL_MIN_W < 200 or SHELL_H < 40:
@@ -266,7 +266,7 @@ PLATE_H = BAND_H - 2 * SHELL_BORDER
 # exactly as in the master's own strip mock; Ko-fi and Star are centred in what is left.
 PAD_Y = 0
 
-# THE KO-FI BUTTON'S NATURAL HEIGHT, before BTN_ZOOM. Ko-fi and Star are still ONE HEIGHT - the
+# THE KO-FI BUTTON'S NATURAL HEIGHT. Ko-fi and Star are still ONE HEIGHT - the
 # operator's standing "same height as Ko-fi" - but they are centred in the plate's band rather than
 # setting it. Star is naturally shorter (36.00), so it is given this height explicitly;
 # tools\measure-panel.py asserts the two still render the same at every width.
@@ -276,32 +276,13 @@ PAD_Y = 0
 KOFI_H = 47.375
 
 # ---------------------------------------------------------------------------------------------
-# THE FIT: WHY KO-FI AND STAR ARE DRAWN AT 80%
+# THE FIT: KEEP THE 0.5.9 CONTROLS, SCALE ONLY THE NEW BANNER
 # ---------------------------------------------------------------------------------------------
-# [M] 2026-10-25, the v1 strip: at full size this row measured 916.84 css px (Ko-fi 171.47 + Star
-# 175.36 + goat group 502.02 + 2 * 20 + 26 + 2). The smallest Settings window offers 856, and the
-# largest floor that is safe at every dpi is 855 (computed below) - 62 css px short. The v2 goat
-# group is the same width (502.00: copy 136 + 10 + plate 356 against v1's 160 + 10 + 332.02), so
-# the same arithmetic holds.
-#
-# What can give, and what each would buy:
-#   * ROW_GAP 20 -> 12 (it must stay more than 1px clear of the plate's 10px pair gap): 16 px;
-#   * the copy column or the plate: this IS the GOAT Cam design, and the master's porting notes
-#     say the host must not override the strip's knobs;
-#   * Ko-fi and Star: 347 css px between them, and the one place the GDI strip already gave -
-#     sponsor.cpp draws both at 70% (kStripScale), by operator instruction.
-# So the buttons give, uniformly, by CSS `zoom` - text, icon, padding and radius together, the
-# way kStripScale scales the GDI ones - and the master's goat--strip group and ROW_GAP are left
-# exactly as they were. 0.8 buys 0.2 * 346.83 = 69.4 css px. The master sized its own GO mock
-# with these same two zoomed widths (README, "Game Optimizer row floor").
-#
-# 0.8 rather than the GDI's 0.7: the web labels are the plugin's ("Star Project on Github" is
-# seven characters longer than the GDI's "Star on GitHub"), and 0.8 keeps the label text at 10px
-# with 0.8 * 12.5 = 10.0px for Ko-fi - the same size as the 10.5px copy beside it, near enough.
-BTN_ZOOM = 0.8
-if not 0.5 <= BTN_ZOOM <= 1.0:
-    raise SystemExit("*** BTN_ZOOM = %s is outside 0.5..1.0 - the Ko-fi and Star labels would be "
-                     "unreadable or larger than the plugin draws them." % BTN_ZOOM)
+# [M] The 0.5.9 page measured .kofi=171.47px and .gh=175.36px at their native CSS size. The
+# sponsor controls are the compatibility boundary: their markup and every applicable rule are
+# checked byte-for-byte below, and the new banner is the only thing allowed to give width.
+# The old third-group box was 236px copy + 8px pair gap + 190px lockup = 434px. The online
+# renderer therefore uses the same 434px slot (136px signed copy + 8px gap + 290px plate).
 
 # The lift. The master's strip already has no movement (`--gc-lift: none`), but its hover still
 # applies `--gc-lift-shadow`: a drop shadow below the plate and an outer 1px gold ring. In a band
@@ -355,9 +336,9 @@ ROW_GAP = 20       # the FLOOR for each of the two gaps between the three groups
 # [M] The three groups' widths, measured by tools\measure-panel.py at the narrowest width. Used
 # for nothing but the floor-budget diagnostic below - the layout reads them off the fonts, never
 # from here - so a stale value costs a slightly wrong error message and nothing else.
-KOFI_W_MEASURED = 137.14
-GH_W_MEASURED = 140.25
-GOAT_W_MEASURED = 502.02
+KOFI_W_MEASURED = 171.47
+GH_W_MEASURED = 175.36
+GOAT_W_MEASURED = 434.00
 
 # ---------------------------------------------------------------------------------------------
 # THE BUDGET IS DERIVED FROM THE C++, NOT GUESSED - AND IT IS A FLOOR, NOT A CEILING
@@ -431,8 +412,8 @@ if SHELL_MIN_W > SHELL_W_CEILING and not MEASURE and os.environ.get("GEN_SPONSOR
         "    EVERY integer dpi from %d to %d is %d. That number is COMPUTED above, not typed in.\n"
         "\n"
         "    What this page's floor is made of [M], measured, not estimated:\n"
-        "      .kofi           %6.2f  at BTN_ZOOM %s\n"
-        "      .gh             %6.2f  at BTN_ZOOM %s\n"
+        "      .kofi           %6.2f  native 0.5.9 size\n"
+        "      .gh             %6.2f  native 0.5.9 size\n"
         "      .goat--strip    %6.2f  the master's copy column + gap + plate, as designed\n"
         "      row gaps        %6d  the TWO inter-group gaps at their floor, %dpx each\n"
         "      shell chrome     28.00  .body__pad 13px a side + the 0.5px border, snapped\n"
@@ -441,13 +422,13 @@ if SHELL_MIN_W > SHELL_W_CEILING and not MEASURE and os.environ.get("GEN_SPONSOR
         "      * raise the window minimum - settings.cpp's WM_GETMINMAXINFO and MIN_CLIENT_CSS_W\n"
         "        here and in tools\\measure-panel.py must move TOGETHER;\n"
         "      * cut ROW_GAP, keeping it more than 1px clear of the plate's 10px pair gap;\n"
-        "      * lower BTN_ZOOM.\n"
+        "      * reduce only the new GOAT Cam plate or its signed copy column.\n"
         "\n"
         "    Set GEN_SPONSOR_ALLOW_WIDE=1 only to generate a page for measuring; it still\n"
         "    refuses to write the header."
         % (SHELL_MIN_W, SHELL_W_CEILING, chr(92), MIN_CLIENT_CSS_W, GAP_CSS,
            MIN_CLIENT_CSS_W - 2 * GAP_CSS, DPI_LO, DPI_HI, SHELL_W_CEILING,
-           KOFI_W_MEASURED, BTN_ZOOM, GH_W_MEASURED, BTN_ZOOM, GOAT_W_MEASURED,
+           KOFI_W_MEASURED, GH_W_MEASURED, GOAT_W_MEASURED,
            2 * ROW_GAP, ROW_GAP))
 
 # ---------------------------------------------------------------------------------------------
@@ -465,10 +446,10 @@ if SHELL_MIN_W > SHELL_W_CEILING and not MEASURE and os.environ.get("GEN_SPONSOR
 #   .go-row>*             flex:0 0 auto - nothing grows, nothing shrinks. A shrinking group would
 #                         rewrap the headline or squeeze the plate the photo, wordmark and QR are
 #                         laid out on.
-#   .go-row>.kofi/.gh     width:max-content (both are `width: 100%` in the plugin's column),
-#                         margin-top:0 (their column spacing), and `zoom: BTN_ZOOM` - see BTN_ZOOM.
-#                         .gh is a flex container so its dark pill (.gh__inner) fills it, and is
-#                         given KOFI_H so the two buttons stay one height.
+#   .go-row>.kofi/.gh     width:max-content (both are `width: 100%` in the plugin's column) and
+#                         margin-top:0 (their column spacing). These declarations, plus the
+#                         `.gh__inner` flex fill, are the exact 0.5.9 row contract; no zoom or
+#                         size override is permitted here.
 #   .go-row>.goat         margin:0. The plugin's host glue gives `.body__pad .goat` a 16px top
 #                         margin for its column; in a row that would push the banner off-centre.
 #   (1) --gc-h            PLATE_H instead of the master's 76 - see BAND_H. Set through the
@@ -487,15 +468,18 @@ if SHELL_MIN_W > SHELL_W_CEILING and not MEASURE and os.environ.get("GEN_SPONSOR
 GO_LAYOUT_CSS = """
 .go-row{display:flex;flex-direction:row;align-items:center;justify-content:space-between;gap:%(rowgap)dpx}
 .go-row>*{flex:0 0 auto}
-.go-row>.kofi{width:max-content;margin-top:0;zoom:%(zoom)s}
-.go-row>.gh{width:max-content;margin-top:0;display:flex;align-items:stretch;height:%(kofih)spx;zoom:%(zoom)s}
+.go-row>.kofi{width:max-content;margin-top:0}
+.go-row>.gh{width:max-content;margin-top:0;display:flex;align-items:stretch}
+.go-row>button:nth-of-type(2){height:47.375px}
 .go-row>.gh>.gh__inner{flex:1 1 auto}
 .go-row>.goat-mount{margin:0}
 .go-row>.goat-mount>.goat--strip{display:inline-flex;width:auto;max-width:none;margin:0}
-.go-row>.goat-mount>.goat--strip .goat-lockup{width:356px;--gc-h:%(plateh)dpx;height:%(plateh)dpx;overflow:hidden;--gc-lift-shadow:none;transition:transform var(--gc-t-out) var(--gc-out),box-shadow var(--gc-t-out) var(--gc-out),border-color var(--gc-t-out) var(--gc-out)}
+.go-row>.goat-mount>.goat--strip .goat-lockup{width:290px;--gc-h:%(plateh)dpx;height:%(plateh)dpx;overflow:hidden;--gc-lift-shadow:none;transition:transform var(--gc-t-out) var(--gc-out),box-shadow var(--gc-t-out) var(--gc-out),border-color var(--gc-t-out) var(--gc-out)}
 .go-row>.goat-mount>.goat--strip .goat-lockup:hover{border-color:%(ring)s;transition:transform 420ms var(--gc-in),box-shadow 420ms var(--gc-in),border-color 420ms var(--gc-in)}
 .go-row>.goat-mount>.goat--strip .goat-lockup:active{transition-duration:120ms}
 .go-row>.goat-mount>.goat--strip .goat-lockup:focus-visible{outline-offset:-2px}
+.go-row>.goat-mount>.goat--strip .gc-stage{position:absolute;inset:auto;width:356px;height:%(plateh)dpx;left:50%%;top:50%%;transform:translate(-50%%,-50%%) scale(.76);transform-origin:50%% 50%%;transition:transform 360ms var(--gc-out)}
+.go-row>.goat-mount>.goat--strip .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-stage{transform:translate(-50%%,-50%%) scale(.798);transition:transform 420ms var(--gc-in)}
 .go-row>.goat-mount>.goat--strip .goat-lockup__word{position:absolute;z-index:1;left:128px;top:3px;width:98px;max-width:98px;min-width:0;transform:none}
 .go-row>.goat-mount>.goat--strip .gc-iphone{position:absolute;z-index:2;top:calc((var(--gc-h) - 2px - var(--gc-qr))/2 + 6px);right:calc(9px + var(--gc-qr) + 6px);display:block;width:28px;height:60px;overflow:hidden;border:0;border-radius:6.5px;background:transparent;box-shadow:0 2px 5px rgba(0,0,0,.55);pointer-events:none}
 .go-row>.goat-mount>.goat--strip .gc-iphone__screen{display:block;width:100%%;height:100%%;border:0;border-radius:4.6px;object-fit:fill}
@@ -510,21 +494,23 @@ GO_LAYOUT_CSS = """
    master's strip, these host overrides restore the strip contract without touching the copied
    renderer: two complete headline rows, signed tagline rows, an undimmed full-bleed photo, and
    the master's whole-stage hover motion. */
-.go-row>.goat-mount>.goat--strip.goat--online .goat__copy{width:136px;height:32px;margin:0;padding:0}
+.go-row>.goat-mount>.goat--strip.goat--online{display:flex;flex-direction:row;align-items:center;gap:8px;width:auto;max-width:none}
+.go-row>.goat-mount>.goat--strip.goat--online .goat__copy{display:flex;flex-direction:column;justify-content:center;flex:0 0 136px;width:136px;height:32px;margin:0;padding:0;text-align:right;align-items:flex-end}
+.go-row>.goat-mount>.goat--strip.goat--online .gc-iphone{right:calc(9px + var(--gc-qr) + 8px)}
 .go-row>.goat-mount>.goat--strip.goat--online .goat__line{font-size:8px !important;line-height:1.25;white-space:nowrap;overflow:visible;text-wrap:nowrap}
 .go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__tag{gap:1px;text-transform:none;white-space:normal}
 .go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__tag>span{overflow:visible;white-space:nowrap}
 .go-row>.goat-mount>.goat--strip.goat--online{--gc-qr:64px}
 .go-row>.goat-mount>.goat--strip.goat--online .gc-vf{--gc-vf-t:0px;--gc-vf-r:0px;--gc-vf-b:0px;--gc-vf-l:0px}
-.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-vf{inset:0}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-vf{inset:3px}
 .go-row>.goat-mount>.goat--strip.goat--online .gc-photo{--gc-scrim:none}
 .go-row>.goat-mount>.goat--strip.goat--online .gc-photo::after{background:none;transform:none}
-.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-stage{transform:scale(1.03);transition:transform 420ms var(--gc-in)}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-stage{transform:translate(-50%%,-50%%) scale(.798);transition:transform 420ms var(--gc-in)}
 
 /* DaGoat remains the legacy page banner beside its copy, matching 71ea5ed/GDI proportions;
    applying the online strip's 136px copy column to it is what created the extra wraps. */
 .go-row>.goat-mount>.goat--strip.goat--dagoat{display:flex;flex-direction:row;align-items:stretch;gap:8px;width:auto;max-width:none}
-.go-row>.goat-mount>.goat--strip.goat--dagoat .goat__copy{flex:0 0 236px;width:236px;margin:0;gap:3px}
+.go-row>.goat-mount>.goat--strip.goat--dagoat .goat__copy{flex:0 0 236px;width:236px;margin:0;gap:3px;text-align:right;align-items:flex-end}
 .go-row>.goat-mount>.goat--strip.goat--dagoat .goat-lockup{flex:0 0 190px;width:190px;max-width:none;height:74px;font-size:5.069px}
 .go-row>.goat-mount>.goat--strip.goat--dagoat .goat-lockup__meteors{inset:0}
 .go-row>.goat-mount>.goat--strip.goat--dagoat .goat-lockup__word{position:relative;left:auto;top:auto;width:auto;max-width:100%%;transform:none}
@@ -867,6 +853,7 @@ while i < len(frag):
                      "dropped from the page in silence."
                      % (c, frag[max(0, i - 40):i + 40], ", ".join(sorted(SUBST))))
 markup = "".join(pieces)
+STATIC_SPONSOR_MARKUP = markup
 
 print("css=%d lockup=%d cup=%d star=%d markup=%d" % (len(css), len(lock), len(cup), len(star), len(markup)))
 
@@ -1059,16 +1046,41 @@ for _gone in ("goat--panel", "goat--gated", "go-group", "go-item", "goatcam.dago
 # the shell is width:max-content so the page can report its own intrinsic minimum; otherwise it
 # is `width:100%` and takes whatever the host gives it.
 go_css = GO_LAYOUT_CSS % {"rowgap": ROW_GAP,
-                          "zoom": ("%.3f" % BTN_ZOOM).rstrip("0").rstrip("."),
-                          "kofih": ("%.3f" % KOFI_H).rstrip("0").rstrip("."),
                           "plateh": PLATE_H, "ring": LIFT_RING, "pady": PAD_Y,
                           "shell": "max-content" if MEASURE else "100%"}
 print("layout override: three groups, space-between; inter-group gap FLOOR %dpx, in-group gap "
-      "%gpx (the master's); Ko-fi and Star at zoom %s, Star given KOFI_H %.3f; master goat--strip "
-      "with --gc-h %dpx (master %gpx), the QR pinned at scale none, a ring-only lift; "
+      "%gpx (the master's); Ko-fi and Star use the native 0.5.9 contract; online slot 136px + 8px + "
+      "290px; master goat--strip with --gc-h %dpx (master %gpx), the QR pinned at scale none, a ring-only lift; "
       ".body__pad top/bottom -> %dpx; .shell.is-open width -> %s"
-      % (ROW_GAP, STRIP_GAP, BTN_ZOOM, KOFI_H, PLATE_H, STRIP_PLATE_H,
+      % (ROW_GAP, STRIP_GAP, PLATE_H, STRIP_PLATE_H,
          PAD_Y, "max-content  [MEASURE MODE]" if MEASURE else "100%  [fills the host]"))
+
+# C1: the founder's compatibility boundary is the two fixed sponsor controls. The digest is from
+# the named 0.5.9 page (71ea5ed's generated page): markup first, then every stylesheet rule whose
+# selector applies to `.kofi`, `.gh`, or one of their descendants. A zoom, a new child override,
+# or a changed extracted fragment therefore refuses generation instead of quietly moving the two
+# controls. The old page is not read at generation time; this is an immutable contract fixture.
+LEGACY_CONTROL_CONTRACT_SHA256 = "cec0d787dfec87acc917f19ba4f2d2161c7f88aa50d2fd90ccbc7ba053f7206f"
+
+
+def control_contract(markup_text, stylesheet):
+    rules = []
+    selector = re.compile(r"\.(?:kofi|gh)(?:[-_:.#\[]|[\s>{+~]|$)")
+    for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", stylesheet):
+        if selector.search(match.group(1)):
+            rules.append(match.group(1).strip() + "{" + match.group(2) + "}")
+    return markup_text + chr(10) + chr(10).join(rules), rules
+
+
+_control_contract, _control_rules = control_contract(STATIC_SPONSOR_MARKUP, css_all + chr(10) + go_css)
+_control_sha = hashlib.sha256(_control_contract.encode("utf-8")).hexdigest()
+if _control_sha != LEGACY_CONTROL_CONTRACT_SHA256:
+    raise SystemExit("*** C1=FAIL: the Ko-fi/Star markup or applicable CSS changed from 0.5.9 "
+                     "(expected %s, got %s; markup=%d rules=%d)" %
+                     (LEGACY_CONTROL_CONTRACT_SHA256, _control_sha,
+                      len(STATIC_SPONSOR_MARKUP), len(_control_rules)))
+print("C1=PASS legacy Ko-fi/Star contract sha256=%s markup=%d rules=%d" %
+      (_control_sha, len(STATIC_SPONSOR_MARKUP), len(_control_rules)))
 
 payload = "<style>" + css_all + chr(10) + go_css + "</style>" + \
           "<div class='shell is-open'><div class='body__pad'>" + regrouped + "</div></div>"

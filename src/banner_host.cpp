@@ -108,7 +108,7 @@ void EnsureClient(HostState& state) {
     config.publicKey65 = &kBannerPublicKey;
     config.floor = kBannerRevisionFloor;
     config.kinds = { ob::Kind::Webp, ob::Kind::Jpg };
-    config.userAgent = L"GameOptimizer/0.6.0";
+    config.userAgent = L"GameOptimizer/0.6.1";
     config.pathPrefix.clear();
     state.client = std::make_unique<ob::Client>(std::move(config), state.window, kClientChanged);
 }

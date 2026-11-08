@@ -1,5 +1,11 @@
 # Notices and attribution
 
+## 2026-11-07 — 0.6.1 sponsor strip compatibility fix
+
+The Ko-fi and Star controls retain the 0.5.9 markup, CSS, and geometry. The GOAT Cam caption is
+right-aligned, and the banner stage grows on hover while keeping its viewfinder content inside the
+plate in both the WebView and GDI fallback renderers.
+
 ## 2026-11-07 — signed sponsor content
 
 The sponsor strip now loads signed promotional content from `goatcam.dagoat.io` when available

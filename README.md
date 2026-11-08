@@ -30,14 +30,14 @@ else, and clears every mask the moment the game exits.
 - **No injection, no overlay.** One native exe, no .NET runtime. Nothing needs elevation except
   the optional AMD 3D V-Cache setting, which asks for it once.
 - **Local config, no account, no analytics — and one network request: the sponsor banner.**
-  Since 0.6.0 the sponsor strip at the bottom of the Settings window shows a promotion that is
+  Since 0.6.1 the sponsor strip at the bottom of the Settings window shows a promotion that is
   published online, so the content can change without a new release. **Opening the Settings
   window is enough to trigger it — no click is needed — and a normal launch (without `--tray`)
   opens Settings by itself.** While the strip is visible the app may send HTTPS GET requests to
   `https://goatcam.dagoat.io/banner/v1.signed` and, only when that signed file names them, to at
   most the two photo files it names. It sends no identifier, no cookies and no query string, but
   the server can see the connection's IP address, the time, a User-Agent made of the
-  app name and version (`GameOptimizer`, `0.6.0`) and the standard HTTPS/WinHTTP headers — in other words, that this app
+  app name and version (`GameOptimizer`, `0.6.1`) and the standard HTTPS/WinHTTP headers — in other words, that this app
   version had its Settings window open. The file is used only after its ECDSA P-256 signature
   verifies against a public key compiled into the app; unsigned, expired or older content is
   ignored. When the strip is shown, a check runs if at least 6 hours have passed since the last

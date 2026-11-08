@@ -98,4 +98,14 @@ void WebSponsorDestroy(WebSponsor* w);
 // page is actually rendering, so a failed creation never leaves a hole where the strip was.
 HWND WebSponsorWindow(const WebSponsor* w);
 
+#if defined(CD_WEBVIEW_HARNESS)
+// Harness-only seams. These are compiled out of the product ABI and exist so the real
+// WebView2 object can be exercised without making the harness duplicate its COM vtables.
+bool WebSponsorCapturePreviewForTest(WebSponsor* w, const wchar_t* path);
+bool WebSponsorCaptureDoneForTest(const WebSponsor* w, bool* ok);
+bool WebSponsorExecuteScriptForTest(WebSponsor* w, const wchar_t* script);
+bool WebSponsorScriptDoneForTest(const WebSponsor* w, bool* ok);
+bool WebSponsorPostMessageForTest(WebSponsor* w, const wchar_t* json);
+#endif
+
 }  // namespace cd

@@ -21,6 +21,7 @@
 
 #include <objbase.h>
 #include <shellapi.h>
+#include <shlwapi.h>
 #include <new>
 #include <string>
 #include <string.h>
@@ -372,7 +373,6 @@ struct WebSponsor {
     LONG ref = 1;            // one reference for the owner; handlers add their own
     bool closed = false;     // WebSponsorDestroy has run; pending callbacks must do nothing
     bool reported = false;   // `ready` is called exactly once
-    bool initialNavigationPending = false;
 
     HWND parent = nullptr;
     HWND host = nullptr;
@@ -386,6 +386,13 @@ struct WebSponsor {
 
     bool qrShown = false;    // this view has the QR magnifier up (qr_magnifier.h)
     int bannerToken = 0;
+
+#if defined(CD_WEBVIEW_HARNESS)
+    bool testCaptureDone = false;
+    bool testCaptureOk = false;
+    bool testScriptDone = false;
+    bool testScriptOk = false;
+#endif
 
     // The magnifier comes down at once whenever the view moves, hides or goes away: the tile it
     // points at is not where it was.
@@ -436,6 +443,104 @@ struct WebSponsor {
         }
     }
 };
+
+#if defined(CD_WEBVIEW_HARNESS)
+
+const GUID kIID_HarnessCapturePreviewHandler =
+    { 0x697e05e9, 0x3d8f, 0x45fa, { 0x96, 0xf4, 0x8f, 0xfe, 0x1e, 0xde, 0xda, 0xf5 } };
+const GUID kIID_HarnessExecuteScriptHandler =
+    { 0x49511172, 0xcc67, 0x4bca, { 0x99, 0x23, 0x13, 0x71, 0x12, 0xf4, 0xc4, 0xcc } };
+
+class HarnessCaptureHandler : public IUnknown {
+public:
+    HarnessCaptureHandler(WebSponsor* owner, IStream* stream)
+        : owner_(owner), stream_(stream) {
+        owner_->AddRef();
+        stream_->AddRef();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (out == nullptr) return E_POINTER;
+        if (!::IsEqualGUID(riid, IID_IUnknown) &&
+            !::IsEqualGUID(riid, kIID_HarnessCapturePreviewHandler)) {
+            *out = nullptr;
+            return E_NOINTERFACE;
+        }
+        *out = static_cast<IUnknown*>(this);
+        AddRef();
+        return S_OK;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(::InterlockedIncrement(&ref_));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = ::InterlockedDecrement(&ref_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+
+    virtual HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode) {
+        owner_->testCaptureOk = SUCCEEDED(errorCode);
+        owner_->testCaptureDone = true;
+        return S_OK;
+    }
+
+private:
+    ~HarnessCaptureHandler() {
+        stream_->Release();
+        owner_->Release();
+    }
+
+    LONG ref_ = 1;
+    WebSponsor* owner_;
+    IStream* stream_;
+};
+
+class HarnessScriptHandler : public IUnknown {
+public:
+    explicit HarnessScriptHandler(WebSponsor* owner) : owner_(owner) {
+        owner_->AddRef();
+    }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        if (out == nullptr) return E_POINTER;
+        if (!::IsEqualGUID(riid, IID_IUnknown) &&
+            !::IsEqualGUID(riid, kIID_HarnessExecuteScriptHandler)) {
+            *out = nullptr;
+            return E_NOINTERFACE;
+        }
+        *out = static_cast<IUnknown*>(this);
+        AddRef();
+        return S_OK;
+    }
+
+    ULONG STDMETHODCALLTYPE AddRef() override {
+        return static_cast<ULONG>(::InterlockedIncrement(&ref_));
+    }
+
+    ULONG STDMETHODCALLTYPE Release() override {
+        const LONG n = ::InterlockedDecrement(&ref_);
+        if (n == 0) delete this;
+        return static_cast<ULONG>(n);
+    }
+
+    virtual HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode, LPCWSTR resultObjectAsJson) {
+        (void)resultObjectAsJson;
+        owner_->testScriptOk = SUCCEEDED(errorCode);
+        owner_->testScriptDone = true;
+        return S_OK;
+    }
+
+private:
+    ~HarnessScriptHandler() { owner_->Release(); }
+
+    LONG ref_ = 1;
+    WebSponsor* owner_;
+};
+
+#endif
 
 namespace {
 
@@ -507,12 +612,28 @@ public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
         return this->Qi(riid, kIID_NavStartingHandler, out);
     }
-    // Invoke(sender, args). The first navigation is the host's own NavigateToString load.
-    // Every later navigation is cancelled for every scheme; only a user-initiated, allow-listed
-    // https target is handed to the user's real browser.
+    // Invoke(sender, args). The host's NavigateToString load may surface as an internal
+    // about:blank/data: navigation before the generated document settles; those navigations
+    // must remain untouched. External HTTP(S) navigations are cancelled, and only a
+    // user-initiated, allow-listed target is handed to the user's real browser.
     virtual HRESULT STDMETHODCALLTYPE Invoke(IWvWebView* sender, IWvNavStartingArgs* args) {
         (void)sender;
         if (args == nullptr) return E_POINTER;
+        LPWSTR uri = nullptr;
+        const HRESULT uriHr = args->get_Uri(&uri);
+        if (FAILED(uriHr) || uri == nullptr) {
+            if (FAILED(uriHr)) {
+                LogLine(L"[sponsor] NavigationStarting get_Uri failed, hr=0x%08lx",
+                        static_cast<unsigned long>(uriHr));
+            }
+            return S_OK;
+        }
+        const std::wstring u(uri);
+        ::CoTaskMemFree(uri);
+        if (!StartsWithI(u, L"http://") && !StartsWithI(u, L"https://")) {
+            return S_OK;
+        }
+
         const HRESULT cancelHr = args->put_Cancel(TRUE);
         if (FAILED(cancelHr)) {
             LogLine(L"[sponsor] NavigationStarting put_Cancel failed, hr=0x%08lx",
@@ -527,29 +648,7 @@ public:
                     static_cast<unsigned long>(userHr));
             return S_OK;
         }
-        LPWSTR uri = nullptr;
-        const HRESULT uriHr = args->get_Uri(&uri);
-        if (FAILED(uriHr) || uri == nullptr) {
-            if (FAILED(uriHr)) {
-                LogLine(L"[sponsor] NavigationStarting get_Uri failed, hr=0x%08lx",
-                        static_cast<unsigned long>(uriHr));
-            }
-            return S_OK;
-        }
-        const std::wstring u(uri);
-        ::CoTaskMemFree(uri);
-        if (this->owner_->initialNavigationPending) {
-            this->owner_->initialNavigationPending = false;
-            const HRESULT allowHr = args->put_Cancel(FALSE);
-            if (FAILED(allowHr)) {
-                LogLine(L"[sponsor] initial navigation put_Cancel(FALSE) failed, hr=0x%08lx",
-                        static_cast<unsigned long>(allowHr));
-                return allowHr;
-            }
-            return S_OK;
-        }
-        if (userInitiated == TRUE && !this->owner_->closed &&
-            (StartsWithI(u, L"http://") || StartsWithI(u, L"https://"))) {
+        if (userInitiated == TRUE && !this->owner_->closed) {
             OpenIfKnown(this->owner_->host, u);
         }
         return S_OK;
@@ -751,6 +850,10 @@ public:
         if (o->closed) return S_OK;
         BOOL success = FALSE;
         if (args == nullptr || FAILED(args->get_IsSuccess(&success)) || !success) {
+            // NavigateToString can leave a late failed about:blank completion behind the
+            // document it accepted. Once the old v0.5.9 readiness point has fired, that stale
+            // completion must not tear down a live page; before readiness, it is a real failure.
+            if (o->reported) return S_OK;
             LogLine(L"[sponsor] banner page navigation failed - using the GDI strip");
             o->Teardown();
             o->Report(false);
@@ -955,9 +1058,7 @@ HRESULT STDMETHODCALLTYPE ControllerHandler::Invoke(HRESULT hr, IWvController* c
     ::SetRect(&client, 0, 0, owner->rc.right - owner->rc.left,
               owner->rc.bottom - owner->rc.top);
     controller->put_Bounds(client);
-
     const std::wstring page = BuildPage();
-    owner->initialNavigationPending = true;
     const HRESULT nhr = web->NavigateToString(page.c_str());
     if (FAILED(nhr)) {
         LogLine(L"[sponsor] NavigateToString failed, hr=0x%08lx - GDI strip",
@@ -967,9 +1068,9 @@ HRESULT STDMETHODCALLTYPE ControllerHandler::Invoke(HRESULT hr, IWvController* c
         return S_OK;
     }
 
-    // The host remains hidden until NavigationCompleted has proved that the generated page
-    // loaded. That callback posts the first model and then makes visibility observable to the
-    // shared client.
+    controller->put_IsVisible(TRUE);
+    ::ShowWindow(owner->host, SW_SHOWNA);
+    owner->Report(true);
     return S_OK;
 }
 
@@ -1185,5 +1286,59 @@ void WebSponsorDestroy(WebSponsor* w) {
 HWND WebSponsorWindow(const WebSponsor* w) {
     return w == nullptr ? nullptr : w->host;
 }
+
+#if defined(CD_WEBVIEW_HARNESS)
+bool WebSponsorCapturePreviewForTest(WebSponsor* w, const wchar_t* path) {
+    if (w == nullptr || w->closed || w->webview == nullptr || path == nullptr || *path == L'\0') {
+        return false;
+    }
+    IStream* stream = nullptr;
+    if (FAILED(::SHCreateStreamOnFileEx(path, STGM_READWRITE | STGM_CREATE,
+                                       FILE_ATTRIBUTE_NORMAL, TRUE, nullptr, &stream)) ||
+        stream == nullptr) {
+        return false;
+    }
+    w->testCaptureDone = false;
+    w->testCaptureOk = false;
+    HarnessCaptureHandler* handler = new (std::nothrow) HarnessCaptureHandler(w, stream);
+    if (handler == nullptr) {
+        stream->Release();
+        return false;
+    }
+    const HRESULT hr = w->webview->CapturePreview(0, stream,
+                                                  static_cast<IUnknown*>(handler));
+    handler->Release();
+    stream->Release();
+    return SUCCEEDED(hr);
+}
+
+bool WebSponsorCaptureDoneForTest(const WebSponsor* w, bool* ok) {
+    if (w == nullptr) return false;
+    if (ok != nullptr) *ok = w->testCaptureOk;
+    return w->testCaptureDone;
+}
+
+bool WebSponsorExecuteScriptForTest(WebSponsor* w, const wchar_t* script) {
+    if (w == nullptr || w->closed || w->webview == nullptr || script == nullptr) return false;
+    HarnessScriptHandler* handler = new (std::nothrow) HarnessScriptHandler(w);
+    if (handler == nullptr) return false;
+    w->testScriptDone = false;
+    w->testScriptOk = false;
+    const HRESULT hr = w->webview->ExecuteScript(script, static_cast<IUnknown*>(handler));
+    handler->Release();
+    return SUCCEEDED(hr);
+}
+
+bool WebSponsorScriptDoneForTest(const WebSponsor* w, bool* ok) {
+    if (w == nullptr) return false;
+    if (ok != nullptr) *ok = w->testScriptOk;
+    return w->testScriptDone;
+}
+
+bool WebSponsorPostMessageForTest(WebSponsor* w, const wchar_t* json) {
+    if (w == nullptr || w->closed || w->webview == nullptr || json == nullptr) return false;
+    return SUCCEEDED(w->webview->PostWebMessageAsJson(json));
+}
+#endif
 
 }  // namespace cd
