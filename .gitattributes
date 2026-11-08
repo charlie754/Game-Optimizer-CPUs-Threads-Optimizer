@@ -1,0 +1,9 @@
+# This project is LF throughout, and several tests match multi-line source with
+# LF-anchored string literals. A CRLF checkout makes those matches fail silently,
+# so the working tree is pinned to LF regardless of the machine's global setting.
+* text=auto eol=lf
+*.png binary
+*.ico binary
+*.mp4 binary
+*.gif binary
+*.signed binary

@@ -1,0 +1,3539 @@
+{
+  "scenarios": [
+    {
+      "name": "cold-start-show",
+      "note": "An empty install fetches, verifies, writes the set, then adopts and displays it.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "jpg": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620804000,
+          "event": {
+            "type": "COMMITTED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 2,
+                "current": {
+                  "revision": 2,
+                  "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "enabled": true,
+                  "expiresMs": 1793880000000,
+                  "photos": {
+                    "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                  }
+                },
+                "lastCheckMs": 1793620804000,
+                "failures": 0
+              }
+            },
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": false
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707204000
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "shown-twice",
+      "note": "A second SHOWN while already visible does not redraw or start another attempt.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793880000000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 1,
+            "shown": "online"
+          }
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 1,
+            "shown": "online"
+          }
+        }
+      ]
+    },
+    {
+      "name": "hidden-mid-attempt",
+      "note": "Hiding during a signed-file attempt cancels it and leaves no timer running.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "HIDDEN"
+          },
+          "expect": [
+            {
+              "type": "cancel",
+              "gen": 1
+            }
+          ],
+          "state": {
+            "visible": false,
+            "attempting": false,
+            "timerAtMs": null,
+            "pendingSwap": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "late-reply-after-hide",
+      "note": "A completion from a cancelled generation is ignored after the view hides.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "HIDDEN"
+          },
+          "expect": [
+            {
+              "type": "cancel",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "jpg": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [],
+          "state": {
+            "visible": false,
+            "gen": 1,
+            "attempting": false,
+            "timerAtMs": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "killswitch-under-pointer",
+      "note": "A committed kill switch swaps immediately even while the pointer is over the banner.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793595600000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793880000000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "POINTER",
+            "over": true
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "killswitch",
+              "reason": null,
+              "revision": 1,
+              "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z"
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "COMMITTED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": {
+                  "revision": 1,
+                  "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                  "enabled": false,
+                  "expiresMs": 1793880000000,
+                  "photos": {}
+                },
+                "lastCheckMs": 1793620803000,
+                "failures": 0
+              }
+            },
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707203000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "dagoat",
+            "pendingSwap": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "fresh-under-pointer-waits",
+      "note": "A fresh online set waits for pointer exit, then swaps with a non-immediate display.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793595600000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793880000000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "POINTER",
+            "over": true
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "jpg": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802500,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "COMMITTED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 2,
+                "current": {
+                  "revision": 2,
+                  "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "enabled": true,
+                  "expiresMs": 1793880000000,
+                  "photos": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                  }
+                },
+                "lastCheckMs": 1793620803000,
+                "failures": 0
+              }
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707203000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "online",
+            "pendingSwap": true
+          }
+        },
+        {
+          "atMs": 1793620804000,
+          "event": {
+            "type": "POINTER",
+            "over": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": false
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "online",
+            "pendingSwap": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "expiry-while-visible",
+      "note": "Visible expiry swaps directly to DaGoat after the expiry timer has fired; no disarm is emitted.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793624400000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793624400000
+            }
+          ]
+        },
+        {
+          "atMs": 1793624400000,
+          "event": {
+            "type": "TIMER",
+            "mayFetch": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "dagoat",
+            "timerAtMs": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "visible-24h-check",
+      "note": "A visible banner checks at lastCheck plus 24 hours while a 20-hour SHOWN is not yet due.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793649600000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793646000000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793649600000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793732400000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "timerAtMs": 1793732400000
+          }
+        },
+        {
+          "atMs": 1793732400000,
+          "event": {
+            "type": "TIMER",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793880000000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "backoff-6-12-24",
+      "note": "Retries occur at 6, 12 and 24 hours, and failures remain capped at three.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "FAILED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": null,
+                "lastCheckMs": 1793620801000,
+                "failures": 1
+              }
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707201000
+            }
+          ]
+        },
+        {
+          "atMs": 1793642341000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793642401000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "fetch-signed",
+              "gen": 2
+            },
+            {
+              "type": "disarm-timer"
+            }
+          ]
+        },
+        {
+          "atMs": 1793642402000,
+          "event": {
+            "type": "FAILED",
+            "gen": 2
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": null,
+                "lastCheckMs": 1793642402000,
+                "failures": 2
+              }
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793728802000
+            }
+          ]
+        },
+        {
+          "atMs": 1793685542000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793685602000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "fetch-signed",
+              "gen": 3
+            },
+            {
+              "type": "disarm-timer"
+            }
+          ]
+        },
+        {
+          "atMs": 1793685603000,
+          "event": {
+            "type": "FAILED",
+            "gen": 3
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": null,
+                "lastCheckMs": 1793685603000,
+                "failures": 3
+              }
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793772003000
+            }
+          ]
+        },
+        {
+          "atMs": 1793771943000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793772003000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "fetch-signed",
+              "gen": 4
+            },
+            {
+              "type": "disarm-timer"
+            }
+          ]
+        },
+        {
+          "atMs": 1793772004000,
+          "event": {
+            "type": "FAILED",
+            "gen": 4
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": null,
+                "lastCheckMs": 1793772004000,
+                "failures": 3
+              }
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793858404000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "gen": 4,
+            "attempting": false,
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 1793772004000,
+              "failures": 3
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "crash-before-record",
+      "note": "A crash after set write but before record write restarts from the old record and banner.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793707200000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707200000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "jpg": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793707200000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620804000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707200000
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793707200000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "visible": true,
+            "gen": 1,
+            "attempting": false,
+            "shown": "online"
+          }
+        }
+      ]
+    },
+    {
+      "name": "hwm-below-floor",
+      "note": "START raises a persisted high-water mark below the compiled floor before continuing.",
+      "floor": 8,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 8,
+                "current": null,
+                "lastCheckMs": 0,
+                "failures": 0
+              }
+            },
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 8,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "floor": 8,
+            "visible": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "click-expired",
+      "note": "Clicking at the exact expiry swaps to DaGoat and does not open the old link.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793620830000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793620830000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620830000,
+          "event": {
+            "type": "CLICK"
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "disarm-timer"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "resume-after-expiry",
+      "note": "RESUME handles an expired online banner before considering a fresh check.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793620830000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793620830000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620830000,
+          "event": {
+            "type": "RESUME",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707200000
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "start-clock-ahead",
+      "note": "START invalidates a persisted banner that is already expired under the startup clock.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793624400000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793620800000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": null,
+                "lastCheckMs": 0,
+                "failures": 0
+              }
+            },
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "visible": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "mayfetch-false",
+      "note": "A false fetch gate suppresses polling until a later SHOWN carries true.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "timerAtMs": null
+          }
+        },
+        {
+          "atMs": 1793642400000,
+          "event": {
+            "type": "RESUME",
+            "mayFetch": false
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793646000000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "expiry-30s-exact",
+      "note": "The exact 30-second expiry is armed without a one-minute clamp, then the next check is armed.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793620830000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793620830000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620830000,
+          "event": {
+            "type": "TIMER",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707200000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "dagoat",
+            "timerAtMs": 1793707200000
+          }
+        }
+      ]
+    },
+    {
+      "name": "photo-after-expiry",
+      "note": "Photos completing after expiry fail the attempt without writing a set, then record the failure.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-02T12:00:10Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "jpg": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620811000,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": null,
+                "lastCheckMs": 1793620811000,
+                "failures": 1
+              }
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707211000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 1793620811000,
+              "failures": 1
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "storage-write-fails",
+      "note": "A failed set write leaves the old current and high-water mark while recording one failure.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793595600000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793880000000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "jpg": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "FAILED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": {
+                  "revision": 1,
+                  "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                  "enabled": true,
+                  "expiresMs": 1793880000000,
+                  "photos": {
+                    "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                  }
+                },
+                "lastCheckMs": 1793620803000,
+                "failures": 1
+              }
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707203000
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620803000,
+              "failures": 1
+            },
+            "visible": true,
+            "attempting": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "clock-behind-last-check",
+      "note": "A clock moving behind lastCheckMs makes the next visible SHOWN due immediately.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 1793624400000,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 1
+          }
+        }
+      ]
+    },
+    {
+      "name": "expiry-while-pending",
+      "note": "Expiry overrides a pointer-held fresh swap and goes straight to the already committed replacement.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793624400000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793595600000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793624400000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "POINTER",
+            "over": true
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-02T15:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "jpg": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802500,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793622600000,
+          "event": {
+            "type": "COMMITTED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 2,
+                "current": {
+                  "revision": 2,
+                  "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "enabled": true,
+                  "expiresMs": 1793631600000,
+                  "photos": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                  }
+                },
+                "lastCheckMs": 1793622600000,
+                "failures": 0
+              }
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "online",
+            "pendingSwap": true
+          }
+        },
+        {
+          "atMs": 1793624400000,
+          "event": {
+            "type": "TIMER",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793631600000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "online",
+            "pendingSwap": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "late-reply-after-reshow",
+      "note": "A stale reply from the first visibility attempt is ignored after a reshow starts generation two.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 1
+          }
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "HIDDEN"
+          },
+          "expect": [
+            {
+              "type": "cancel",
+              "gen": 1
+            }
+          ],
+          "state": {
+            "visible": false,
+            "attempting": false,
+            "gen": 1,
+            "timerAtMs": null
+          }
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 2
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 2
+          }
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 2
+          }
+        },
+        {
+          "atMs": 1793620804000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 2,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 2,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": true,
+            "gen": 2
+          }
+        }
+      ]
+    },
+    {
+      "name": "start-set-invalid",
+      "note": "START clears a current set that startup verification rejected and writes the cleared record once.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 1,
+                "current": null,
+                "lastCheckMs": 1793620800000,
+                "failures": 0
+              }
+            },
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "visible": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "start-revision-mismatch",
+      "note": "START clears a verified-shape set whose revision does not equal the persisted high-water mark.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 2,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 2,
+                "current": null,
+                "lastCheckMs": 1793620800000,
+                "failures": 0
+              }
+            },
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 2,
+              "current": null,
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "visible": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "start-null-record-floor",
+      "note": "A null record starts at the compiled floor without emitting a persistence write.",
+      "floor": 8,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": null,
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 8,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "floor": 8,
+            "visible": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "precommit-revision-below-hwm",
+      "note": "A show result below hwm can fetch photos but fails at pre-commit, recording a failure without writing a set.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 8,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 7,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 8,
+                "current": null,
+                "lastCheckMs": 1793620802000,
+                "failures": 1
+              }
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707202000
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 8,
+              "current": null,
+              "lastCheckMs": 1793620802000,
+              "failures": 1
+            },
+            "visible": true,
+            "attempting": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "pending-hide-reshow",
+      "note": "A hidden view forgets a deferred swap; the next SHOWN draws the newly committed set immediately.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793707200000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707200000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "POINTER",
+            "over": true
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802500,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "COMMITTED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 2,
+                "current": {
+                  "revision": 2,
+                  "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "enabled": true,
+                  "expiresMs": 1793880000000,
+                  "photos": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                  }
+                },
+                "lastCheckMs": 1793620803000,
+                "failures": 0
+              }
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "online",
+            "pendingSwap": true
+          }
+        },
+        {
+          "atMs": 1793620804000,
+          "event": {
+            "type": "HIDDEN"
+          },
+          "expect": [
+            {
+              "type": "disarm-timer"
+            }
+          ],
+          "state": {
+            "visible": false,
+            "pendingSwap": false,
+            "timerAtMs": null
+          }
+        },
+        {
+          "atMs": 1793620805000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793880000000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "shown": "online",
+            "pendingSwap": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "check-timer-clamp-low",
+      "note": "A check due in thirty seconds is clamped to the minimum sixty-second timer window.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 1793534430000,
+              "failures": 3
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793620860000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "timerAtMs": 1793620860000
+          }
+        }
+      ]
+    },
+    {
+      "name": "two-kinds",
+      "note": "A client drawing both formats fetches both photos and persists both committed hashes.",
+      "floor": 1,
+      "kinds": [
+        "webp",
+        "jpg"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "jpg": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp",
+                "jpg"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "COMMITTED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 2,
+                "current": {
+                  "revision": 2,
+                  "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "enabled": true,
+                  "expiresMs": 1793880000000,
+                  "photos": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                    "jpg": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                  }
+                },
+                "lastCheckMs": 1793620803000,
+                "failures": 0
+              }
+            },
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": false
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707203000
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 2,
+              "current": {
+                "revision": 2,
+                "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                  "jpg": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+                }
+              },
+              "lastCheckMs": 1793620803000,
+              "failures": 0
+            },
+            "visible": true,
+            "attempting": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "focus-defers-swap",
+      "note": "Focus inside defers a fresh online swap; focus outside applies it non-immediately.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793707200000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 0,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707200000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800500,
+          "event": {
+            "type": "FOCUS",
+            "inside": true
+          },
+          "expect": []
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "COMMITTED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 2,
+                "current": {
+                  "revision": 2,
+                  "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "enabled": true,
+                  "expiresMs": 1793880000000,
+                  "photos": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                  }
+                },
+                "lastCheckMs": 1793620803000,
+                "failures": 0
+              }
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "online",
+            "pendingSwap": true
+          }
+        },
+        {
+          "atMs": 1793620804000,
+          "event": {
+            "type": "FOCUS",
+            "inside": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": false
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707203000
+            }
+          ],
+          "state": {
+            "visible": true,
+            "attempting": false,
+            "shown": "online",
+            "pendingSwap": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "click-opens",
+      "note": "A click before expiry on a valid online display opens its link.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793624400000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793624400000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "CLICK"
+          },
+          "expect": [
+            {
+              "type": "open-link"
+            }
+          ],
+          "state": {
+            "visible": true,
+            "shown": "online"
+          }
+        }
+      ]
+    },
+    {
+      "name": "timer-while-hidden",
+      "note": "TIMER and RESUME events after HIDDEN are ignored and produce no effects.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": {
+                "revision": 1,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "enabled": true,
+                "expiresMs": 1793624400000,
+                "photos": {
+                  "webp": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+              },
+              "lastCheckMs": 1793620800000,
+              "failures": 0
+            },
+            "setValid": true
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": false
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": true
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793624400000
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "HIDDEN"
+          },
+          "expect": [
+            {
+              "type": "disarm-timer"
+            }
+          ],
+          "state": {
+            "visible": false,
+            "timerAtMs": null
+          }
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "TIMER",
+            "mayFetch": true
+          },
+          "expect": [],
+          "state": {
+            "visible": false,
+            "timerAtMs": null
+          }
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "RESUME",
+            "mayFetch": true
+          },
+          "expect": [],
+          "state": {
+            "visible": false,
+            "timerAtMs": null
+          }
+        }
+      ]
+    },
+    {
+      "name": "commit-resets-failures",
+      "note": "A successful commit resets a previously failing record to zero failures.",
+      "floor": 1,
+      "kinds": [
+        "webp"
+      ],
+      "steps": [
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "START",
+            "record": {
+              "hwm": 1,
+              "current": null,
+              "lastCheckMs": 1793577600000,
+              "failures": 2
+            },
+            "setValid": false
+          },
+          "expect": [
+            {
+              "type": "delete-unnamed-sets"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620800000,
+          "event": {
+            "type": "SHOWN",
+            "mayFetch": true
+          },
+          "expect": [
+            {
+              "type": "display",
+              "what": "dagoat",
+              "immediate": true
+            },
+            {
+              "type": "fetch-signed",
+              "gen": 1
+            }
+          ]
+        },
+        {
+          "atMs": 1793620801000,
+          "event": {
+            "type": "SIGNED",
+            "gen": 1,
+            "result": {
+              "action": "show",
+              "reason": null,
+              "revision": 2,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "banner": {
+                "expires": "2026-11-05T12:00:00Z",
+                "photo": {
+                  "sha256": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                  }
+                }
+              }
+            }
+          },
+          "expect": [
+            {
+              "type": "fetch-photos",
+              "gen": 1,
+              "kinds": [
+                "webp"
+              ]
+            }
+          ]
+        },
+        {
+          "atMs": 1793620802000,
+          "event": {
+            "type": "PHOTOS",
+            "gen": 1,
+            "ok": true
+          },
+          "expect": [
+            {
+              "type": "write-set",
+              "gen": 1,
+              "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+            }
+          ]
+        },
+        {
+          "atMs": 1793620803000,
+          "event": {
+            "type": "COMMITTED",
+            "gen": 1
+          },
+          "expect": [
+            {
+              "type": "write-record",
+              "record": {
+                "hwm": 2,
+                "current": {
+                  "revision": 2,
+                  "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                  "enabled": true,
+                  "expiresMs": 1793880000000,
+                  "photos": {
+                    "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                  }
+                },
+                "lastCheckMs": 1793620803000,
+                "failures": 0
+              }
+            },
+            {
+              "type": "display",
+              "what": "online",
+              "immediate": false
+            },
+            {
+              "type": "arm-timer",
+              "atMs": 1793707203000
+            }
+          ],
+          "state": {
+            "record": {
+              "hwm": 2,
+              "current": {
+                "revision": 2,
+                "sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                "enabled": true,
+                "expiresMs": 1793880000000,
+                "photos": {
+                  "webp": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+                }
+              },
+              "lastCheckMs": 1793620803000,
+              "failures": 0
+            },
+            "visible": true,
+            "attempting": false
+          }
+        }
+      ]
+    },
+    {
+      "name": "stale-signed-while-newer-runs",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620801000,"event":{"type":"HIDDEN"},"expect":[{"type":"cancel","gen":1}]},
+        {"atMs":1793620802000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":2}]},
+        {"atMs":1793620803000,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-05T12:00:00Z","photo":{"sha256":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}},"expect":[],"state":{"visible":true,"gen":2,"attempting":true,"shown":"dagoat"}}
+      ]
+    },
+    {
+      "name": "stale-committed-while-newer-writes",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620801000,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","banner":{"expires":"2026-11-05T12:00:00Z","photo":{"sha256":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}},"expect":[{"type":"fetch-photos","gen":1,"kinds":["webp"]}]},
+        {"atMs":1793620802000,"event":{"type":"PHOTOS","gen":1,"ok":true},"expect":[{"type":"write-set","gen":1,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"}]},
+        {"atMs":1793620803000,"event":{"type":"HIDDEN"},"expect":[{"type":"cancel","gen":1}]},
+        {"atMs":1793620804000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":2}]},
+        {"atMs":1793620805000,"event":{"type":"SIGNED","gen":2,"result":{"action":"show","reason":null,"revision":3,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-05T12:00:00Z","photo":{"sha256":{"webp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}}}},"expect":[{"type":"fetch-photos","gen":2,"kinds":["webp"]}]},
+        {"atMs":1793620806000,"event":{"type":"PHOTOS","gen":2,"ok":true},"expect":[{"type":"write-set","gen":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]},
+        {"atMs":1793620807000,"event":{"type":"COMMITTED","gen":1},"expect":[],"state":{"visible":true,"gen":2,"attempting":true,"shown":"dagoat"}},
+        {"atMs":1793620808000,"event":{"type":"COMMITTED","gen":2},"expect":[{"type":"write-record","record":{"hwm":3,"current":{"revision":3,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","enabled":true,"expiresMs":1793880000000,"photos":{"webp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},"lastCheckMs":1793620808000,"failures":0}},{"type":"display","what":"online","immediate":false},{"type":"arm-timer","atMs":1793707208000}],"state":{"visible":true,"attempting":false,"shown":"online"}}
+      ]
+    },
+    {
+      "name": "stale-failed-while-newer-runs",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620801000,"event":{"type":"HIDDEN"},"expect":[{"type":"cancel","gen":1}]},
+        {"atMs":1793620802000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":2}]},
+        {"atMs":1793620803000,"event":{"type":"FAILED","gen":1},"expect":[],"state":{"visible":true,"gen":2,"attempting":true,"shown":"dagoat"}},
+        {"atMs":1793620804000,"event":{"type":"SIGNED","gen":2,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-05T12:00:00Z","photo":{"sha256":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}},"expect":[{"type":"fetch-photos","gen":2,"kinds":["webp"]}],"state":{"visible":true,"gen":2,"attempting":true}}
+      ]
+    },
+    {
+      "name": "photos-in-signed-phase",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620801000,"event":{"type":"PHOTOS","gen":1,"ok":true},"expect":[],"state":{"visible":true,"gen":1,"attempting":true,"shown":"dagoat"}}
+      ]
+    },
+    {
+      "name": "committed-in-photos-phase",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620801000,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-05T12:00:00Z","photo":{"sha256":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}},"expect":[{"type":"fetch-photos","gen":1,"kinds":["webp"]}]},
+        {"atMs":1793620802000,"event":{"type":"COMMITTED","gen":1},"expect":[],"state":{"visible":true,"gen":1,"attempting":true,"shown":"dagoat"}}
+      ]
+    },
+    {
+      "name": "restart-clears-holds",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":{"revision":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true,"expiresMs":1793880000000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":0,"failures":0},"setValid":true},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":false},"expect":[{"type":"display","what":"online","immediate":true},{"type":"arm-timer","atMs":1793880000000}]},
+        {"atMs":1793620801000,"event":{"type":"POINTER","over":true},"expect":[]},
+        {"atMs":1793620803000,"event":{"type":"START","record":{"hwm":1,"current":{"revision":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true,"expiresMs":1793880000000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":0,"failures":0},"setValid":true},"expect":[{"type":"delete-unnamed-sets"}],"state":{"visible":false,"pendingSwap":false,"timerAtMs":null}},
+        {"atMs":1793620804000,"event":{"type":"SHOWN","mayFetch":false},"expect":[{"type":"display","what":"online","immediate":true},{"type":"arm-timer","atMs":1793880000000}]},
+        {"atMs":1793620805000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620806000,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-05T12:00:00Z","photo":{"sha256":{"webp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}}}},"expect":[{"type":"fetch-photos","gen":1,"kinds":["webp"]}]},
+        {"atMs":1793620807000,"event":{"type":"PHOTOS","gen":1,"ok":true},"expect":[{"type":"write-set","gen":1,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]},
+        {"atMs":1793620808000,"event":{"type":"COMMITTED","gen":1},"expect":[{"type":"write-record","record":{"hwm":2,"current":{"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","enabled":true,"expiresMs":1793880000000,"photos":{"webp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},"lastCheckMs":1793620808000,"failures":0}},{"type":"display","what":"online","immediate":false},{"type":"arm-timer","atMs":1793707208000}],"state":{"visible":true,"pendingSwap":false,"shown":"online"}}
+      ]
+    },
+    {
+      "name": "hide-clears-holds",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":{"revision":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true,"expiresMs":1793880000000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":0,"failures":0},"setValid":true},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":false},"expect":[{"type":"display","what":"online","immediate":true},{"type":"arm-timer","atMs":1793880000000}]},
+        {"atMs":1793620801000,"event":{"type":"POINTER","over":true},"expect":[]},
+        {"atMs":1793620802000,"event":{"type":"FOCUS","inside":true},"expect":[]},
+        {"atMs":1793620803000,"event":{"type":"HIDDEN"},"expect":[{"type":"disarm-timer"}],"state":{"visible":false,"pendingSwap":false,"timerAtMs":null}},
+        {"atMs":1793620804000,"event":{"type":"SHOWN","mayFetch":false},"expect":[{"type":"display","what":"online","immediate":true},{"type":"arm-timer","atMs":1793880000000}]},
+        {"atMs":1793620805000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620806000,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-05T12:00:00Z","photo":{"sha256":{"webp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}}}},"expect":[{"type":"fetch-photos","gen":1,"kinds":["webp"]}]},
+        {"atMs":1793620807000,"event":{"type":"PHOTOS","gen":1,"ok":true},"expect":[{"type":"write-set","gen":1,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]},
+        {"atMs":1793620808000,"event":{"type":"COMMITTED","gen":1},"expect":[{"type":"write-record","record":{"hwm":2,"current":{"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","enabled":true,"expiresMs":1793880000000,"photos":{"webp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},"lastCheckMs":1793620808000,"failures":0}},{"type":"display","what":"online","immediate":false},{"type":"arm-timer","atMs":1793707208000}],"state":{"visible":true,"pendingSwap":false,"shown":"online"}}
+      ]
+    },
+    {
+      "name": "expiry-check-on-hidden",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":{"revision":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true,"expiresMs":1793620801000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":0,"failures":0},"setValid":true},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":false},"expect":[{"type":"display","what":"online","immediate":true},{"type":"arm-timer","atMs":1793620801000}]},
+        {"atMs":1793620801000,"event":{"type":"HIDDEN"},"expect":[{"type":"disarm-timer"}],"state":{"visible":false,"shown":"online","timerAtMs":null}}
+      ]
+    },
+    {
+      "name": "timer-resume-hidden",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":{"revision":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true,"expiresMs":1793624400000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":0,"failures":0},"setValid":true},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":false},"expect":[{"type":"display","what":"online","immediate":true},{"type":"arm-timer","atMs":1793624400000}]},
+        {"atMs":1793620801000,"event":{"type":"HIDDEN"},"expect":[{"type":"disarm-timer"}]},
+        {"atMs":1793620802000,"event":{"type":"TIMER","mayFetch":true},"expect":[],"state":{"visible":false,"timerAtMs":null}},
+        {"atMs":1793620803000,"event":{"type":"RESUME","mayFetch":true},"expect":[],"state":{"visible":false,"timerAtMs":null}}
+      ]
+    },
+    {
+      "name": "resume-records-mayfetch",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":{"revision":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":false,"expiresMs":1793880000000,"photos":{}},"lastCheckMs":1793620800000,"failures":0},"setValid":true},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"arm-timer","atMs":1793707200000}]},
+        {"atMs":1793620801000,"event":{"type":"RESUME","mayFetch":false},"expect":[],"state":{"visible":true,"attempting":false,"timerAtMs":null,"shown":"dagoat"}}
+      ]
+    },
+    {
+      "name": "click-pointer-focus-hidden",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":false},"expect":[{"type":"display","what":"dagoat","immediate":true}]},
+        {"atMs":1793620801000,"event":{"type":"HIDDEN"},"expect":[]},
+        {"atMs":1793620802000,"event":{"type":"CLICK"},"expect":[],"state":{"visible":false}},
+        {"atMs":1793620803000,"event":{"type":"POINTER","over":true},"expect":[],"state":{"visible":false}},
+        {"atMs":1793620804000,"event":{"type":"FOCUS","inside":true},"expect":[],"state":{"visible":false}}
+      ]
+    },
+    {
+      "name": "precommit-at-expiry",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620800500,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-02T12:00:01Z","photo":{"sha256":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}},"expect":[{"type":"fetch-photos","gen":1,"kinds":["webp"]}]},
+        {"atMs":1793620801000,"event":{"type":"PHOTOS","gen":1,"ok":true},"expect":[{"type":"write-record","record":{"hwm":1,"current":null,"lastCheckMs":1793620801000,"failures":1}},{"type":"arm-timer","atMs":1793707201000}],"state":{"visible":true,"attempting":false,"record":{"hwm":1,"current":null,"lastCheckMs":1793620801000,"failures":1}}}
+      ]
+    },
+    {
+      "name": "committed-no-expiry-recheck",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620800500,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-02T12:00:01Z","photo":{"sha256":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}},"expect":[{"type":"fetch-photos","gen":1,"kinds":["webp"]}]},
+        {"atMs":1793620800600,"event":{"type":"PHOTOS","gen":1,"ok":true},"expect":[{"type":"write-set","gen":1,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]},
+        {"atMs":1793620802000,"event":{"type":"COMMITTED","gen":1},"expect":[{"type":"write-record","record":{"hwm":2,"current":{"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","enabled":true,"expiresMs":1793620801000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":1793620802000,"failures":0}},{"type":"arm-timer","atMs":1793707202000}],"state":{"visible":true,"attempting":false,"shown":"dagoat","record":{"hwm":2,"current":{"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","enabled":true,"expiresMs":1793620801000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":1793620802000,"failures":0}}}
+      ]
+    },
+    {
+      "name": "resume-resets-timer",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":{"revision":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true,"expiresMs":1793880000000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":1793620800000,"failures":0},"setValid":true},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"online","immediate":true},{"type":"arm-timer","atMs":1793707200000}]},
+        {"atMs":1793620801000,"event":{"type":"RESUME","mayFetch":true},"expect":[{"type":"arm-timer","atMs":1793707200000}],"state":{"visible":true,"attempting":false,"timerAtMs":1793707200000,"shown":"online"}}
+      ]
+    },
+    {
+      "name": "pending-replacement-expires-first",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":{"revision":1,"sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","enabled":true,"expiresMs":1793631600000,"photos":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}},"lastCheckMs":1793595600000,"failures":0},"setValid":true},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"online","immediate":true},{"type":"fetch-signed","gen":1},{"type":"arm-timer","atMs":1793631600000}]},
+        {"atMs":1793620801000,"event":{"type":"POINTER","over":true},"expect":[]},
+        {"atMs":1793620802000,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-02T12:01:00Z","photo":{"sha256":{"webp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}}}}},"expect":[{"type":"fetch-photos","gen":1,"kinds":["webp"]}]},
+        {"atMs":1793620803000,"event":{"type":"PHOTOS","gen":1,"ok":true},"expect":[{"type":"write-set","gen":1,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"}]},
+        {"atMs":1793620804000,"event":{"type":"COMMITTED","gen":1},"expect":[{"type":"write-record","record":{"hwm":2,"current":{"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","enabled":true,"expiresMs":1793620860000,"photos":{"webp":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"}},"lastCheckMs":1793620804000,"failures":0}},{"type":"arm-timer","atMs":1793620860000}],"state":{"visible":true,"attempting":false,"shown":"online","pendingSwap":true,"timerAtMs":1793620860000}},
+        {"atMs":1793620860000,"event":{"type":"TIMER","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"arm-timer","atMs":1793707204000}],"state":{"visible":true,"attempting":false,"shown":"dagoat","timerAtMs":1793707204000}}
+      ]
+    },
+    {
+      "name": "precommit-unparsable-expiry",
+      "floor": 1,
+      "kinds": ["webp"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620801000,"event":{"type":"SIGNED","gen":1,"result":{"action":"killswitch","reason":null,"revision":1,"sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","banner":{"expires":"garbage"}}},"expect":[{"type":"write-record","record":{"hwm":1,"current":null,"lastCheckMs":1793620801000,"failures":1}},{"type":"arm-timer","atMs":1793707201000}],"state":{"visible":true,"attempting":false,"record":{"hwm":1,"current":null,"lastCheckMs":1793620801000,"failures":1}}}
+      ]
+    },
+    {
+      "name": "show-missing-drawn-photo-hash",
+      "floor": 1,
+      "kinds": ["webp", "jpg"],
+      "steps": [
+        {"atMs":1793620800000,"event":{"type":"START","record":{"hwm":1,"current":null,"lastCheckMs":0,"failures":0},"setValid":false},"expect":[{"type":"delete-unnamed-sets"}]},
+        {"atMs":1793620800000,"event":{"type":"SHOWN","mayFetch":true},"expect":[{"type":"display","what":"dagoat","immediate":true},{"type":"fetch-signed","gen":1}]},
+        {"atMs":1793620801000,"event":{"type":"SIGNED","gen":1,"result":{"action":"show","reason":null,"revision":2,"sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","banner":{"expires":"2026-11-05T12:00:00Z","photo":{"sha256":{"webp":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}}}}},"expect":[{"type":"fetch-photos","gen":1,"kinds":["webp","jpg"]}]},
+        {"atMs":1793620802000,"event":{"type":"PHOTOS","gen":1,"ok":true},"expect":[{"type":"write-record","record":{"hwm":1,"current":null,"lastCheckMs":1793620802000,"failures":1}},{"type":"arm-timer","atMs":1793707202000}],"state":{"visible":true,"attempting":false,"record":{"hwm":1,"current":null,"lastCheckMs":1793620802000,"failures":1}}}
+      ]
+    }
+  ]
+}

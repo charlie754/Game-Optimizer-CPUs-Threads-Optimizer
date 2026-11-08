@@ -1278,14 +1278,19 @@ bool UpdateEnvironmentSection(SettingsState* st);
 // ---- how much room the sponsor panel needs ----------------------------------------------
 // THE TWO RENDERINGS ARE DIFFERENT SHAPES, so the band cannot be one number.
 //
-//   WebView2  ONE ROW OF THREE GROUPS - Ko-fi, Star-on-Github, and the disease-research copy
-//             beside the GOATPROJECT lockup - ~76 logical px tall and as wide as the window
-//             gives it. It was a 272 x 261 vertical stack, then a fixed 831 x 65 row; the
-//             numbers here are measured, see tools\measure-panel.py.
-//   GDI       the fallback in sponsor.cpp - a short horizontal ROW, ~45 logical px tall.
+//   WebView2  ONE ROW OF THREE GROUPS - Ko-fi, Star-on-Github, and the GOAT Cam banner (two
+//             copy lines beside the espresso plate: coffee photo, GOAT mark, wordmark, App Store
+//             QR) - kSponsorCssHeight = 76 logical px tall and as wide as the window gives it,
+//             never narrower than kSponsorCssMinWidth. It was a 272 x 261 vertical stack, then a
+//             fixed 831 x 65 row, then the GOATPROJECT row; the numbers are measured, see
+//             tools\measure-panel.py.
+//   GDI       the fallback in sponsor.cpp - the same three items in a row at its OWN natural
+//             width, in the SAME 76 logical px band (sponsor.cpp kPlateH, set by the QR).
 //
-// Reserving the row's height for the stack clips three quarters of the panel; reserving the
-// stack's height for the row opens 200px of dead space above the footer. So the band follows
+// The heights agree now; the widths and placements still do not. And the history is why the band
+// follows the rendering rather than one constant: reserving a row's height for the old stack
+// clipped three quarters of it, and the stack's height for a row opened 200px of dead space above
+// the footer. So the band follows
 // whichever rendering is actually in play, and `st->web` is the discriminator: non-null means
 // WebView2 is live or still being built, null means we are on the GDI path - either because
 // creation refused synchronously or because SponsorWebReady reported failure, and that
@@ -1352,11 +1357,12 @@ void SponsorWebReady(void* user, bool ok) {
         ShowWindow(st->hSponsor, SW_SHOWNA);
         InvalidateRect(st->hSponsor, nullptr, TRUE);
     }
-    // THE BAND MUST SHRINK. It was reserving the web panel's 150 logical px for a control
-    // that draws a 45px row; leaving it would strand 200px of dead space above the footer on
-    // exactly the machines that never get the web panel at all. SponsorBandSize now answers
-    // with the GDI measure, so one re-layout moves the page content back down into the room
-    // the panel gave up.
+    // THE BAND MUST FOLLOW THE GDI STRIP. It was reserving the web panel's rectangle for a
+    // different control; when the two heights differed (a 150px panel over a 45px row) that
+    // stranded 200px of dead space above the footer on exactly the machines that never get the
+    // web panel at all. Both are 76 logical px tall now, but the GDI strip has its own natural
+    // width and placement, so SponsorBandSize answers with the GDI measure and one re-layout
+    // puts the band where that control actually is.
     SettingsLayout(st, hwnd);
     InvalidateRect(hwnd, nullptr, TRUE);
 }
@@ -3588,7 +3594,8 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
     // WHICH part has changed with the placement, and it is worth saying plainly. The old
     // fixed-width panel clipped at its own LEFT edge, so the lockup in the bottom-right survived.
     // A `space-between` row that runs out of room overflows its END edge, so what disappears
-    // behind `.shell { overflow: hidden }` is the RIGHT-hand group - the GOATPROJECT lockup.
+    // behind `.shell { overflow: hidden }` is the RIGHT-hand group - the GOAT Cam plate and its
+    // App Store QR.
     // Nothing degrades gracefully any more; what prevents it is the window minimum staying above
     // kSponsorCssMinWidth, which is what WM_GETMINMAXINFO below is for.
     const int avail = (ch - footerH - GAP) - (TABH + GAP);
@@ -3623,8 +3630,9 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
     // WebView2 panel is up the strip is hidden - but SponsorWebReady and the patience timer both
     // call ShowWindow BEFORE they re-run this layout, so whatever position it is holding is what
     // the user sees for one frame. Until 2026-08-29 that was the panel's rectangle, which was at
-    // least a strip-shaped one; the panel is now the whole content row and a 45px strip stretched
-    // across it is not. Parking it where it actually belongs costs one SetWindowPos per layout.
+    // least a strip-shaped one; the panel is now the whole content row, and the GDI strip - which
+    // packs its items from its own left edge at its natural width - stretched across it is not.
+    // Parking it where it actually belongs costs one SetWindowPos per layout.
     if (st->sponsorW > 0 && st->sponsorH > 0) {
         int gW = st->sponsorW;
         int gH = st->sponsorH;
@@ -6110,39 +6118,45 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             // The panel is one row of three groups spread with `justify-content: space-between`,
             // and it has a FLOOR: kSponsorCssMinWidth, the narrowest host at which the three
             // groups still fit. Below it the row overflows its end edge and
-            // `.shell { overflow: hidden }` cuts the GOATPROJECT lockup off, silently, with no
-            // error anywhere.
+            // `.shell { overflow: hidden }` cuts the GOAT Cam plate and its App Store QR off,
+            // silently, with no error anywhere.
             //
-            // RE-DERIVED 2026-08-29, and the numbers are measured, not reasoned about:
+            // RE-DERIVED 2026-10-25 for the GOAT Cam strip, and the numbers are measured, not
+            // reasoned about:
             //
-            //   [M] kSponsorCssMinWidth = 849 (src\sponsor_html.h). tools\measure-panel.py
+            //   [M] kSponsorCssMinWidth = 848 (src\sponsor_html.h). tools\measure-panel.py
             //       renders the shipped page and sweeps the host width 1000px down to 640px in
-            //       1px steps: the first break is at 848 (row-overflow), so the floor is 849.
-            //       The generator's own --measure pass reports the same 848.83 intrinsic width
-            //       from `width:max-content` - two independent routes, one answer.
+            //       1px steps: the first break is at 847 (group-past-row), so the floor is 848.
+            //       The generator's own --measure pass reports 847.41 intrinsic width from
+            //       `width:max-content` - two independent routes, one answer.
+            //   [M] It fits ONLY because Ko-fi and Star are drawn at 80% (the generator's
+            //       BTN_ZOOM): at full size the master's own measurement of this row is 916.84,
+            //       61 CSS px past what this minimum offers. The GOAT Cam banner itself is the
+            //       master's goat--strip, unchanged in width.
             //   [M] The panel gets cw - 2 * theme::metric::kGap, so at this minimum it has
-            //       880 - 2 * 12 = 856 CSS px. 849 fits with 7 to spare.
+            //       880 - 2 * 12 = 856 CSS px. 848 fits with 8 to spare.
             //   [M] 856 is the CSS-px answer and not the guard: the three MulDiv calls round
             //       independently, so the largest floor that is safe at EVERY integer dpi from
-            //       96 to 480 (custom scaling runs 100%..500%) is 855. 849 is inside it.
-            //   [M] Sweeping every one of those 385 DPI values, the worst margin is 7 DEVICE px,
-            //       at dpi 96; it GROWS with DPI (9 at 125%, 10 at 150%, 12 at 175%) because
-            //       7 CSS px scale up while the rounding error stays at most 1px. The thin case
+            //       96 to 480 (custom scaling runs 100%..500%) is 855. 848 is inside it.
+            //   [M] Sweeping every one of those 385 DPI values, the worst margin is 8 DEVICE px,
+            //       at dpi 96; it GROWS with DPI (10 at 125%, 12 at 150%, 14 at 175%) because
+            //       8 CSS px scale up while the rounding error stays at most 1px. The thin case
             //       is 100% and even there nothing rounds it away.
             //
-            // COULD IT BE SMALLER? Yes: Dp(874) is the smallest minimum at which a 849px floor
-            // is safe at every DPI. It is not taken. 880 costs 6 CSS px against 874, and buys:
-            //   * headroom for the panel's floor to move. The floor is a MEASUREMENT of four
-            //     intrinsic widths and two gaps; a font-metric change moves it, and at 874 the
-            //     margin is zero, so the next re-measure would fail the generator's guard rather
-            //     than absorb it.
+            // COULD IT BE SMALLER? Yes: Dp(873) is the smallest minimum at which an 848px floor
+            // is safe at every DPI. It is not taken. 880 costs 7 CSS px against 873, and buys:
+            //   * headroom for the panel's floor to move. The floor is a MEASUREMENT of three
+            //     groups' intrinsic widths and two gaps; a font-metric change moves it, and at
+            //     873 the margin is zero, so the next re-measure would fail the generator's guard
+            //     rather than absorb it.
             //   * defence in depth. What refuses an over-budget panel is a Python script's
             //     guard; a regression there is silent in a way this constant is not.
             //   * it is already the shipped minimum, so keeping it changes nothing for anyone.
             //
             // Not more than 880: at 150% scaling Dp(880) is 1320 device px and still fits a
             // 1366-wide screen with 30px spare. Dp(900) leaves exactly ZERO there; Dp(920)
-            // does not fit at all.
+            // does not fit at all - which is also why the full-size GOAT Cam row (it would need
+            // about Dp(941)) was fitted by shrinking the buttons rather than by raising this.
             //
             // MIN_CLIENT_CSS_W in tools\gen-sponsor-html.py AND in tools\measure-panel.py is
             // this same 880. All three have to move together or the guard is measuring a window
@@ -6217,8 +6231,9 @@ LRESULT CALLBACK SettingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 // page does turn up.
                 if (!st->webShowing && st->hSponsor != nullptr) {
                     // Size the band for the control that is about to be on screen. The two
-                    // renderings are different shapes: leaving the band at the web panel's
-                    // 462x150 rectangle would strand dead height above the 45px GDI row.
+                    // renderings are different shapes: the same 76px band, but the web panel
+                    // fills the content row while the GDI strip has its own natural width and
+                    // sits right-anchored, so the band has to be the GDI strip's.
                     st->webLate = true;
                     ShowWindow(st->hSponsor, SW_SHOWNA);
                     SettingsLayout(st, hwnd);

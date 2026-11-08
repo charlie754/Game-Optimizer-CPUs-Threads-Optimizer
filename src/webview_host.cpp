@@ -17,6 +17,7 @@
 // there to hold their slots. Parameter types for uncalled methods are deliberately loose
 // (void*), because a slot's position is what matters, not its signature.
 #include "webview_host.h"
+#include "banner_host.h"
 
 #include <objbase.h>
 #include <shellapi.h>
@@ -24,10 +25,13 @@
 #include <string>
 #include <string.h>
 
+#include "goatcam_qr.h"
+#include "qr_magnifier.h"
 #include "sponsor.h"
 #include "sponsor_html.h"
 #include "theme.h"
 #include "util.h"
+#include "webview_message.h"
 
 namespace cd {
 namespace {
@@ -61,6 +65,13 @@ const GUID kIID_NewWindowHandler =
 // 0xc979903e_d4ca_4228_92eb_47ee3fa96eab
 const GUID kIID_Controller2 =
     { 0xc979903e, 0xd4ca, 0x4228, { 0x92, 0xeb, 0x47, 0xee, 0x3f, 0xa9, 0x6e, 0xab } };
+// 0x57213f19_00e6_49fa_8e07_898ea01ecbd2 - ICoreWebView2WebMessageReceivedEventHandler,
+// bindings.rs line 37470.
+const GUID kIID_WebMessageHandler =
+    { 0x57213f19, 0x00e6, 0x49fa, { 0x8e, 0x07, 0x89, 0x8e, 0xa0, 0x1e, 0xcb, 0xd2 } };
+// 0xd33a35bf_1c49_4f98_93ab_006e0533fe1c - ICoreWebView2NavigationCompletedEventHandler.
+const GUID kIID_NavigationCompletedHandler =
+    { 0xd33a35bf, 0x1c49, 0x4f98, { 0x93, 0xab, 0x00, 0x6e, 0x05, 0x33, 0xfe, 0x1c } };
 
 // ===========================================================================
 // Interfaces.
@@ -116,6 +127,20 @@ struct IWvNewWindowArgs : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE get_IsUserInitiated(BOOL*) = 0;
     virtual HRESULT STDMETHODCALLTYPE GetDeferral(void**) = 0;
     virtual HRESULT STDMETHODCALLTYPE get_WindowFeatures(void**) = 0;
+};
+
+// ICoreWebView2WebMessageReceivedEventArgs (IID 0x0f99a40c_e962_4207_9e92_e3d542eff849,
+// bindings.rs line 37256): Source, WebMessageAsJson, TryGetWebMessageAsString - in that order.
+struct IWvWebMessageArgs : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE get_Source(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_WebMessageAsJson(LPWSTR*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE TryGetWebMessageAsString(LPWSTR*) = 0;
+};
+
+struct IWvNavigationCompletedArgs : public IUnknown {
+    virtual HRESULT STDMETHODCALLTYPE get_NavigationId(UINT64*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_IsSuccess(BOOL*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_WebErrorStatus(INT*) = 0;
 };
 
 // ICoreWebView2. Every slot up to add_NewWindowRequested is listed; the ones this file never
@@ -294,10 +319,11 @@ bool StartsWithI(const std::wstring& s, const wchar_t* prefix) {
     return _wcsnicmp(s.c_str(), prefix, n) == 0;
 }
 
-// The browser normalises "https://dagoat.io" to "https://dagoat.io/" before the navigation
-// event fires, so an exact compare against the constant in sponsor.h would MISS the goat
-// lockup - the one link most likely to be clicked. One optional trailing slash is the whole
-// tolerance; nothing else is forgiven.
+// The browser normalises "https://goatcam.dagoat.io" to "https://goatcam.dagoat.io/" before the
+// navigation event fires, so an exact compare against the constant in sponsor.h would MISS the
+// GOAT Cam plate - the one link most likely to be clicked. One optional trailing slash, on
+// either side, is the whole tolerance; nothing else is forgiven - not a path, not a query, and
+// not another host (dagoat.io, the old destination, is refused now).
 bool SameTarget(std::wstring a, std::wstring b) {
     if (!a.empty() && a[a.size() - 1] == L'/') a.erase(a.size() - 1);
     if (!b.empty() && b[b.size() - 1] == L'/') b.erase(b.size() - 1);
@@ -305,22 +331,36 @@ bool SameTarget(std::wstring a, std::wstring b) {
            ::CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
-// A click is only ever allowed to open one of the three known destinations, and what is
-// opened is the CONSTANT from sponsor.h, never the string the page supplied. Anything else -
-// a redirect, an injected link, a mistake in the page - is dropped. Opening a WRONG url is
-// worse than opening none: it sends the user somewhere the author did not intend.
+// The GDI and WebView2 paths share the same pure decision. Fixed destinations open their
+// canonical literal; an online banner may additionally authorize exactly its current signed
+// link. The page-supplied spelling is never opened for the dynamic case.
 bool OpenIfKnown(HWND owner, const std::wstring& uri) {
-    const wchar_t* const known[3] = { sponsor_url::kKofi, sponsor_url::kGitHub,
-                                      sponsor_url::kGoatProject };
-    for (int i = 0; i < 3; ++i) {
-        if (SameTarget(uri, known[i])) {
-            LogLine(L"[sponsor] opening %s in the default browser", known[i]);
-            ::ShellExecuteW(owner, L"open", known[i], nullptr, nullptr, SW_SHOWNORMAL);
+    const ob::Model current = BannerHostCurrent();
+    if (!SponsorLinkAllowed(uri, current)) {
+        LogLine(L"[sponsor] refused an unexpected navigation target");
+        return false;
+    }
+    const wchar_t* const fixed[] = { sponsor_url::kKofi, sponsor_url::kGitHub,
+                                     sponsor_url::kGoatCam, sponsor_url::kDaGoat };
+    for (const wchar_t* target : fixed) {
+        if (SameTarget(uri, target)) {
+            LogLine(L"[sponsor] opening %s in the default browser", target);
+            ::ShellExecuteW(owner, L"open", target, nullptr, nullptr, SW_SHOWNORMAL);
             return true;
         }
     }
-    LogLine(L"[sponsor] refused an unexpected navigation target");
-    return false;
+    const std::wstring signedTarget = Widen(current.banner.link);
+    if (current.online && !signedTarget.empty() && SameTarget(uri, signedTarget)) {
+        std::string verified;
+        if (!BannerHostClick(&verified)) return false;
+        const std::wstring clickedTarget = Widen(verified);
+        if (!SponsorLinkAllowed(clickedTarget, BannerHostCurrent()) ||
+            !SameTarget(clickedTarget, signedTarget)) return false;
+        LogLine(L"[sponsor] opening the verified online banner link");
+        ::ShellExecuteW(owner, L"open", clickedTarget.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        return true;
+    }
+    return false;  // defensive: SponsorLinkAllowed and this canonicalisation must agree.
 }
 
 }  // namespace
@@ -332,6 +372,7 @@ struct WebSponsor {
     LONG ref = 1;            // one reference for the owner; handlers add their own
     bool closed = false;     // WebSponsorDestroy has run; pending callbacks must do nothing
     bool reported = false;   // `ready` is called exactly once
+    bool initialNavigationPending = false;
 
     HWND parent = nullptr;
     HWND host = nullptr;
@@ -342,6 +383,23 @@ struct WebSponsor {
 
     WebSponsorReadyFn ready = nullptr;
     void* user = nullptr;
+
+    bool qrShown = false;    // this view has the QR magnifier up (qr_magnifier.h)
+    int bannerToken = 0;
+
+    // The magnifier comes down at once whenever the view moves, hides or goes away: the tile it
+    // points at is not where it was.
+    void DropQr() {
+        if (qrShown) QrMagnifierHideNow();
+        qrShown = false;
+    }
+
+    // ... and fades out on "leave", or on ANY message it cannot act on: a stale popup must not
+    // outlive a refresh that failed.
+    void HideQr() {
+        if (qrShown) QrMagnifierHide();
+        qrShown = false;
+    }
 
     void AddRef() { ::InterlockedIncrement(&ref); }
     void Release() {
@@ -357,6 +415,12 @@ struct WebSponsor {
     // Everything that touches the runtime, in one place, so the failure path and the destroy
     // path cannot drift apart.
     void Teardown() {
+        DropQr();
+        if (bannerToken != 0) {
+            BannerHostVisible(bannerToken, false);
+            BannerHostUnsubscribe(bannerToken);
+            bannerToken = 0;
+        }
         if (webview != nullptr) {
             webview->Release();
             webview = nullptr;
@@ -374,6 +438,16 @@ struct WebSponsor {
 };
 
 namespace {
+
+void PostBannerModel(WebSponsor* owner) {
+    if (owner == nullptr || owner->closed || owner->webview == nullptr) return;
+    const std::wstring message = PageMessageJson(BannerHostCurrent());
+    const HRESULT hr = owner->webview->PostWebMessageAsJson(message.c_str());
+    if (FAILED(hr)) {
+        LogLine(L"[sponsor] PostWebMessageAsJson failed, hr=0x%08lx",
+                static_cast<unsigned long>(hr));
+    }
+}
 
 // ===========================================================================
 // Handlers. Each is a COM object this file owns; each holds a reference on the WebSponsor so
@@ -433,20 +507,50 @@ public:
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
         return this->Qi(riid, kIID_NavStartingHandler, out);
     }
-    // Invoke(sender, args). Cancel EVERY http(s) navigation the page tries to make - nothing
-    // may load inside this view - and hand a recognised URL to the user's real browser. The
-    // initial NavigateToString is not http, so it is left alone.
+    // Invoke(sender, args). The first navigation is the host's own NavigateToString load.
+    // Every later navigation is cancelled for every scheme; only a user-initiated, allow-listed
+    // https target is handed to the user's real browser.
     virtual HRESULT STDMETHODCALLTYPE Invoke(IWvWebView* sender, IWvNavStartingArgs* args) {
         (void)sender;
-        if (args == nullptr) return S_OK;
+        if (args == nullptr) return E_POINTER;
+        const HRESULT cancelHr = args->put_Cancel(TRUE);
+        if (FAILED(cancelHr)) {
+            LogLine(L"[sponsor] NavigationStarting put_Cancel failed, hr=0x%08lx",
+                    static_cast<unsigned long>(cancelHr));
+            return cancelHr;
+        }
+
+        BOOL userInitiated = FALSE;
+        const HRESULT userHr = args->get_IsUserInitiated(&userInitiated);
+        if (FAILED(userHr)) {
+            LogLine(L"[sponsor] NavigationStarting get_IsUserInitiated failed, hr=0x%08lx",
+                    static_cast<unsigned long>(userHr));
+            return S_OK;
+        }
         LPWSTR uri = nullptr;
-        if (SUCCEEDED(args->get_Uri(&uri)) && uri != nullptr) {
-            const std::wstring u(uri);
-            ::CoTaskMemFree(uri);
-            if (StartsWithI(u, L"http://") || StartsWithI(u, L"https://")) {
-                args->put_Cancel(TRUE);
-                if (!this->owner_->closed) OpenIfKnown(this->owner_->host, u);
+        const HRESULT uriHr = args->get_Uri(&uri);
+        if (FAILED(uriHr) || uri == nullptr) {
+            if (FAILED(uriHr)) {
+                LogLine(L"[sponsor] NavigationStarting get_Uri failed, hr=0x%08lx",
+                        static_cast<unsigned long>(uriHr));
             }
+            return S_OK;
+        }
+        const std::wstring u(uri);
+        ::CoTaskMemFree(uri);
+        if (this->owner_->initialNavigationPending) {
+            this->owner_->initialNavigationPending = false;
+            const HRESULT allowHr = args->put_Cancel(FALSE);
+            if (FAILED(allowHr)) {
+                LogLine(L"[sponsor] initial navigation put_Cancel(FALSE) failed, hr=0x%08lx",
+                        static_cast<unsigned long>(allowHr));
+                return allowHr;
+            }
+            return S_OK;
+        }
+        if (userInitiated == TRUE && !this->owner_->closed &&
+            (StartsWithI(u, L"http://") || StartsWithI(u, L"https://"))) {
+            OpenIfKnown(this->owner_->host, u);
         }
         return S_OK;
     }
@@ -463,14 +567,203 @@ public:
     // one of its own.
     virtual HRESULT STDMETHODCALLTYPE Invoke(IWvWebView* sender, IWvNewWindowArgs* args) {
         (void)sender;
-        if (args == nullptr) return S_OK;
-        LPWSTR uri = nullptr;
-        if (SUCCEEDED(args->get_Uri(&uri)) && uri != nullptr) {
-            const std::wstring u(uri);
-            ::CoTaskMemFree(uri);
-            if (!this->owner_->closed) OpenIfKnown(this->owner_->host, u);
+        if (args == nullptr) return E_POINTER;
+        const HRESULT handledHr = args->put_Handled(TRUE);
+        if (FAILED(handledHr)) {
+            LogLine(L"[sponsor] NewWindowRequested put_Handled failed, hr=0x%08lx",
+                    static_cast<unsigned long>(handledHr));
+            return handledHr;
         }
-        args->put_Handled(TRUE);
+        BOOL userInitiated = FALSE;
+        const HRESULT userHr = args->get_IsUserInitiated(&userInitiated);
+        if (FAILED(userHr)) {
+            LogLine(L"[sponsor] NewWindowRequested get_IsUserInitiated failed, hr=0x%08lx",
+                    static_cast<unsigned long>(userHr));
+            return S_OK;
+        }
+        LPWSTR uri = nullptr;
+        const HRESULT uriHr = args->get_Uri(&uri);
+        if (FAILED(uriHr) || uri == nullptr) {
+            if (FAILED(uriHr)) {
+                LogLine(L"[sponsor] NewWindowRequested get_Uri failed, hr=0x%08lx",
+                        static_cast<unsigned long>(uriHr));
+            }
+            return S_OK;
+        }
+        const std::wstring u(uri);
+        ::CoTaskMemFree(uri);
+        if (userInitiated == TRUE && !this->owner_->closed) {
+            OpenIfKnown(this->owner_->host, u);
+        }
+        return S_OK;
+    }
+};
+
+int HostDpi(HWND hwnd) {
+    typedef UINT(WINAPI * PFN_GetDpiForWindow)(HWND);
+    static PFN_GetDpiForWindow fn = []() -> PFN_GetDpiForWindow {
+        HMODULE u = ::GetModuleHandleW(L"user32.dll");
+        if (u == nullptr) return nullptr;
+        return reinterpret_cast<PFN_GetDpiForWindow>(
+            reinterpret_cast<void*>(::GetProcAddress(u, "GetDpiForWindow")));
+    }();
+    if (fn != nullptr && hwnd != nullptr) {
+        const UINT d = fn(hwnd);
+        if (d != 0) return static_cast<int>(d);
+    }
+    return 96;
+}
+
+bool JsonWideToUtf8(const wchar_t* value, std::size_t length, std::string* out) {
+    if (value == nullptr || out == nullptr || length == 0 ||
+        length > cd::webview_message::kMaxJsonChars) return false;
+    if (length > static_cast<std::size_t>(INT_MAX)) return false;
+    const int boundedLength = static_cast<int>(length);
+    const int bytes = ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, boundedLength,
+                                            nullptr, 0, nullptr, nullptr);
+    if (bytes <= 0) return false;
+    out->assign(static_cast<size_t>(bytes), '\0');
+    return ::WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, value, boundedLength, &(*out)[0], bytes,
+                                 nullptr, nullptr) == bytes;
+}
+
+const ob::json::Value* JsonMember(const ob::json::Value& object, const char* key) {
+    for (const auto& member : object.members) {
+        if (member.first == key) return &member.second;
+    }
+    return nullptr;
+}
+
+bool HasBannerMessageKey(const std::string& json) {
+    ob::json::Value root;
+    if (ob::json::Parse(json, static_cast<int>(json.size()), &root) != nullptr ||
+        root.type != ob::json::Type::Object) return false;
+    return JsonMember(root, "goatcamBanner") != nullptr;
+}
+
+bool ParseBannerInput(const std::string& utf8, bool* isPointer, bool* value) {
+    if (isPointer == nullptr || value == nullptr) return false;
+    ob::json::Value root;
+    if (ob::json::Parse(utf8, static_cast<int>(utf8.size()), &root) != nullptr ||
+        root.type != ob::json::Type::Object || root.members.size() != 2) return false;
+    const ob::json::Value* event = JsonMember(root, "goatcamBanner");
+    if (event == nullptr || event->type != ob::json::Type::String) return false;
+    if (event->text == "pointer") {
+        const ob::json::Value* over = JsonMember(root, "over");
+        if (over == nullptr || over->type != ob::json::Type::Bool) return false;
+        *isPointer = true;
+        *value = over->b;
+        return true;
+    }
+    if (event->text == "focus") {
+        const ob::json::Value* inside = JsonMember(root, "inside");
+        if (inside == nullptr || inside->type != ob::json::Type::Bool) return false;
+        *isPointer = false;
+        *value = inside->b;
+        return true;
+    }
+    return false;
+}
+
+// The page's QR hover report - the ONLY message this view accepts. goatcam_qr.h parses it
+// strictly (two keys, four finite numbers, nothing else). "enter" shows the native QR magnifier
+// above the tile, "leave" hides it. The rect is CSS px inside the view; it becomes device px with
+// the view's bounds, the window's dpi and the zoom factor, and a rect the view cannot be showing
+// is refused rather than trusted. Anything refused - a malformed message, a failed getter, bounds
+// or zoom that cannot be read, a dpi or zoom outside its sane range, a rect outside the view -
+// hides this view's popup and does nothing else. Nothing here navigates or opens anything: the
+// allow-list above is untouched.
+class WebMessageHandler : public HandlerBase<WebMessageHandler> {
+public:
+    explicit WebMessageHandler(WebSponsor* o) : HandlerBase(o) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        return this->Qi(riid, kIID_WebMessageHandler, out);
+    }
+    virtual HRESULT STDMETHODCALLTYPE Invoke(IWvWebView* sender, IWvWebMessageArgs* args) {
+        (void)sender;
+        WebSponsor* const o = this->owner_;
+        if (o->closed) return S_OK;   // Teardown has already taken the popup down
+        // Every refusal below HIDES this view's popup: a stale popup must not survive an invalid
+        // refresh. The JSON is freed whenever the getter handed a pointer back, even with a
+        // failure code.
+        LPWSTR json = nullptr;
+        const HRESULT got = (args != nullptr) ? args->get_WebMessageAsJson(&json) : E_POINTER;
+        const bool bounded = SUCCEEDED(got) && json != nullptr &&
+                             cd::webview_message::WithinLimit(json);
+        const std::size_t jsonLength = bounded ? cd::webview_message::BoundedLength(json) : 0;
+        std::string utf8;
+        if (bounded && JsonWideToUtf8(json, jsonLength, &utf8)) {
+            if (HasBannerMessageKey(utf8)) {
+                bool isPointer = false;
+                bool value = false;
+                const bool accepted = ParseBannerInput(utf8, &isPointer, &value);
+                ::CoTaskMemFree(json);
+                if (accepted) {
+                    if (isPointer) BannerHostPointer(value);
+                    else BannerHostFocus(value);
+                } else {
+                    o->HideQr();
+                }
+                return S_OK;
+            }
+        }
+        goatcam_qr::QrMessage m;
+        const bool parsed = bounded && goatcam_qr::ParseQrMessage(json, &m);
+        if (json != nullptr) ::CoTaskMemFree(json);
+        if (!parsed || m.event == goatcam_qr::QrEvent::kLeave || o->host == nullptr || o->controller == nullptr) {
+            o->HideQr();
+            return S_OK;
+        }
+        RECT b;
+        double zoom = 1.0;
+        long l = 0, t = 0, r = 0, bt = 0;
+        const int dpi = HostDpi(o->host);
+        if (FAILED(o->controller->get_Bounds(&b)) || FAILED(o->controller->get_ZoomFactor(&zoom)) ||
+            !goatcam_qr::QrCssRectToClient(m, b.left, b.top, b.right, b.bottom, dpi, zoom, &l, &t, &r, &bt)) {
+            o->HideQr();
+            return S_OK;
+        }
+        RECT tile = { l, t, r, bt };
+        ::SetLastError(0);
+        if (::MapWindowPoints(o->host, nullptr, reinterpret_cast<POINT*>(&tile), 2) == 0 &&
+            ::GetLastError() != 0) {
+            o->HideQr();   // fail closed if client-to-screen mapping fails
+            return S_OK;
+        }
+        // An identical rect while the popup is up is coalesced inside QrMagnifierShow (no move, no
+        // fade restart). It refuses a hidden or minimised owner, or one it cannot watch, so record
+        // what actually happened rather than what was asked.
+        QrMagnifierShow(o->host, tile, dpi);
+        o->qrShown = QrMagnifierIsShown();
+        return S_OK;
+    }
+};
+
+class NavigationCompletedHandler : public HandlerBase<NavigationCompletedHandler> {
+public:
+    explicit NavigationCompletedHandler(WebSponsor* o) : HandlerBase(o) {}
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** out) override {
+        return this->Qi(riid, kIID_NavigationCompletedHandler, out);
+    }
+    virtual HRESULT STDMETHODCALLTYPE Invoke(IWvWebView* sender, IWvNavigationCompletedArgs* args) {
+        (void)sender;
+        WebSponsor* const o = this->owner_;
+        if (o->closed) return S_OK;
+        BOOL success = FALSE;
+        if (args == nullptr || FAILED(args->get_IsSuccess(&success)) || !success) {
+            LogLine(L"[sponsor] banner page navigation failed - using the GDI strip");
+            o->Teardown();
+            o->Report(false);
+            return S_OK;
+        }
+        PostBannerModel(o);
+        if (o->controller != nullptr) o->controller->put_IsVisible(TRUE);
+        if (o->host != nullptr) {
+            ::ShowWindow(o->host, SW_SHOWNA);
+            if (::IsWindowVisible(o->host) && o->bannerToken != 0)
+                BannerHostVisible(o->bannerToken, true);
+        }
+        o->Report(true);
         return S_OK;
     }
 };
@@ -582,24 +875,80 @@ HRESULT STDMETHODCALLTYPE ControllerHandler::Invoke(HRESULT hr, IWvController* c
         s->put_IsStatusBarEnabled(FALSE);
         s->put_AreDefaultContextMenusEnabled(FALSE);
         s->put_IsZoomControlEnabled(FALSE);
+        s->put_IsWebMessageEnabled(TRUE);   // the page's QR hover report; see WebMessageHandler
         s->Release();
+    }
+    bool handlersOk = true;
+    {
+        INT64 token = 0;
+        WebMessageHandler* wm = new (std::nothrow) WebMessageHandler(owner);
+        if (wm == nullptr) {
+            handlersOk = false;
+            LogLine(L"[sponsor] WebMessageReceived handler allocation failed - GDI strip");
+        } else {
+            const HRESULT hr = web->add_WebMessageReceived(static_cast<IUnknown*>(wm), &token);
+            wm->Release();
+            if (FAILED(hr)) {
+                handlersOk = false;
+                LogLine(L"[sponsor] add_WebMessageReceived failed, hr=0x%08lx - GDI strip",
+                        static_cast<unsigned long>(hr));
+            }
+        }
     }
 
     {
         INT64 token = 0;
         NewWindowHandler* nw = new (std::nothrow) NewWindowHandler(owner);
-        if (nw != nullptr) {
-            web->add_NewWindowRequested(static_cast<IUnknown*>(nw), &token);
+        if (nw == nullptr) {
+            handlersOk = false;
+            LogLine(L"[sponsor] NewWindowRequested handler allocation failed - GDI strip");
+        } else {
+            const HRESULT hr = web->add_NewWindowRequested(static_cast<IUnknown*>(nw), &token);
             nw->Release();
+            if (FAILED(hr)) {
+                handlersOk = false;
+                LogLine(L"[sponsor] add_NewWindowRequested failed, hr=0x%08lx - GDI strip",
+                        static_cast<unsigned long>(hr));
+            }
         }
     }
     {
         INT64 token = 0;
         NavStartingHandler* ns = new (std::nothrow) NavStartingHandler(owner);
-        if (ns != nullptr) {
-            web->add_NavigationStarting(static_cast<IUnknown*>(ns), &token);
+        if (ns == nullptr) {
+            handlersOk = false;
+            LogLine(L"[sponsor] NavigationStarting handler allocation failed - GDI strip");
+        } else {
+            const HRESULT hr = web->add_NavigationStarting(static_cast<IUnknown*>(ns), &token);
             ns->Release();
+            if (FAILED(hr)) {
+                handlersOk = false;
+                LogLine(L"[sponsor] add_NavigationStarting failed, hr=0x%08lx - GDI strip",
+                        static_cast<unsigned long>(hr));
+            }
         }
+    }
+    {
+        INT64 token = 0;
+        NavigationCompletedHandler* nc = new (std::nothrow) NavigationCompletedHandler(owner);
+        if (nc == nullptr) {
+            handlersOk = false;
+            LogLine(L"[sponsor] NavigationCompleted handler allocation failed - GDI strip");
+        } else {
+            const HRESULT hr = web->add_NavigationCompleted(static_cast<IUnknown*>(nc), &token);
+            nc->Release();
+            if (FAILED(hr)) {
+                handlersOk = false;
+                LogLine(L"[sponsor] add_NavigationCompleted failed, hr=0x%08lx - GDI strip",
+                        static_cast<unsigned long>(hr));
+            }
+        }
+    }
+
+    if (!handlersOk) {
+        owner->Teardown();
+        owner->Report(false);
+        return S_OK;
     }
 
     RECT client;
@@ -608,6 +957,7 @@ HRESULT STDMETHODCALLTYPE ControllerHandler::Invoke(HRESULT hr, IWvController* c
     controller->put_Bounds(client);
 
     const std::wstring page = BuildPage();
+    owner->initialNavigationPending = true;
     const HRESULT nhr = web->NavigateToString(page.c_str());
     if (FAILED(nhr)) {
         LogLine(L"[sponsor] NavigateToString failed, hr=0x%08lx - GDI strip",
@@ -617,9 +967,9 @@ HRESULT STDMETHODCALLTYPE ControllerHandler::Invoke(HRESULT hr, IWvController* c
         return S_OK;
     }
 
-    controller->put_IsVisible(TRUE);
-    ::ShowWindow(owner->host, SW_SHOWNA);
-    owner->Report(true);
+    // The host remains hidden until NavigationCompleted has proved that the generated page
+    // loaded. That callback posts the first model and then makes visibility observable to the
+    // shared client.
     return S_OK;
 }
 
@@ -668,6 +1018,19 @@ void PaintHostGround(HWND hwnd, HDC dc) {
 }
 
 LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    WebSponsor* owner = reinterpret_cast<WebSponsor*>(::GetWindowLongPtrW(hwnd, GWLP_USERDATA));
+    if (msg == WM_NCCREATE) {
+        const CREATESTRUCTW* create = reinterpret_cast<const CREATESTRUCTW*>(lp);
+        owner = static_cast<WebSponsor*>(create->lpCreateParams);
+        ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(owner));
+    }
+    if (owner != nullptr && msg == kBannerHostChanged) {
+        PostBannerModel(owner);
+        return 0;
+    }
+    if (owner != nullptr && msg == WM_SHOWWINDOW && owner->bannerToken != 0) {
+        BannerHostVisible(owner->bannerToken, wp != FALSE);
+    }
     // BOTH, and not one or the other. BeginPaint only sends WM_ERASEBKGND when the update
     // region was invalidated WITH an erase, so an erase-only handler would miss every
     // RDW_INVALIDATE that did not ask for one; and a paint-only handler would leave the
@@ -686,7 +1049,9 @@ LRESULT CALLBACK HostProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    return ::DefWindowProcW(hwnd, msg, wp, lp);
+    const LRESULT result = ::DefWindowProcW(hwnd, msg, wp, lp);
+    if (msg == WM_NCDESTROY) ::SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+    return result;
 }
 
 void RegisterHostClass() {
@@ -764,13 +1129,14 @@ WebSponsor* WebSponsorCreate(HWND parent, const RECT& rc, WebSponsorReadyFn read
     // creation never leaves a hole where the strip should be.
     w->host = ::CreateWindowExW(0, kHostClass, L"", WS_CHILD | WS_CLIPSIBLINGS,
                                 rc.left, rc.top, rc.right - rc.left, rc.bottom - rc.top,
-                                parent, nullptr, ::GetModuleHandleW(nullptr), nullptr);
+                                parent, nullptr, ::GetModuleHandleW(nullptr), w);
     if (w->host == nullptr) {
         LogLine(L"[sponsor] the webview host window could not be created, gle=%lu",
                 ::GetLastError());
         w->Release();
         return nullptr;
     }
+    w->bannerToken = BannerHostSubscribe(w->host, kBannerHostChanged);
 
     EnvironmentHandler* h = new (std::nothrow) EnvironmentHandler(w);
     if (h == nullptr) {
@@ -792,6 +1158,7 @@ WebSponsor* WebSponsorCreate(HWND parent, const RECT& rc, WebSponsorReadyFn read
 
 void WebSponsorMove(WebSponsor* w, const RECT& rc) {
     if (w == nullptr || w->closed) return;
+    w->DropQr();
     w->rc = rc;
     if (w->host != nullptr) {
         // Match settings.cpp's PosBatch: NOCOPYBITS prevents moved child pixels from ghosting.

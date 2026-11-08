@@ -1,5 +1,18 @@
 # Notices and attribution
 
+## 2026-11-07 — signed sponsor content
+
+The sponsor strip now loads signed promotional content from `goatcam.dagoat.io` when available
+and falls back to the built-in Goat Project strip. The compiled-in public key has keyId
+`220c87522a4b7cbf`. What is requested, when, and how to stop it is described in `README.md`.
+
+**This supersedes the two "Nothing is fetched" statements in the older sections below.** The
+coffee photo is no longer compiled into the app: it arrives as part of the signed online
+banner. The only image still compiled in for the banner is a small preview of the GOAT Cam
+iPhone app's screen, shown inside the phone outline; it is the operator's own work. The
+CC0 coffee photo (credited below) is still in this repository as a test fixture under
+`tests\banner-vectors\photos\`.
+
 ## CPUSetSetter — the inspiration, not a dependency
 
 Game Optimizer was inspired by **[CPUSetSetter](https://github.com/SimonvBez/CPUSetSetter)** by
@@ -115,18 +128,41 @@ import table.
 
 ## The sponsor panel's HTML, CSS and SVG — the operator's own work
 
-`src\sponsor_html.h` is a **generated file**. Its content — the panel stylesheet, the animated
-GOATPROJECT lockup, the Ko-fi cup and the GitHub star — is **the operator's own work**, taken
-from their browser extension, the *google map plugin*, on this machine:
+`src\sponsor_html.h` is a **generated file**. Its content — the panel stylesheet, the Ko-fi cup,
+the GitHub star, and the **GOAT Cam** banner (its stylesheet, its headline, the "GOAT Cam"
+wordmark and tagline, the viewfinder, and the App Store QR code) — is **the operator's own work**,
+taken from their browser extension, the *google map plugin*, on this machine:
 
 ```
 F:\google map plugin\extension\content\widget.js
 ```
 
-It is **not third-party material**, and it is not licensed from anyone: the author of this
-repository is the author of that panel. It is recorded here because a generated file whose
-content came from another project should say where it came from, not because a licence
-requires it.
+The current header was generated on 2026-10-26 (banner v2) from the extension's
+`goatcam-banner` worktree,
+`F:\google map plugin\.claude\worktrees\goatcam-banner\extension\content\widget.js`. In that
+file, `GOAT_LOCKUP_CSS` is a comment-stripped copy of the GOAT Cam repository's master
+stylesheet, `brand\goatcam-banner\goatcam-banner.css`. Game Optimizer draws it as the master's
+`goat--strip` variant.
+
+The page also runs one script of the banner's, also the operator's own work:
+`goatcam-qr-bridge.js` from the same GOAT Cam folder, inlined verbatim. While the pointer is on
+the QR it reports the tile's position to the app, which shows its own enlarged QR in a native
+popup.
+
+Apart from the photo described below, it is **not third-party material**, and it is not
+licensed from anyone: the author of this repository is the author of that panel. It is recorded
+here because a generated file whose content came from another project should say where it came
+from, not because a licence requires it.
+
+**The banner's photo is third-party, and it is public domain.** The page embeds the same CC0
+photo as the GDI strip (*White cup and MacBook* by Alex Knight; licence and evidence in the next
+section) as a `data:image/webp` URI. It is the GOAT Cam site's own
+`site\public\assets\hero-coffee-800.webp`, 800 × 498, 21,038 bytes, the same uncropped photo as
+the GDI strip's JPEG. The embedded bytes are identical to that file.
+
+**Nothing is fetched.** The photo is a data URI and the QR is inline SVG. The generator
+refuses to write a page that carries any absolute URL other than the three destinations (Ko-fi,
+the GitHub repository and `https://goatcam.dagoat.io`).
 
 **Why it is copied rather than re-implemented.** The panel was first hand-ported into GDI
 drawing code. Re-expressing CSS transitions, cubic-bezier easing, blur filters, a radial
@@ -139,14 +175,50 @@ not one path.
 
 ```
 python tools\gen-sponsor-html.py
+python tools\gen-sponsor-html.py --plugin-dir <extension checkout>
 ```
 
+Use the second form while the GOAT Cam banner exists only in a worktree of the extension. The
+generator refuses an extension whose `widget.js` still carries the GOATPROJECT banner, or the v1
+GOAT Cam banner's ask line or DaGoat lockup. It reads `goatcam-qr-bridge.js` from the GOAT Cam
+checkout (`--bridge-js <file>` to point elsewhere).
+
 That is the only thing in this repository that ever reads the plugin path. **The application
-never does**: the generated header is compiled in, and the running app opens no file outside
-its own installation. The generator also fails loudly if the three destination URLs in the
+never does**: the generated header is compiled in, and the app never reads the plugin checkout.
+(Since 0.6.0 it does keep a banner cache in `%LOCALAPPDATA%\GameOptimizer\banner` — see the
+2026-11-07 entry at the top.) The generator also fails loudly if the three destination URLs in the
 page ever disagree with the constants in `src\sponsor.h`.
 
 The panel's natural size is measured rather than estimated, by `tools\measure-panel.py`.
+
+## The GOAT Cam banner in the GDI sponsor strip — and its coffee photo
+
+When WebView2 is unavailable, the Settings window draws the sponsor strip itself
+(`src\sponsor.cpp`). Its third item is the **GOAT Cam** banner: a headline beside a plate that
+a coffee photo fills edge to edge, with the GOAT Cam wordmark, a viewfinder and an App Store QR
+code; hovering the QR enlarges it in a small popup (`src\qr_magnifier.cpp`). Its design, its
+copy and the QR matrix are **the operator's own work**, from the GOAT Cam repository
+(`brand\goatcam-banner\`, SPEC section 7), and its drawing code was lifted from the operator's
+own MacFanControl port of the same banner. None of it is third-party material.
+
+**The photo is third-party, and it is public domain.** `src\goatcam-coffee.jpg` is embedded in
+the executable as the resource `GOATCAM_COFFEE`:
+
+| | |
+|---|---|
+| Title | White cup and MacBook |
+| Photographer | Alex Knight — https://unsplash.com/@agkdesign |
+| Source page | https://unsplash.com/photos/j4uuKnN43_M |
+| Licence | Creative Commons CC0 1.0 Universal Public Domain Dedication — https://creativecommons.org/publicdomain/zero/1.0/ |
+| Licence evidence | Unsplash published under CC0 until 5 June 2017; an archived copy of the page from 2017-04-25 names the photographer and shows the image: https://web.archive.org/web/20170425102516/https://unsplash.com/photos/j4uuKnN43_M — Wikimedia Commons records the same licence: https://commons.wikimedia.org/wiki/File:White_cup_and_MacBook_(Unsplash).jpg |
+| Changes | resized to 800 px wide, a warm colour grade, all embedded metadata removed — this is the GOAT Cam site's own `site\public\assets\hero-coffee-800.jpg`, byte for byte, not re-cropped |
+| This file | 800 × 498 JPEG, 41,289 bytes, SHA-256 `e84ccbe2459a621955d699130789191715a77364754cb52097331238a7fed819` |
+
+These facts are taken from the GOAT Cam repository's
+`brand\goatcam-banner\assets\CREDITS.txt`, not re-verified against the source pages here. CC0
+does not require attribution; the photographer is credited anyway, with thanks.
+
+**Nothing is fetched.** The photo is compiled in; drawing the strip opens no file and no URL.
 
 ## NVIDIA NVAPI — struct layouts and interface ids, not code
 
@@ -186,14 +258,30 @@ reproducing it is the safe reading of the licence, not because any NVIDIA source
 **None.** Apart from the WebView2 loader and the NVAPI ABI facts described above, Game Optimizer
 links only against the Windows SDK import
 libraries shipped with the platform toolchain (`user32`, `shell32`, `gdi32`, `advapi32`,
-`comctl32`, `ole32`, `shlwapi`, `psapi`, `comdlg32`, `msimg32`). There is no vendored source,
-no package manager, and no bundled image asset — the tray icons are drawn with GDI at runtime.
+`comctl32`, `ole32`, `shlwapi`, `psapi`, `comdlg32`, `msimg32`, and `gdiplus`, delay-loaded
+for the GDI sponsor strip). There is no vendored source and no package manager. The only bundled
+image is the CC0 coffee photo described above. It ships twice: as a JPEG resource for the GDI
+strip, and as a webp data URI inside the generated web page. The tray icons are drawn with GDI
+at runtime.
 
 ## The sponsor strip's markup and stylesheets
 
-`src\sponsor_html.h` is generated by `tools\gen-sponsor-html.py` and contains, verbatim, the
-`.kofi` rules and `:root` custom properties from `options.css`, the Ko-fi `<button>` element
-from `options.html`, the whole of `brand\goat-lockup-hover.css`, and the
-`<a class="goat-lockup">` element and star SVG from `widget.js` — all four files being the
-**operator's own** browser extension. They are reproduced here with the author's instruction to
-do so. Nothing in that generated file is third-party work.
+`src\sponsor_html.h` is generated by `tools\gen-sponsor-html.py`. Nearly all of it comes from the
+extension's `widget.js`; the bridge comes from the GOAT Cam folder. It contains these, verbatim:
+
+- the panel's CSS template;
+- `GOAT_LOCKUP_CSS`, the master GOAT Cam stylesheet;
+- the Ko-fi and Star buttons, with their cup and star SVGs;
+- the GOAT Cam banner's markup: the headline, and the plate with the photo, the wordmark and
+  the QR;
+- `goatcam-qr-bridge.js`, the banner's QR-magnifier bridge.
+
+Two things are not verbatim:
+
+- Game Optimizer's own layout rules, appended after theirs;
+- one rewritten class attribute, `goat goat--panel goat--gated` becoming `goat goat--strip`.
+
+All of it is the **operator's own** work, reproduced here with the author's instruction to do so.
+The one exception is the CC0 photo described above. (The superseded `tools\gen-sponsor-html.ps1`
+read four extension files, `options.css`, `options.html`, `goat-lockup-hover.css` and
+`widget.js`. It exits without running and generates nothing.)

@@ -24,7 +24,13 @@
 #include <windows.h>
 
 #include <algorithm>
+#include <clocale>
 #include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <filesystem>
+#include <fstream>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -50,12 +56,17 @@
 #include "settings_warning.h"
 #include "envwarning_text.h"
 #include "firstrun_text.h"
+#include "goatcam_qr.h"
 #include "irq_policy.h"
 #include "irq_probe.h"
 #include "startup_warning.h"
 #include "topology.h"
 #include "util.h"
 #include "version_label.h"
+#include "online_banner.h"
+#include "online_banner_machine.h"
+#include "banner_host.h"
+#include "webview_message.h"
 
 // ===========================================================================
 // Private-member access for ProcessSnapshot (header untouched).
@@ -101,6 +112,40 @@ std::string Utf8(const std::wstring& w) {
     std::string s((size_t)n, '\0');
     ::WideCharToMultiByte(CP_UTF8, 0, w.c_str(), (int)w.size(), &s[0], n, nullptr, nullptr);
     return s;
+}
+
+std::string DecodeBase64ForTest(const std::string& value, bool* ok) {
+    static const char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    std::string out;
+    *ok = value.size() % 4 == 0;
+    if (!*ok) return out;
+    for (size_t i = 0; i < value.size() && *ok; i += 4) {
+        unsigned int bits = 0;
+        int pad = 0;
+        for (size_t j = 0; j < 4; ++j) {
+            const char ch = value[i + j];
+            if (ch == '=') {
+                ++pad;
+                bits <<= 6;
+            } else {
+                const char* at = std::strchr(alphabet, ch);
+                if (at == nullptr || pad != 0) {
+                    *ok = false;
+                    break;
+                }
+                bits = (bits << 6) | static_cast<unsigned int>(at - alphabet);
+            }
+        }
+        if (!*ok || (pad > 2) || (pad != 0 && i + 4 != value.size())) {
+            *ok = false;
+            break;
+        }
+        out.push_back(static_cast<char>((bits >> 16) & 0xff));
+        if (pad < 2) out.push_back(static_cast<char>((bits >> 8) & 0xff));
+        if (pad < 1) out.push_back(static_cast<char>(bits & 0xff));
+    }
+    return out;
 }
 
 std::string Show(bool v) { return v ? "true" : "false"; }
@@ -13105,6 +13150,1082 @@ void Test_AL1_TheRunProgressLine() {
     CHECK_EQ(cd::FormatRunProgressLine(true, 3, 9, true).find(L"Removing 3 of 9."), (size_t)0);
 }
 
+// ===========================================================================
+// AM. The WebView2 page's QR hover report (src\goatcam_qr.h). It arrives from a web page, so the
+// parser has to REFUSE everything but the one documented shape - these cases are written from
+// the header's contract, not from the implementation.
+// ===========================================================================
+void Test_AM1_TheQrMessageAcceptsOnlyItsTwoForms() {
+    using cd::goatcam_qr::ParseQrMessage;
+    using cd::goatcam_qr::QrEvent;
+    using cd::goatcam_qr::QrMessage;
+
+    Case("AM1 the two documented forms are accepted, with their numbers");
+    {
+        QrMessage m;
+        CHECK(ParseQrMessage(L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":12,\"y\":3,\"w\":72,\"h\":72}}", &m));
+        CHECK(m.event == QrEvent::kEnter);
+        CHECK_EQ(m.x, 12.0);
+        CHECK_EQ(m.y, 3.0);
+        CHECK_EQ(m.w, 72.0);
+        CHECK_EQ(m.h, 72.0);
+        QrMessage n;
+        CHECK(ParseQrMessage(L"{\"goatcamQr\":\"leave\",\"rect\":{\"x\":12.5,\"y\":-0.25,\"w\":72,\"h\":7.2e1}}", &n));
+        CHECK(n.event == QrEvent::kLeave);
+        CHECK_EQ(n.x, 12.5);
+        CHECK_EQ(n.y, -0.25);
+        CHECK_EQ(n.h, 72.0);
+    }
+
+    Case("AM1b key order and insignificant whitespace do not matter");
+    {
+        QrMessage m;
+        CHECK(ParseQrMessage(L" { \"rect\" : { \"h\":72, \"w\":72, \"y\":0, \"x\":4 } ,\r\n \"goatcamQr\" : \"enter\" } ", &m));
+        CHECK(m.event == QrEvent::kEnter);
+        CHECK_EQ(m.x, 4.0);
+    }
+
+    Case("AM1c anything else is refused - and a refusal leaves the output untouched");
+    {
+        const wchar_t* const bad[] = {
+            nullptr,
+            L"",
+            L"null",
+            L"{}",
+            L"\"enter\"",                                                          // a JSON string
+            L"[\"enter\"]",
+            L"{\"goatcamQr\":\"hover\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}}",   // unknown event
+            L"{\"goatcamQr\":\"ENTER\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}}",   // case matters
+            L"{\"goatcamQr\":\"enter\"}",                                          // no rect
+            L"{\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}}",                         // no event
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72}}",            // no h
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72},\"url\":\"x\"}",  // extra key
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72,\"z\":0}}",       // extra rect key
+            L"{\"goatcamQr\":\"enter\",\"goatcamQr\":\"leave\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}}",  // duplicate
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"x\":2,\"y\":1,\"w\":72,\"h\":72}}",        // duplicate
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":0,\"h\":72}}",    // empty
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":-5}}",   // negative
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":5000,\"h\":72}}", // absurd
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1e999,\"y\":1,\"w\":72,\"h\":72}}",  // infinite
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":\"1\",\"y\":1,\"w\":72,\"h\":72}}",  // a string
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":01,\"y\":1,\"w\":72,\"h\":72}}",     // leading zero
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":.5,\"y\":1,\"w\":72,\"h\":72}}",     // no integer part
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":+1,\"y\":1,\"w\":72,\"h\":72}}",     // plus sign
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1.,\"y\":1,\"w\":72,\"h\":72}}",     // no fraction
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":0x10,\"y\":1,\"w\":72,\"h\":72}}",   // hex
+            L"{\"goatcam\\u0051r\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}}", // an escape
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}}x",      // trailing
+            L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}",        // truncated
+            L"{\"goatcamQr\":\"enter\",\"rect\":[1,1,72,72]}",                       // wrong shape
+        };
+        int refused = 0;
+        for (const wchar_t* b : bad) {
+            QrMessage m;
+            m.x = 777.0;
+            const bool ok = ParseQrMessage(b, &m);
+            if (!ok && m.x == 777.0) ++refused;
+            else std::printf("    accepted or touched: %s\n", Show(b).c_str());
+        }
+        CHECK_EQ(refused, static_cast<int>(sizeof(bad) / sizeof(bad[0])));
+
+        std::wstring longer = L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}";
+        longer += std::wstring(600, L' ');
+        longer += L"}";
+        QrMessage m;
+        CHECK(!ParseQrMessage(longer.c_str(), &m));   // over the length cap, however well formed
+        CHECK(!ParseQrMessage(L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}}", nullptr));
+    }
+
+    Case("AM2 the tile's CSS rect becomes device px inside the view, or is refused");
+    {
+        using cd::goatcam_qr::QrCssRectToClient;
+        QrMessage m;
+        CHECK(ParseQrMessage(L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":700,\"y\":2,\"w\":72,\"h\":72}}", &m));
+        long l = 0, t = 0, r = 0, b = 0;
+        // 100%: one CSS px is one device px, offset by the view's bounds.
+        CHECK(QrCssRectToClient(m, 10, 5, 10 + 900, 5 + 76, 96, 1.0, &l, &t, &r, &b));
+        CHECK_EQ(static_cast<int>(l), 710);
+        CHECK_EQ(static_cast<int>(t), 7);
+        CHECK_EQ(static_cast<int>(r), 782);
+        CHECK_EQ(static_cast<int>(b), 79);
+        // 150%: 1.5 device px per CSS px.
+        CHECK(QrCssRectToClient(m, 0, 0, 1350, 114, 144, 1.0, &l, &t, &r, &b));
+        CHECK_EQ(static_cast<int>(l), 1050);
+        CHECK_EQ(static_cast<int>(t), 3);
+        CHECK_EQ(static_cast<int>(r), 1158);
+        CHECK_EQ(static_cast<int>(b), 111);
+        // A tile the view cannot be showing - past its right edge - is refused.
+        CHECK(!QrCssRectToClient(m, 0, 0, 600, 76, 96, 1.0, &l, &t, &r, &b));
+        // So are a nonsense dpi and zoom.
+        CHECK(!QrCssRectToClient(m, 0, 0, 1350, 114, 0, 1.0, &l, &t, &r, &b));
+        CHECK(!QrCssRectToClient(m, 0, 0, 1350, 114, 96, 0.0, &l, &t, &r, &b));
+    }
+}
+
+// AM3. The EXACT strings the generated page posted. Captured 2026-10-26 from src\sponsor_html.h's
+// own page (goatcam-qr-bridge.js, inlined by tools\gen-sponsor-html.py) in headless Chromium,
+// through a stub window.chrome.webview that recorded JSON.stringify of each posted object - the
+// serialisation get_WebMessageAsJson hands webview_host.cpp. Pointer onto the QR tile, then off
+// it; at the Settings minimum (856 css px) and default (976) widths, and at the FRACTIONAL widths
+// the app really has at 125% and 150% (1071 / 1.25 = 856.8 css px, 1285 / 1.5 = 856.67). The page
+// and the parser are written in two languages by two lanes; this is where a drift between them
+// would show.
+void Test_AM3_TheGeneratedPagesOwnMessagesAreAccepted() {
+    using cd::goatcam_qr::ParseQrMessage;
+    using cd::goatcam_qr::QrCssRectToClient;
+    using cd::goatcam_qr::QrEvent;
+    using cd::goatcam_qr::QrMessage;
+
+    Case("AM3 the strings the generated page actually posted parse, and land inside the view");
+    struct Captured {
+        const wchar_t* json;
+        QrEvent event;
+        double x;
+        int dpi;
+        long viewW, viewH;   // the WebView's bounds in device px at that dpi
+    };
+    const Captured cap[] = {
+        { L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":768,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kEnter, 768.0, 96, 856, 76 },
+        { L"{\"goatcamQr\":\"leave\",\"rect\":{\"x\":768,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kLeave, 768.0, 96, 856, 76 },
+        { L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":888,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kEnter, 888.0, 96, 976, 76 },
+        { L"{\"goatcamQr\":\"leave\",\"rect\":{\"x\":888,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kLeave, 888.0, 96, 976, 76 },
+        { L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":768.796875,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kEnter, 768.796875, 120, 1071, 95 },
+        { L"{\"goatcamQr\":\"leave\",\"rect\":{\"x\":768.796875,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kLeave, 768.796875, 120, 1071, 95 },
+        { L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":768.65625,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kEnter, 768.65625, 144, 1285, 114 },
+        { L"{\"goatcamQr\":\"leave\",\"rect\":{\"x\":768.65625,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kLeave, 768.65625, 144, 1285, 114 },
+        { L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":888.796875,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kEnter, 888.796875, 120, 1221, 95 },
+        { L"{\"goatcamQr\":\"leave\",\"rect\":{\"x\":888.796875,\"y\":2,\"w\":72,\"h\":72}}", QrEvent::kLeave, 888.796875, 120, 1221, 95 },
+    };
+    int accepted = 0, inside = 0;
+    for (const Captured& c : cap) {
+        QrMessage m;
+        const bool ok = ParseQrMessage(c.json, &m);
+        CHECK(ok);
+        if (!ok) {
+            std::printf("    refused: %s\n", Show(c.json).c_str());
+            continue;
+        }
+        ++accepted;
+        CHECK(m.event == c.event);
+        CHECK_EQ(m.x, c.x);
+        CHECK_EQ(m.y, 2.0);
+        CHECK_EQ(m.w, 72.0);
+        CHECK_EQ(m.h, 72.0);
+        // The tile is the whole 72 css px QR, inside the 76 css px band, at that dpi.
+        long l = 0, t = 0, r = 0, b = 0;
+        if (QrCssRectToClient(m, 0, 0, c.viewW, c.viewH, c.dpi, 1.0, &l, &t, &r, &b)) {
+            ++inside;
+            const long side = std::lround(72.0 * c.dpi / 96.0);
+            CHECK(r - l >= side - 1 && r - l <= side + 1);
+            CHECK(b - t >= side - 1 && b - t <= side + 1);
+            CHECK(r <= c.viewW && b <= c.viewH && l >= 0 && t >= 0);
+        } else {
+            std::printf("    outside the view: %s at dpi %d\n", Show(c.json).c_str(), c.dpi);
+        }
+    }
+    const int n = static_cast<int>(sizeof(cap) / sizeof(cap[0]));
+    CHECK_EQ(accepted, n);
+    CHECK_EQ(inside, n);
+}
+
+// AM4. After review, accepted: the parser never reads past its length cap, and the
+// conversion refuses any dpi, zoom, coordinate or bound outside a sane range instead of
+// overflowing or rounding garbage into a rectangle. Written from goatcam_qr.h's contract.
+void Test_AM4_TheParserAndTheConversionAreBounded() {
+    using cd::goatcam_qr::ParseQrMessage;
+    using cd::goatcam_qr::QrCssRectToClient;
+    using cd::goatcam_qr::QrEvent;
+    using cd::goatcam_qr::QrMessage;
+    using cd::goatcam_qr::kMaxJson;
+    using cd::goatcam_qr::detail::BoundedLen;
+    const wchar_t* const valid = L"{\"goatcamQr\":\"enter\",\"rect\":{\"x\":1,\"y\":1,\"w\":72,\"h\":72}}";
+
+    Case("AM4e WebView messages are length-capped before conversion");
+    {
+        using cd::webview_message::BoundedLength;
+        using cd::webview_message::WithinLimit;
+        CHECK_EQ(BoundedLength(L"{}"), static_cast<size_t>(2));
+        CHECK(WithinLimit(L"{}"));
+        const std::wstring atCap(cd::webview_message::kMaxJsonChars, L'x');
+        CHECK_EQ(BoundedLength(atCap.c_str()), cd::webview_message::kMaxJsonChars);
+        CHECK(WithinLimit(atCap.c_str()));
+        const std::wstring overCap = atCap + L"x";
+        CHECK_EQ(BoundedLength(overCap.c_str()), cd::webview_message::kMaxJsonChars + 1);
+        CHECK(!WithinLimit(overCap.c_str()));
+        CHECK_EQ(BoundedLength(static_cast<const wchar_t*>(nullptr)),
+                 cd::webview_message::kMaxJsonChars + 1);
+    }
+
+    Case("AM4 a 1 MB message is refused quickly, and the length scan stops at the cap");
+    {
+        const std::wstring huge = std::wstring(valid) + std::wstring(1u << 20, L' ');
+        CHECK_EQ(BoundedLen(huge.c_str(), kMaxJson), kMaxJson + 1);
+        LARGE_INTEGER f, t0, t1;
+        ::QueryPerformanceFrequency(&f);
+        ::QueryPerformanceCounter(&t0);
+        QrMessage m;
+        m.x = 777.0;
+        const bool ok = ParseQrMessage(huge.c_str(), &m);
+        ::QueryPerformanceCounter(&t1);
+        const double ms = static_cast<double>(t1.QuadPart - t0.QuadPart) * 1000.0 / static_cast<double>(f.QuadPart);
+        CHECK(!ok);
+        CHECK_EQ(m.x, 777.0);
+        CHECK(ms < 50.0);
+        std::printf("    1 MB message refused in %.4f ms\n", ms);
+    }
+
+    Case("AM4b an UNTERMINATED message is refused without reading one character past the cap");
+    {
+        // kMaxJson + 1 characters with no terminator, ending exactly where a no-access page
+        // begins: a parser that read even one character further would fault and kill this run.
+        SYSTEM_INFO si;
+        ::GetSystemInfo(&si);
+        const size_t page = si.dwPageSize;
+        BYTE* base = static_cast<BYTE*>(::VirtualAlloc(nullptr, page * 2, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+        CHECK(base != nullptr);
+        if (base != nullptr) {
+            DWORD old = 0;
+            const bool guarded = ::VirtualProtect(base + page, page, PAGE_NOACCESS, &old) != FALSE;
+            CHECK(guarded);
+            const size_t n = kMaxJson + 1;
+            wchar_t* s = reinterpret_cast<wchar_t*>(base + page) - n;
+            for (size_t i = 0; i < n; ++i) s[i] = L'{';
+            if (guarded) {
+                CHECK_EQ(BoundedLen(s, kMaxJson), kMaxJson + 1);
+                QrMessage m;
+                CHECK(!ParseQrMessage(s, &m));
+                // A well-formed message whose terminator is the page's LAST character is read up
+                // to it and no further - and accepted.
+                const size_t len = ::wcslen(valid) + 1;
+                wchar_t* t = reinterpret_cast<wchar_t*>(base + page) - len;
+                ::memcpy(t, valid, len * sizeof(wchar_t));
+                CHECK(ParseQrMessage(t, &m));
+                CHECK(m.event == QrEvent::kEnter);
+            }
+            ::VirtualFree(base, 0, MEM_RELEASE);
+        }
+    }
+
+    QrMessage m;
+    m.event = QrEvent::kEnter;
+    m.x = 10.0;
+    m.y = 2.0;
+    m.w = 72.0;
+    m.h = 72.0;
+    long l = 0, t = 0, r = 0, b = 0;
+    const long W = 4000, H = 1000;   // a view big enough for the largest zoom and dpi below
+
+    Case("AM4c zoom must lie in 0.25..5 and dpi in 48..960 - the ends in, everything else out");
+    {
+        CHECK(QrCssRectToClient(m, 0, 0, W, H, 96, 0.25, &l, &t, &r, &b));
+        CHECK(QrCssRectToClient(m, 0, 0, W, H, 96, 5.0, &l, &t, &r, &b));
+        CHECK_EQ(static_cast<int>(r - l), 360);   // 72 css px at 5x
+        const double badZoom[] = { 0.2499, 5.0001, 0.0, -1.0, 1e9, 1e-9, std::nan(""), HUGE_VAL, -HUGE_VAL };
+        int refused = 0;
+        for (double z : badZoom)
+            if (!QrCssRectToClient(m, 0, 0, W, H, 96, z, &l, &t, &r, &b)) ++refused;
+        CHECK_EQ(refused, static_cast<int>(sizeof(badZoom) / sizeof(badZoom[0])));
+        CHECK(QrCssRectToClient(m, 0, 0, W, H, 48, 1.0, &l, &t, &r, &b));
+        CHECK(QrCssRectToClient(m, 0, 0, W, H, 960, 1.0, &l, &t, &r, &b));
+        const int badDpi[] = { 47, 961, 0, -96, 2147483647, -2147483647 - 1 };
+        refused = 0;
+        for (int d : badDpi)
+            if (!QrCssRectToClient(m, 0, 0, W, H, d, 1.0, &l, &t, &r, &b)) ++refused;
+        CHECK_EQ(refused, static_cast<int>(sizeof(badDpi) / sizeof(badDpi[0])));
+    }
+
+    Case("AM4d extreme coordinates and bounds are refused, never overflowed");
+    {
+        int refused = 0, cases = 0;
+        auto refuse = [&](const QrMessage& q, long bl, long bt, long br, long bb) {
+            ++cases;
+            long a = -1, c = -1, d = -1, e = -1;
+            if (!QrCssRectToClient(q, bl, bt, br, bb, 96, 1.0, &a, &c, &d, &e) && a == -1 && e == -1) ++refused;
+        };
+        QrMessage q = m;
+        q.x = 1e300;            refuse(q, 0, 0, W, H);
+        q = m; q.x = -1e300;    refuse(q, 0, 0, W, H);
+        q = m; q.w = 1e300;     refuse(q, 0, 0, W, H);
+        q = m; q.y = 1e300;     refuse(q, 0, 0, W, H);
+        q = m; q.x = std::nan(""); refuse(q, 0, 0, W, H);
+        q = m; q.w = HUGE_VAL;  refuse(q, 0, 0, W, H);
+        q = m; q.w = -72.0;     refuse(q, 0, 0, W, H);   // inverted
+        q = m; q.h = 0.0;       refuse(q, 0, 0, W, H);   // empty
+        q = m; q.w = 0.1;       refuse(q, 0, 0, W, H);   // rounds to nothing
+        q = m; q.x = 5000.0;    refuse(q, 0, 0, W, H);   // outside the view
+        refuse(m, -2147483647L - 1, -2147483647L - 1, 2147483647L, 2147483647L);   // the long limits
+        refuse(m, 0, 0, 16777217L, H);                                         // past 2^24
+        refuse(m, 100, 0, 50, H);                                              // inverted bounds
+        refuse(m, 0, 0, 0, H);                                                 // empty bounds
+        CHECK_EQ(refused, cases);
+        // Bounds right at the 2^24 limit still work, exactly.
+        CHECK(QrCssRectToClient(m, 16776216L, 0, 16777216L, H, 96, 1.0, &l, &t, &r, &b));
+        CHECK_EQ(static_cast<int>(l), 16776226);
+        CHECK_EQ(static_cast<int>(r), 16776298);
+        // And a rect whose rounded end would land one pixel past the view comes back clamped
+        // INSIDE it (72.6 rounds to 73; the view ends at 72).
+        q = m; q.x = 0.0; q.w = 72.6;
+        CHECK(QrCssRectToClient(q, 0, 0, 72, H, 96, 1.0, &l, &t, &r, &b));
+        CHECK_EQ(static_cast<int>(r), 72);
+    }
+}
+
+namespace banner_test_detail {
+
+std::filesystem::path BannerVectors() {
+    const std::filesystem::path fromSource =
+        std::filesystem::path(__FILE__).parent_path() / "banner-vectors";
+    if (std::filesystem::exists(fromSource / "cases.json")) return fromSource;
+    const std::filesystem::path fromWorktree =
+        std::filesystem::current_path() / "tests" / "banner-vectors";
+    if (std::filesystem::exists(fromWorktree / "cases.json")) return fromWorktree;
+    return std::filesystem::current_path().parent_path() / "tests" / "banner-vectors";
+}
+
+bool ReadBytes(const std::filesystem::path& path, std::string* out) {
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) return false;
+    const std::streampos end = file.tellg();
+    if (end < 0) return false;
+    out->assign(static_cast<std::size_t>(end), '\0');
+    file.seekg(0, std::ios::beg);
+    if (!out->empty()) file.read(&(*out)[0], static_cast<std::streamsize>(out->size()));
+    return file.good() || file.eof();
+}
+
+const ob::json::Value* Member(const ob::json::Value* object, const char* key) {
+    return object == nullptr ? nullptr : object->Find(key);
+}
+
+int HexDigit(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+bool HexBytes(const std::string& text, std::vector<std::uint8_t>* out) {
+    if ((text.size() & 1u) != 0u) return false;
+    out->clear();
+    out->reserve(text.size() / 2u);
+    for (std::size_t i = 0; i < text.size(); i += 2u) {
+        const int hi = HexDigit(text[i]);
+        const int lo = HexDigit(text[i + 1u]);
+        if (hi < 0 || lo < 0) return false;
+        out->push_back(static_cast<std::uint8_t>((hi << 4) | lo));
+    }
+    return true;
+}
+
+std::int64_t DaysFromCivil(int year, unsigned month, unsigned day) {
+    year -= month <= 2u ? 1 : 0;
+    const int era = (year >= 0 ? year : year - 399) / 400;
+    const unsigned yoe = static_cast<unsigned>(year - era * 400);
+    const unsigned mp = month > 2u ? month - 3u : month + 9u;
+    const unsigned doy = (153u * mp + 2u) / 5u + day - 1u;
+    const unsigned doe = yoe * 365u + yoe / 4u - yoe / 100u + doy;
+    return static_cast<std::int64_t>(era) * 146097 +
+           static_cast<std::int64_t>(doe) - 719468;
+}
+
+bool DigitsAt(const std::string& text, std::size_t start, std::size_t count) {
+    if (start > text.size() || count > text.size() - start) return false;
+    for (std::size_t i = start; i < start + count; ++i) {
+        if (text[i] < '0' || text[i] > '9') return false;
+    }
+    return true;
+}
+
+bool ParseTime(const std::string& text, std::int64_t* out) {
+    if (text.size() != 20u || text[4] != '-' || text[7] != '-' ||
+        text[10] != 'T' || text[13] != ':' || text[16] != ':' ||
+        text[19] != 'Z' || !DigitsAt(text, 0, 4) || !DigitsAt(text, 5, 2) ||
+        !DigitsAt(text, 8, 2) || !DigitsAt(text, 11, 2) ||
+        !DigitsAt(text, 14, 2) || !DigitsAt(text, 17, 2)) return false;
+    const int year = std::stoi(text.substr(0, 4));
+    const unsigned month = static_cast<unsigned>(std::stoi(text.substr(5, 2)));
+    const unsigned day = static_cast<unsigned>(std::stoi(text.substr(8, 2)));
+    const unsigned hour = static_cast<unsigned>(std::stoi(text.substr(11, 2)));
+    const unsigned minute = static_cast<unsigned>(std::stoi(text.substr(14, 2)));
+    const unsigned second = static_cast<unsigned>(std::stoi(text.substr(17, 2)));
+    if (year < 2000 || year > 9999 || month < 1u || month > 12u ||
+        hour > 23u || minute > 59u || second > 59u) return false;
+    const unsigned leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)) ? 1u : 0u;
+    const unsigned daysInMonth[] = {0u, 31u, 28u + leap, 31u, 30u, 31u,
+                                    30u, 31u, 31u, 30u, 31u, 30u, 31u};
+    if (day < 1u || day > daysInMonth[month]) return false;
+    const std::int64_t days = DaysFromCivil(year, month, day);
+    *out = days * 86400000ll + static_cast<std::int64_t>(hour) * 3600000ll +
+           static_cast<std::int64_t>(minute) * 60000ll +
+           static_cast<std::int64_t>(second) * 1000ll;
+    return true;
+}
+
+bool IntegerValue(const ob::json::Value* value, std::int64_t* out) {
+    if (value == nullptr || value->type != ob::json::Type::Number ||
+        value->text.empty()) return false;
+    const bool negative = value->text[0] == '-';
+    const std::size_t first = negative ? 1u : 0u;
+    if (first == value->text.size()) return false;
+    const std::uint64_t positiveLimit =
+        static_cast<std::uint64_t>((std::numeric_limits<std::int64_t>::max)());
+    const std::uint64_t limit = negative ? positiveLimit + 1u : positiveLimit;
+    std::uint64_t magnitude = 0;
+    for (std::size_t i = first; i < value->text.size(); ++i) {
+        const char ch = value->text[i];
+        if (ch < '0' || ch > '9') return false;
+        const std::uint64_t digit = static_cast<std::uint64_t>(ch - '0');
+        if (magnitude > (limit - digit) / 10u) return false;
+        magnitude = magnitude * 10u + digit;
+    }
+    if (negative) {
+        *out = magnitude == positiveLimit + 1u
+                   ? (std::numeric_limits<std::int64_t>::min)()
+                   : -static_cast<std::int64_t>(magnitude);
+    } else {
+        *out = static_cast<std::int64_t>(magnitude);
+    }
+    return true;
+}
+
+bool StringValue(const ob::json::Value* value, std::string* out) {
+    if (value == nullptr || value->type != ob::json::Type::String) return false;
+    *out = value->text;
+    return true;
+}
+
+bool BoolValue(const ob::json::Value* value, bool* out) {
+    if (value == nullptr || value->type != ob::json::Type::Bool) return false;
+    *out = value->b;
+    return true;
+}
+
+bool ParseFailure(std::string* failure, const std::string& field) {
+    if (failure != nullptr && failure->empty()) *failure = field;
+    return false;
+}
+
+ob::Action ActionFor(const std::string& text) {
+    if (text == "show") return ob::Action::Show;
+    if (text == "killswitch") return ob::Action::KillSwitch;
+    return ob::Action::Reject;
+}
+
+const char* ReasonFor(const ob::json::Value* value) {
+    if (value == nullptr || value->type == ob::json::Type::Null) return nullptr;
+    return value->text.c_str();
+}
+
+const char* ActionName(ob::Action action) {
+    switch (action) {
+        case ob::Action::Show: return "show";
+        case ob::Action::KillSwitch: return "killswitch";
+        case ob::Action::Reject: return "reject";
+    }
+    return "unknown";
+}
+
+bool SameReason(const char* a, const char* b) {
+    if (a == nullptr || b == nullptr) return a == b;
+    return std::strcmp(a, b) == 0;
+}
+
+bool ParseKind(const std::string& text, ob::Kind* out) {
+    if (text == "webp") {
+        *out = ob::Kind::Webp;
+        return true;
+    }
+    if (text == "jpg") {
+        *out = ob::Kind::Jpg;
+        return true;
+    }
+    return false;
+}
+
+bool ParseRecord(const ob::json::Value* value, ob::Record* out) {
+    if (value == nullptr || value->type != ob::json::Type::Object) return false;
+    std::int64_t number = 0;
+    if (!IntegerValue(Member(value, "hwm"), &out->hwm) ||
+        !IntegerValue(Member(value, "lastCheckMs"), &out->lastCheckMs) ||
+        !IntegerValue(Member(value, "failures"), &number)) return false;
+    out->failures = static_cast<int>(number);
+    const ob::json::Value* current = Member(value, "current");
+    if (current == nullptr) return false;
+    if (current->type == ob::json::Type::Null) {
+        out->hasCurrent = false;
+        out->current = ob::CurrentSet{};
+        return true;
+    }
+    if (current->type != ob::json::Type::Object ||
+        !IntegerValue(Member(current, "revision"), &out->current.revision) ||
+        !StringValue(Member(current, "sha256"), &out->current.sha256) ||
+        !BoolValue(Member(current, "enabled"), &out->current.enabled) ||
+        !IntegerValue(Member(current, "expiresMs"), &out->current.expiresMs)) return false;
+    const ob::json::Value* photos = Member(current, "photos");
+    if (photos == nullptr || photos->type != ob::json::Type::Object) return false;
+    out->current.photoWebp.clear();
+    out->current.photoJpg.clear();
+    const ob::json::Value* webp = Member(photos, "webp");
+    const ob::json::Value* jpg = Member(photos, "jpg");
+    if ((webp != nullptr && !StringValue(webp, &out->current.photoWebp)) ||
+        (jpg != nullptr && !StringValue(jpg, &out->current.photoJpg))) return false;
+    out->hasCurrent = true;
+    return true;
+}
+
+bool ParseEvent(const ob::json::Value* value, const std::vector<ob::Kind>& kinds,
+                ob::Event* out, std::string* failure) {
+    if (value == nullptr || value->type != ob::json::Type::Object)
+        return ParseFailure(failure, "event");
+    std::string type;
+    if (!StringValue(Member(value, "type"), &type)) return ParseFailure(failure, "event.type");
+    if (type == "START") out->type = ob::EventType::Start;
+    else if (type == "SHOWN") out->type = ob::EventType::Shown;
+    else if (type == "HIDDEN") out->type = ob::EventType::Hidden;
+    else if (type == "SIGNED") out->type = ob::EventType::Signed;
+    else if (type == "PHOTOS") out->type = ob::EventType::Photos;
+    else if (type == "COMMITTED") out->type = ob::EventType::Committed;
+    else if (type == "FAILED") out->type = ob::EventType::Failed;
+    else if (type == "TIMER") out->type = ob::EventType::Timer;
+    else if (type == "RESUME") out->type = ob::EventType::Resume;
+    else if (type == "CLICK") out->type = ob::EventType::Click;
+    else if (type == "POINTER") out->type = ob::EventType::Pointer;
+    else if (type == "FOCUS") out->type = ob::EventType::Focus;
+    else return ParseFailure(failure, "event.type");
+    const ob::json::Value* record = Member(value, "record");
+    if (record != nullptr && record->type != ob::json::Type::Null) {
+        out->hasRecord = true;
+        if (!ParseRecord(record, &out->record)) return ParseFailure(failure, "event.record");
+    }
+    if (!BoolValue(Member(value, "setValid"), &out->setValid) && out->type == ob::EventType::Start)
+        return ParseFailure(failure, "event.setValid");
+    if (!BoolValue(Member(value, "mayFetch"), &out->mayFetch) &&
+        (out->type == ob::EventType::Shown || out->type == ob::EventType::Timer ||
+         out->type == ob::EventType::Resume)) return ParseFailure(failure, "event.mayFetch");
+    if (Member(value, "gen") != nullptr && !IntegerValue(Member(value, "gen"), &out->gen))
+        return ParseFailure(failure, "event.gen");
+    if (Member(value, "ok") != nullptr && !BoolValue(Member(value, "ok"), &out->ok))
+        return ParseFailure(failure, "event.ok");
+    if (Member(value, "over") != nullptr && !BoolValue(Member(value, "over"), &out->over))
+        return ParseFailure(failure, "event.over");
+    if (Member(value, "inside") != nullptr && !BoolValue(Member(value, "inside"), &out->inside))
+        return ParseFailure(failure, "event.inside");
+    if (out->type != ob::EventType::Signed) return true;
+
+    const ob::json::Value* result = Member(value, "result");
+    if (result == nullptr || result->type != ob::json::Type::Object)
+        return ParseFailure(failure, "event.result");
+    if (Member(result, "reason") == nullptr) return ParseFailure(failure, "event.result.reason");
+    std::string action;
+    if (!StringValue(Member(result, "action"), &action)) return ParseFailure(failure, "event.result.action");
+    if (!IntegerValue(Member(result, "revision"), &out->result.banner.revision))
+        return ParseFailure(failure, "event.result.revision");
+    if (!StringValue(Member(result, "sha256"), &out->result.sha256))
+        return ParseFailure(failure, "event.result.sha256");
+    if (action == "show") out->result.action = ob::Action::Show;
+    else if (action == "killswitch") out->result.action = ob::Action::KillSwitch;
+    else if (action == "reject") out->result.action = ob::Action::Reject;
+    else return ParseFailure(failure, "event.result.action");
+    const ob::json::Value* banner = Member(result, "banner");
+    if (banner == nullptr || banner->type != ob::json::Type::Object)
+        return ParseFailure(failure, "event.result.banner");
+    std::string expires;
+    if (!StringValue(Member(banner, "expires"), &expires))
+        return ParseFailure(failure, "event.result.banner.expires");
+    if (!ob::ParseTimestamp(expires, &out->result.banner.expiresMs))
+        out->result.banner.expiresMs = (std::numeric_limits<std::int64_t>::min)();
+    if (out->result.action == ob::Action::Show) {
+        const ob::json::Value* photo = Member(banner, "photo");
+        const ob::json::Value* hashes = Member(photo, "sha256");
+        if (photo == nullptr || photo->type != ob::json::Type::Object ||
+            hashes == nullptr || hashes->type != ob::json::Type::Object)
+            return ParseFailure(failure, "event.result.banner.photo.sha256");
+        for (const ob::Kind kind : kinds) {
+            const char* name = kind == ob::Kind::Webp ? "webp" : "jpg";
+            std::string* hash = kind == ob::Kind::Webp
+                                    ? &out->result.banner.sha256Webp
+                                    : &out->result.banner.sha256Jpg;
+            const ob::json::Value* hashValue = Member(hashes, name);
+            if (hashValue != nullptr && !StringValue(hashValue, hash))
+                return ParseFailure(failure, std::string("event.result.banner.photo.sha256.") + name);
+        }
+    }
+    return true;
+}
+
+bool EqualCurrent(const ob::CurrentSet& a, const ob::CurrentSet& b) {
+    return a.revision == b.revision && a.sha256 == b.sha256 && a.enabled == b.enabled &&
+           a.expiresMs == b.expiresMs && a.photoWebp == b.photoWebp && a.photoJpg == b.photoJpg;
+}
+
+bool EqualRecord(const ob::Record& a, const ob::Record& b) {
+    return a.hwm == b.hwm && a.hasCurrent == b.hasCurrent &&
+           (!a.hasCurrent || EqualCurrent(a.current, b.current)) &&
+           a.lastCheckMs == b.lastCheckMs && a.failures == b.failures;
+}
+
+bool ParseEffect(const ob::json::Value* value, ob::Effect* out, std::string* failure) {
+    if (value == nullptr || value->type != ob::json::Type::Object)
+        return ParseFailure(failure, "effect");
+    std::string type;
+    if (!StringValue(Member(value, "type"), &type)) return ParseFailure(failure, "effect.type");
+    if (type == "fetch-signed") out->type = ob::EffectType::FetchSigned;
+    else if (type == "fetch-photos") out->type = ob::EffectType::FetchPhotos;
+    else if (type == "cancel") out->type = ob::EffectType::Cancel;
+    else if (type == "write-set") out->type = ob::EffectType::WriteSet;
+    else if (type == "write-record") out->type = ob::EffectType::WriteRecord;
+    else if (type == "delete-unnamed-sets") out->type = ob::EffectType::DeleteUnnamedSets;
+    else if (type == "display") out->type = ob::EffectType::Display;
+    else if (type == "arm-timer") out->type = ob::EffectType::ArmTimer;
+    else if (type == "disarm-timer") out->type = ob::EffectType::DisarmTimer;
+    else if (type == "open-link") out->type = ob::EffectType::OpenLink;
+    else return ParseFailure(failure, "effect.type");
+    const auto Has = [value](const char* key) { return Member(value, key) != nullptr; };
+    const auto Allowed = [out](const std::string& key) {
+        if (key == "type") return true;
+        switch (out->type) {
+            case ob::EffectType::FetchSigned:
+            case ob::EffectType::Cancel: return key == "gen";
+            case ob::EffectType::FetchPhotos: return key == "gen" || key == "kinds";
+            case ob::EffectType::WriteSet: return key == "gen" || key == "sha256";
+            case ob::EffectType::WriteRecord: return key == "record";
+            case ob::EffectType::DeleteUnnamedSets:
+            case ob::EffectType::DisarmTimer:
+            case ob::EffectType::OpenLink: return false;
+            case ob::EffectType::Display: return key == "what" || key == "immediate";
+            case ob::EffectType::ArmTimer: return key == "atMs";
+        }
+        return false;
+    };
+    for (const auto& member : value->members)
+        if (!Allowed(member.first)) return ParseFailure(failure, "effect." + member.first);
+    if ((out->type == ob::EffectType::FetchSigned || out->type == ob::EffectType::FetchPhotos ||
+         out->type == ob::EffectType::Cancel || out->type == ob::EffectType::WriteSet) &&
+        !Has("gen")) return ParseFailure(failure, "effect.gen");
+    if (out->type == ob::EffectType::FetchPhotos && !Has("kinds")) return ParseFailure(failure, "effect.kinds");
+    if (out->type == ob::EffectType::WriteSet && !Has("sha256")) return ParseFailure(failure, "effect.sha256");
+    if (out->type == ob::EffectType::WriteRecord && !Has("record")) return ParseFailure(failure, "effect.record");
+    if (out->type == ob::EffectType::Display && (!Has("what") || !Has("immediate"))) return ParseFailure(failure, "effect.display");
+    if (out->type == ob::EffectType::ArmTimer && !Has("atMs")) return ParseFailure(failure, "effect.atMs");
+    if (Member(value, "gen") != nullptr && !IntegerValue(Member(value, "gen"), &out->gen)) return ParseFailure(failure, "effect.gen");
+    if (Member(value, "sha256") != nullptr && !StringValue(Member(value, "sha256"), &out->sha256)) return ParseFailure(failure, "effect.sha256");
+    if (Member(value, "atMs") != nullptr && !IntegerValue(Member(value, "atMs"), &out->atMs)) return ParseFailure(failure, "effect.atMs");
+    if (Member(value, "immediate") != nullptr && !BoolValue(Member(value, "immediate"), &out->immediate)) return ParseFailure(failure, "effect.immediate");
+    const ob::json::Value* what = Member(value, "what");
+    if (what != nullptr) {
+        std::string name;
+        if (!StringValue(what, &name)) return ParseFailure(failure, "effect.what");
+        if (name == "online") out->online = true;
+        else if (name != "dagoat") return ParseFailure(failure, "effect.what");
+    }
+    if (Member(value, "record") != nullptr && !ParseRecord(Member(value, "record"), &out->record)) return ParseFailure(failure, "effect.record");
+    const ob::json::Value* kinds = Member(value, "kinds");
+    if (kinds != nullptr) {
+        if (kinds->type != ob::json::Type::Array) return ParseFailure(failure, "effect.kinds");
+        for (const ob::json::Value& item : kinds->items) {
+            std::string name;
+            ob::Kind kind = ob::Kind::Webp;
+            if (!StringValue(&item, &name) || !ParseKind(name, &kind)) return ParseFailure(failure, "effect.kinds");
+            out->kinds.push_back(kind);
+        }
+    }
+    return true;
+}
+
+bool EqualEffect(const ob::Effect& a, const ob::Effect& b) {
+    return a.type == b.type && a.gen == b.gen && a.kinds == b.kinds && a.sha256 == b.sha256 &&
+           a.online == b.online && a.immediate == b.immediate && a.atMs == b.atMs &&
+           EqualRecord(a.record, b.record);
+}
+
+void AddIssue(std::string* issue, const std::string& text) {
+    if (!issue->empty()) *issue += "; ";
+    *issue += text;
+}
+
+bool CheckState(const ob::json::Value* expected, const ob::Machine::State& state,
+                std::string* issue) {
+    if (expected == nullptr) return true;
+    if (expected->type != ob::json::Type::Object) {
+        AddIssue(issue, "state is not an object");
+        return false;
+    }
+    bool ok = true;
+    for (const auto& member : expected->members) {
+        const std::string& key = member.first;
+        const ob::json::Value* value = &member.second;
+        if (key == "record") {
+            ob::Record record;
+            if (!ParseRecord(Member(expected, "record"), &record) ||
+                !EqualRecord(record, state.record)) {
+                AddIssue(issue, "state.record");
+                ok = false;
+            }
+        } else if (key == "visible") {
+            bool actual = false;
+            if (!BoolValue(value, &actual) || actual != state.visible) { AddIssue(issue, "state.visible"); ok = false; }
+        } else if (key == "gen") {
+            std::int64_t actual = 0;
+            if (!IntegerValue(value, &actual) || actual != state.gen) { AddIssue(issue, "state.gen"); ok = false; }
+        } else if (key == "attempting") {
+            bool actual = false;
+            if (!BoolValue(value, &actual) || actual != state.attempting) { AddIssue(issue, "state.attempting"); ok = false; }
+        } else if (key == "shown") {
+            std::string actual;
+            const std::string expectedShown = state.shownOnline ? "online" : "dagoat";
+            if (!StringValue(value, &actual) || actual != expectedShown) { AddIssue(issue, "state.shown"); ok = false; }
+        } else if (key == "pendingSwap") {
+            bool actual = false;
+            if (!BoolValue(value, &actual) || actual != state.pendingSwap) { AddIssue(issue, "state.pendingSwap"); ok = false; }
+        } else if (key == "floor") {
+            std::int64_t actual = 0;
+            if (!IntegerValue(value, &actual) || actual != state.floor) { AddIssue(issue, "state.floor"); ok = false; }
+        } else if (key == "timerAtMs") {
+            if (value->type == ob::json::Type::Null) {
+                if (state.timerArmed) { AddIssue(issue, "state.timerAtMs"); ok = false; }
+            } else {
+                std::int64_t actual = 0;
+                if (!IntegerValue(value, &actual) || !state.timerArmed || actual != state.timerAtMs) { AddIssue(issue, "state.timerAtMs"); ok = false; }
+            }
+        } else {
+            AddIssue(issue, "unknown state key");
+            ok = false;
+        }
+    }
+    return ok;
+}
+
+bool IsForbiddenWhileHidden(ob::EffectType type) {
+    return type == ob::EffectType::FetchSigned || type == ob::EffectType::FetchPhotos ||
+           type == ob::EffectType::WriteSet || type == ob::EffectType::WriteRecord ||
+           type == ob::EffectType::ArmTimer || type == ob::EffectType::Display;
+}
+
+}  // namespace banner_test_detail
+
+void Test_AO1_BannerVectors() {
+    using namespace banner_test_detail;
+    Case("AO1 every signed-file vector action and reason");
+    const std::filesystem::path vectors = BannerVectors();
+    std::string casesBytes;
+    if (!ReadBytes(vectors / "cases.json", &casesBytes)) {
+        CHECK(false);
+        std::printf("AO1 VECTORS 0 of 0\n");
+        return;
+    }
+    ob::json::Value document;
+    const char* parseReason = ob::json::Parse(casesBytes, 64, &document);
+    const ob::json::Value* publicKeyHex = Member(&document, "publicKeyHex");
+    const ob::json::Value* keyId = Member(&document, "keyId");
+    const ob::json::Value* cases = Member(&document, "cases");
+    const bool schemaOk = parseReason == nullptr && publicKeyHex != nullptr && keyId != nullptr &&
+                          cases != nullptr && cases->type == ob::json::Type::Array &&
+                          publicKeyHex->type == ob::json::Type::String && keyId->type == ob::json::Type::String;
+    CHECK(schemaOk);
+    if (!schemaOk) {
+        std::printf("AO1 VECTORS 0 of 0\n");
+        return;
+    }
+    std::vector<std::uint8_t> publicKey;
+    std::uint8_t publicKeyArray[65]{};
+    const bool publicKeyOk = publicKeyHex->text.size() == 130u && HexBytes(publicKeyHex->text, &publicKey) && publicKey.size() == 65u;
+    CHECK(publicKeyOk);
+    if (!publicKeyOk) {
+        std::printf("AO1 VECTORS 0 of %zu\n", cases->items.size());
+        return;
+    }
+    std::copy(publicKey.begin(), publicKey.end(), publicKeyArray);
+    CHECK(ob::KeyIdOf(publicKeyArray) == keyId->text);
+    CHECK(cases->items.size() >= 42u);
+    std::size_t passed = 0;
+    for (const ob::json::Value& item : cases->items) {
+        const ob::json::Value* name = Member(&item, "name");
+        const ob::json::Value* file = Member(&item, "file");
+        const ob::json::Value* now = Member(&item, "now");
+        const ob::json::Value* hwm = Member(&item, "hwm");
+        const ob::json::Value* floor = Member(&item, "floor");
+        const ob::json::Value* stored = Member(&item, "stored");
+        const ob::json::Value* expect = Member(&item, "expect");
+        const ob::json::Value* reason = Member(&item, "reason");
+        const std::string caseName = name == nullptr ? "<missing>" : name->text;
+        std::string signedBytes;
+        std::string storedBytes;
+        std::int64_t nowMs = 0, hwmValue = 0, floorValue = 0;
+        bool setupOk = name != nullptr && file != nullptr && now != nullptr && hwm != nullptr &&
+                       floor != nullptr && stored != nullptr && expect != nullptr && reason != nullptr &&
+                       name->type == ob::json::Type::String && file->type == ob::json::Type::String &&
+                       now->type == ob::json::Type::String && ParseTime(now->text, &nowMs) &&
+                       IntegerValue(hwm, &hwmValue) && IntegerValue(floor, &floorValue) &&
+                       expect->type == ob::json::Type::String;
+        const std::string* storedPtr = nullptr;
+        if (setupOk && stored->type == ob::json::Type::String) {
+            setupOk = ReadBytes(vectors / stored->text, &storedBytes);
+            storedPtr = &storedBytes;
+        } else if (setupOk && stored->type != ob::json::Type::Null) {
+            setupOk = false;
+        }
+        if (setupOk) setupOk = ReadBytes(vectors / file->text, &signedBytes);
+        ob::Result result{};
+        if (setupOk) {
+            const ob::Context context{&publicKeyArray, nowMs, hwmValue, floorValue, storedPtr};
+            result = ob::Evaluate(signedBytes, context);
+        }
+        const ob::Action expectedAction = setupOk ? ActionFor(expect->text) : ob::Action::Reject;
+        const char* expectedReason = setupOk ? ReasonFor(reason) : "test-setup";
+        const bool actionOk = setupOk && result.action == expectedAction;
+        const bool reasonOk = setupOk && SameReason(result.reason, expectedReason);
+        if (!actionOk || !reasonOk) {
+            std::printf("FAIL AO1 case %s action %s/%s reason %s/%s\n", caseName.c_str(),
+                        ActionName(result.action), ActionName(expectedAction),
+                        result.reason == nullptr ? "null" : result.reason,
+                        expectedReason == nullptr ? "null" : expectedReason);
+        }
+        CHECK(actionOk);
+        CHECK(reasonOk);
+        if (actionOk && reasonOk) ++passed;
+    }
+    std::printf("AO1 VECTORS %zu of %zu\n", passed, cases->items.size());
+}
+
+void Test_AO2_BannerMachine() {
+    using namespace banner_test_detail;
+    Case("AO2 every machine scenario and invariant after each step");
+    const std::filesystem::path vectors = BannerVectors();
+    std::string bytes;
+    ob::json::Value document;
+    if (!ReadBytes(vectors / "transitions.json", &bytes) || ob::json::Parse(bytes, 64, &document) != nullptr) {
+        CHECK(false);
+        std::printf("AO2 MACHINE 0 of 0\n");
+        return;
+    }
+    const ob::json::Value* scenarios = Member(&document, "scenarios");
+    const bool scenariosOk = scenarios != nullptr && scenarios->type == ob::json::Type::Array && !scenarios->items.empty();
+    CHECK(scenariosOk);
+    if (!scenariosOk) {
+        std::printf("AO2 MACHINE 0 of 0\n");
+        return;
+    }
+    std::size_t passed = 0;
+    for (std::size_t scenarioIndex = 0; scenarioIndex < scenarios->items.size(); ++scenarioIndex) {
+        const ob::json::Value& scenario = scenarios->items[scenarioIndex];
+        std::string name;
+        std::int64_t floor = 0;
+        const ob::json::Value* kindsValue = Member(&scenario, "kinds");
+        const ob::json::Value* steps = Member(&scenario, "steps");
+        bool scenarioOk = StringValue(Member(&scenario, "name"), &name) && IntegerValue(Member(&scenario, "floor"), &floor) &&
+                          kindsValue != nullptr && kindsValue->type == ob::json::Type::Array && steps != nullptr &&
+                          steps->type == ob::json::Type::Array;
+        std::vector<ob::Kind> kinds;
+        if (scenarioOk) {
+            for (const ob::json::Value& item : kindsValue->items) {
+                std::string kindText;
+                ob::Kind kind = ob::Kind::Webp;
+                if (!StringValue(&item, &kindText) || !ParseKind(kindText, &kind)) { scenarioOk = false; break; }
+                kinds.push_back(kind);
+            }
+        }
+        ob::Machine machine(floor, kinds);
+        if (!scenarioOk) {
+            std::printf("FAIL AO2 scenario %zu step -1: setup\n", scenarioIndex);
+            CHECK(false);
+            continue;
+        }
+        for (std::size_t stepIndex = 0; stepIndex < steps->items.size(); ++stepIndex) {
+            const ob::json::Value& step = steps->items[stepIndex];
+            std::int64_t atMs = 0;
+            ob::Event event;
+            std::vector<ob::Effect> expected;
+            const ob::json::Value* eventValue = Member(&step, "event");
+            const ob::json::Value* expectedValue = Member(&step, "expect");
+            std::string setupIssue;
+            bool stepOk = IntegerValue(Member(&step, "atMs"), &atMs);
+            if (!stepOk) AddIssue(&setupIssue, "atMs");
+            if (stepOk && !ParseEvent(eventValue, kinds, &event, &setupIssue)) stepOk = false;
+            if (stepOk && (expectedValue == nullptr || expectedValue->type != ob::json::Type::Array)) {
+                AddIssue(&setupIssue, "expect");
+                stepOk = false;
+            }
+            if (stepOk) {
+                for (std::size_t effectIndex = 0; effectIndex < expectedValue->items.size(); ++effectIndex) {
+                    ob::Effect effect;
+                    std::string effectIssue;
+                    if (!ParseEffect(&expectedValue->items[effectIndex], &effect, &effectIssue)) {
+                        AddIssue(&setupIssue, "expect[" + std::to_string(effectIndex) + "]" + (effectIssue.empty() ? "" : "." + effectIssue));
+                        stepOk = false;
+                        break;
+                    }
+                    expected.push_back(effect);
+                }
+            }
+            std::string issue;
+            if (!stepOk) {
+                AddIssue(&issue, setupIssue.empty() ? "setup" : "setup: " + setupIssue);
+            } else {
+                const std::vector<ob::Effect> actual = machine.Dispatch(event, atMs);
+                if (actual.size() != expected.size()) {
+                    AddIssue(&issue, "effects length");
+                } else {
+                    for (std::size_t effectIndex = 0; effectIndex < actual.size(); ++effectIndex) {
+                        if (!EqualEffect(actual[effectIndex], expected[effectIndex])) { AddIssue(&issue, "effect fields"); break; }
+                    }
+                }
+                const ob::Machine::State state = machine.GetState();
+                CheckState(Member(&step, "state"), state, &issue);
+                if (!machine.CheckInvariants().empty()) AddIssue(&issue, "invariants");
+                if (event.type != ob::EventType::Start && !state.visible) {
+                    for (const ob::Effect& effect : actual) {
+                        if (IsForbiddenWhileHidden(effect.type)) { AddIssue(&issue, "forbidden hidden effect"); break; }
+                    }
+                }
+            }
+            if (!issue.empty()) {
+                std::printf("FAIL AO2 %s step %zu: %s\n", name.c_str(), stepIndex, issue.c_str());
+                scenarioOk = false;
+            }
+        }
+        CHECK(scenarioOk);
+        if (scenarioOk) ++passed;
+    }
+    std::printf("AO2 MACHINE %zu of %zu\n", passed, scenarios->items.size());
+}
+
+void Test_AO4_SponsorLinkAllowList() {
+    Case("AO4 sponsor link allow-list includes only verified destinations");
+    ob::Model current;
+    current.online = true;
+    current.banner.link = "https://verified.example/banner";
+
+    CHECK(cd::SponsorLinkAllowed(L"https://verified.example/banner", current));
+    CHECK(cd::SponsorLinkAllowed(L"https://verified.example/banner/", current));
+    CHECK(cd::SponsorLinkAllowed(cd::sponsor_url::kKofi, current));
+    CHECK(cd::SponsorLinkAllowed(cd::sponsor_url::kGitHub, current));
+    CHECK(cd::SponsorLinkAllowed(cd::sponsor_url::kGoatCam, current));
+    CHECK(cd::SponsorLinkAllowed(cd::sponsor_url::kDaGoat, current));
+    CHECK(!cd::SponsorLinkAllowed(L"https://evil.example", current));
+    CHECK(!cd::SponsorLinkAllowed(L"https://verified.example/banner/x", current));
+    CHECK(!cd::SponsorLinkAllowed(L"http://verified.example/banner", current));
+    current.online = false;
+    CHECK(!cd::SponsorLinkAllowed(L"https://verified.example/banner", current));
+}
+
+void Test_AO5_PageMessageJson() {
+    Case("AO5 page-message JSON escaping and offline shape");
+
+    ob::Model model;
+    model.online = true;
+    model.banner.headline = L"GOAT \"Cam\" \\ LIVE\tNOW\u2028next";
+    model.banner.headlineEm = L"NOW";
+    model.banner.hasHeadlineEm = true;
+    model.banner.wordmark = L"山羊 Cam";
+    model.banner.tagline = {L"Your iPhone, NOW", L"Streams safely"};
+    model.banner.badge = L"LIVE";
+    model.banner.hasBadge = true;
+    model.banner.viewfinder = true;
+    model.banner.steam = true;
+    model.banner.link = "https://verified.example/banner";
+    model.banner.labelLink = L"Open";
+    model.banner.labelQr = L"Scan";
+    model.banner.qrRows = {"111", "101", "111"};
+    model.banner.w = 60;
+    model.banner.h = 128;
+    model.banner.focus[0] = 0.5;
+    model.banner.focus[1] = 0.5;
+    model.banner.textBox[0] = 0.1;
+    model.banner.textBox[1] = 0.2;
+    model.banner.textBox[2] = 0.8;
+    model.banner.textBox[3] = 0.4;
+    model.banner.steamAt[0] = 0.5;
+    model.banner.steamAt[1] = 0.3;
+    const std::string rawWebp("\x00\x80\xff\x01\xfe\x7f", 6);
+    model.webp = rawWebp;
+
+    const std::string expectedHeadline = Utf8(model.banner.headline);
+    const std::string utf8 = Utf8(cd::PageMessageJson(model));
+    ob::json::Value root;
+    CHECK(ob::json::Parse(utf8, static_cast<int>(utf8.size()), &root) == nullptr);
+    const ob::json::Value* outer = banner_test_detail::Member(&root, "goatcamBanner");
+    CHECK(outer != nullptr);
+    const ob::json::Value* banner = banner_test_detail::Member(outer, "banner");
+    CHECK(banner != nullptr);
+    const ob::json::Value* headline = banner_test_detail::Member(banner, "headline");
+    CHECK(headline != nullptr);
+    CHECK(headline->type == ob::json::Type::String);
+    CHECK(headline->text == expectedHeadline);
+    const ob::json::Value* photo = banner_test_detail::Member(outer, "photo");
+    CHECK(photo != nullptr);
+    const ob::json::Value* dataUrl = banner_test_detail::Member(photo, "dataUrl");
+    CHECK(dataUrl != nullptr);
+    CHECK(dataUrl != nullptr && dataUrl->type == ob::json::Type::String);
+    if (dataUrl != nullptr && dataUrl->type == ob::json::Type::String) {
+        const std::string prefix = "data:image/webp;base64,";
+        CHECK(dataUrl->text.rfind(prefix, 0) == 0);
+        if (dataUrl->text.rfind(prefix, 0) == 0) {
+            bool decodedOk = false;
+            const std::string decoded = DecodeBase64ForTest(dataUrl->text.substr(prefix.size()),
+                                                            &decodedOk);
+            CHECK(decodedOk);
+            CHECK(decoded == rawWebp);
+        }
+    }
+
+    ob::Model surrogate = model;
+    surrogate.banner.headline = L"bad";
+    surrogate.banner.headline.push_back(static_cast<wchar_t>(0xd800));
+    surrogate.banner.headline.push_back(L'!');
+    const std::string surrogateJson = Utf8(cd::PageMessageJson(surrogate));
+    ob::json::Value surrogateRoot;
+    CHECK(ob::json::Parse(surrogateJson, static_cast<int>(surrogateJson.size()), &surrogateRoot) == nullptr);
+    const ob::json::Value* surrogateBanner = banner_test_detail::Member(&surrogateRoot, "goatcamBanner");
+    const ob::json::Value* surrogatePayload = surrogateBanner == nullptr
+                                                   ? nullptr
+                                                   : banner_test_detail::Member(surrogateBanner, "banner");
+    const ob::json::Value* surrogateHeadline = surrogatePayload == nullptr
+                                                    ? nullptr
+                                                    : banner_test_detail::Member(surrogatePayload, "headline");
+    CHECK(surrogateHeadline != nullptr &&
+          surrogateHeadline->text == "bad\xef\xbf\xbd!");
+
+    ob::Model offline;
+    const std::string offlineJson = Utf8(cd::PageMessageJson(offline));
+    ob::json::Value offlineRoot;
+    CHECK(ob::json::Parse(offlineJson, static_cast<int>(offlineJson.size()), &offlineRoot) == nullptr);
+    const ob::json::Value* offlineBanner = banner_test_detail::Member(&offlineRoot, "goatcamBanner");
+    CHECK(offlineBanner != nullptr);
+    const ob::json::Value* offlineKind = banner_test_detail::Member(offlineBanner, "kind");
+    CHECK(offlineKind != nullptr && offlineKind->text == "dagoat");
+
+    model.webp.clear();
+    const std::string emptyWebpJson = Utf8(cd::PageMessageJson(model));
+    ob::json::Value emptyWebpRoot;
+    CHECK(ob::json::Parse(emptyWebpJson, static_cast<int>(emptyWebpJson.size()), &emptyWebpRoot) == nullptr);
+    const ob::json::Value* emptyWebpBanner = banner_test_detail::Member(&emptyWebpRoot, "goatcamBanner");
+    CHECK(emptyWebpBanner != nullptr);
+    const ob::json::Value* emptyWebpKind = banner_test_detail::Member(emptyWebpBanner, "kind");
+    CHECK(emptyWebpKind != nullptr && emptyWebpKind->text == "dagoat");
+
+    model.webp.assign(300001, 'x');
+    const std::string oversizedJson = Utf8(cd::PageMessageJson(model));
+    ob::json::Value oversizedRoot;
+    CHECK(ob::json::Parse(oversizedJson, static_cast<int>(oversizedJson.size()), &oversizedRoot) == nullptr);
+    const ob::json::Value* oversizedBanner = banner_test_detail::Member(&oversizedRoot, "goatcamBanner");
+    const ob::json::Value* oversizedKind = oversizedBanner == nullptr
+                                                ? nullptr
+                                                : banner_test_detail::Member(oversizedBanner, "kind");
+    CHECK(oversizedKind != nullptr && oversizedKind->text == "dagoat");
+}
+
+void Test_AO7_ResumeAfterExpiry() {
+    Case("AO7 resume after expiry falls back to DaGoat");
+    ob::Model expired;
+    expired.online = true;
+    expired.banner.expiresMs = 1;
+    cd::BannerHostSetModelForTest(&expired);
+    CHECK(cd::BannerHostCurrent().online);
+    cd::BannerHostResumed();
+    CHECK(!cd::BannerHostCurrent().online);
+    cd::BannerHostSetModelForTest(nullptr);
+}
+
 int main() {
     std::printf("Game Optimizer unit tests\n");
     std::printf("=======================\n");
@@ -13495,6 +14616,18 @@ int main() {
 
     std::printf("\n== AL. What a run says while it walks its rows (v0.5.9) ==\n");
     Test_AL1_TheRunProgressLine();
+
+    std::printf("\n== AO. Online banner native core ==\n");
+    Test_AO1_BannerVectors();
+    Test_AO2_BannerMachine();
+    Test_AO4_SponsorLinkAllowList();
+    Test_AO5_PageMessageJson();
+    Test_AO7_ResumeAfterExpiry();
+
+    std::printf("\n== AM. The WebView2 page's QR hover report (GOAT Cam banner v2) ==\n");
+    Test_AM1_TheQrMessageAcceptsOnlyItsTwoForms();
+    Test_AM3_TheGeneratedPagesOwnMessagesAreAccepted();
+    Test_AM4_TheParserAndTheConversionAreBounded();
 
     std::printf("\n");
     std::printf("TOTAL %d PASSED %d FAILED %d\n", g_total, g_total - g_failed, g_failed);

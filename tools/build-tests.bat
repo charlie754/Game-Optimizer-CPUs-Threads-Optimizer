@@ -14,7 +14,9 @@ cl /nologo /EHsc /Od /Zi /std:c++17 /W3 /permissive- /DUNICODE /D_UNICODE /DCD_T
    "%ROOT%\src\topology.cpp" "%ROOT%\src\config.cpp" "%ROOT%\src\util.cpp" ^
    "%ROOT%\src\engine.cpp" "%ROOT%\src\procwatch.cpp" "%ROOT%\src\applier.cpp" ^
    "%ROOT%\src\games.cpp" ^
-   /link /SUBSYSTEM:CONSOLE user32.lib advapi32.lib shell32.lib shlwapi.lib psapi.lib ole32.lib
+   "%ROOT%\src\banner_host.cpp" ^
+   "%ROOT%\src\online_banner.cpp" "%ROOT%\src\online_banner_machine.cpp" "%ROOT%\src\online_banner_client.cpp" ^
+   /link /SUBSYSTEM:CONSOLE user32.lib advapi32.lib shell32.lib shlwapi.lib psapi.lib ole32.lib bcrypt.lib winhttp.lib windowscodecs.lib
 set RC=%ERRORLEVEL%
 popd
 echo TESTBUILD_EXIT=%RC%

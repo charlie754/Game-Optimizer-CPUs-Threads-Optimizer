@@ -21,9 +21,9 @@ namespace cd {
 //
 //   ms = (major << 16) | minor          ls = (patch << 16) | build
 //
-// SHAPE, and it is a judgement call worth writing down: "v0.4.3" for a release, and
-// "v0.4.3.1" only when the fourth field is non-zero. The operator's own name for this
-// release is "v0.4.3", so a corner label reading "v0.4.3.0" would be four characters of
+// SHAPE, and it is a judgement call worth writing down: "v0.6.0" for a release, and
+// "v0.6.0.1" only when the fourth field is non-zero. The operator's own name for this
+// release is "v0.6.0", so a corner label reading "v0.6.0.0" would be four characters of
 // noise that match nothing they ever said - while a rebuild that DID move the fourth field
 // is exactly the case where the extra digit is the only thing distinguishing two binaries.
 //

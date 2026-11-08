@@ -1,0 +1,1078 @@
+{
+  "publicKeyHex": "0473c63ed84130ca531bbd4095f9c3278366265e39bd0b61ee32a8905a7e24967860880e731a1b97e2248232e4b86ede9f37f6eea23bee833239b5cb9fea508979",
+  "keyId": "a5f8de8eb7ed4751",
+  "cases": [
+    {
+      "name": "valid",
+      "file": "cases/valid.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "valid-killswitch",
+      "file": "cases/valid-killswitch.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "killswitch",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "unknown-key",
+      "file": "cases/unknown-key.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "max-text",
+      "file": "cases/max-text.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "sig-bad",
+      "file": "cases/sig-bad.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "sig",
+      "photo": null
+    },
+    {
+      "name": "sig-update-style",
+      "file": "cases/sig-update-style.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "sig",
+      "photo": null
+    },
+    {
+      "name": "sigline-long",
+      "file": "cases/sigline-long.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "sigline",
+      "photo": null
+    },
+    {
+      "name": "sigline-missing",
+      "file": "cases/sigline-missing.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "sigline",
+      "photo": null
+    },
+    {
+      "name": "size-over",
+      "file": "cases/size-over.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "size",
+      "photo": null
+    },
+    {
+      "name": "utf8-bad",
+      "file": "cases/utf8-bad.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "utf8",
+      "photo": null
+    },
+    {
+      "name": "json-trailing",
+      "file": "cases/json-trailing.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "json",
+      "photo": null
+    },
+    {
+      "name": "json-whitespace",
+      "file": "cases/json-whitespace.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "json-pretty",
+      "file": "cases/json-pretty.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "killswitch-spaced",
+      "file": "cases/killswitch-spaced.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "killswitch",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "schema-1.0",
+      "file": "cases/schema-1.0.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "schema",
+      "photo": null
+    },
+    {
+      "name": "schema-1e0",
+      "file": "cases/schema-1e0.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "schema",
+      "photo": null
+    },
+    {
+      "name": "depth4-then-trailing",
+      "file": "cases/depth4-then-trailing.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "json",
+      "photo": null
+    },
+    {
+      "name": "depth4-then-dupkey",
+      "file": "cases/depth4-then-dupkey.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "dupkey",
+      "photo": null
+    },
+    {
+      "name": "dupkey-then-depth33",
+      "file": "cases/dupkey-then-depth33.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "depth",
+      "photo": null
+    },
+    {
+      "name": "depth32-malformed",
+      "file": "cases/depth32-malformed.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "depth",
+      "photo": null
+    },
+    {
+      "name": "toplevel-array",
+      "file": "cases/toplevel-array.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "json",
+      "photo": null
+    },
+    {
+      "name": "size-exact-16384",
+      "file": "cases/size-exact-16384.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "json-dupkey",
+      "file": "cases/json-dupkey.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "dupkey",
+      "photo": null
+    },
+    {
+      "name": "json-depth4",
+      "file": "cases/json-depth4.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "depth",
+      "photo": null
+    },
+    {
+      "name": "schema-2",
+      "file": "cases/schema-2.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "schema",
+      "photo": null
+    },
+    {
+      "name": "keyid-wrong",
+      "file": "cases/keyid-wrong.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "keyid",
+      "photo": null
+    },
+    {
+      "name": "field-missing-headline",
+      "file": "cases/field-missing-headline.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "sha-upper",
+      "file": "cases/sha-upper.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "text-headline-49",
+      "file": "cases/text-headline-49.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "text-bidi",
+      "file": "cases/text-bidi.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "text-zero-width",
+      "file": "cases/text-zero-width.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "text-del",
+      "file": "cases/text-del.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "text-soft-hyphen",
+      "file": "cases/text-soft-hyphen.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "text-u0250",
+      "file": "cases/text-u0250.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "text-u2010",
+      "file": "cases/text-u2010.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "em-not-substring",
+      "file": "cases/em-not-substring.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "tagline-19",
+      "file": "cases/tagline-19.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "badge-17",
+      "file": "cases/badge-17.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "label-81",
+      "file": "cases/label-81.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "text",
+      "photo": null
+    },
+    {
+      "name": "url-http",
+      "file": "cases/url-http.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-userinfo",
+      "file": "cases/url-userinfo.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-ip",
+      "file": "cases/url-ip.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-port",
+      "file": "cases/url-port.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-label-hyphen",
+      "file": "cases/url-label-hyphen.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-label-64",
+      "file": "cases/url-label-64.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-tld-1",
+      "file": "cases/url-tld-1.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-tld-digits",
+      "file": "cases/url-tld-digits.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-idn-tld",
+      "file": "cases/url-idn-tld.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "url-port-443",
+      "file": "cases/url-port-443.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "url-201",
+      "file": "cases/url-201.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "url-non-ascii",
+      "file": "cases/url-non-ascii.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "url",
+      "photo": null
+    },
+    {
+      "name": "textbox-sum",
+      "file": "cases/textbox-sum.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "w-1601",
+      "file": "cases/w-1601.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "revision-2p53",
+      "file": "cases/revision-2p53.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "date-feb29-2027",
+      "file": "cases/date-feb29-2027.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "hour-24",
+      "file": "cases/hour-24.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "year-1999",
+      "file": "cases/year-1999.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "qr-size-33",
+      "file": "cases/qr-size-33.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "qr",
+      "photo": null
+    },
+    {
+      "name": "qr-size-huge",
+      "file": "cases/qr-size-huge.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "qr",
+      "photo": null
+    },
+    {
+      "name": "qr-size-negative",
+      "file": "cases/qr-size-negative.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "qr",
+      "photo": null
+    },
+    {
+      "name": "qr-row-number",
+      "file": "cases/qr-row-number.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "field",
+      "photo": null
+    },
+    {
+      "name": "qr-row-short",
+      "file": "cases/qr-row-short.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "qr",
+      "photo": null
+    },
+    {
+      "name": "time-expired",
+      "file": "cases/time-expired.signed",
+      "now": "2027-11-02T00:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "time",
+      "photo": null
+    },
+    {
+      "name": "time-issued-future",
+      "file": "cases/time-issued-future.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "time",
+      "photo": null
+    },
+    {
+      "name": "time-window-401d",
+      "file": "cases/time-window-401d.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "time",
+      "photo": null
+    },
+    {
+      "name": "time-expires-before-issued",
+      "file": "cases/time-expires-before-issued.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "time",
+      "photo": null
+    },
+    {
+      "name": "time-expires-equals-issued",
+      "file": "cases/time-expires-equals-issued.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "time",
+      "photo": null
+    },
+    {
+      "name": "clock-future",
+      "file": "cases/clock-future.signed",
+      "now": "2029-11-01T00:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "time",
+      "photo": null
+    },
+    {
+      "name": "clock-past",
+      "file": "cases/clock-past.signed",
+      "now": "2026-10-03T00:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "time",
+      "photo": null
+    },
+    {
+      "name": "revision-below-hwm",
+      "file": "cases/revision-below-hwm.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 8,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "revision",
+      "photo": null
+    },
+    {
+      "name": "revision-below-floor",
+      "file": "cases/revision-below-floor.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 8,
+      "stored": null,
+      "expect": "reject",
+      "reason": "floor",
+      "photo": null
+    },
+    {
+      "name": "hwm-negative",
+      "file": "cases/hwm-negative.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": -1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "revision",
+      "photo": null
+    },
+    {
+      "name": "floor-negative",
+      "file": "cases/floor-negative.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": -1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "floor",
+      "photo": null
+    },
+    {
+      "name": "revision-equal-different",
+      "file": "cases/revision-equal-different.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 7,
+      "floor": 1,
+      "stored": "cases/revision-equal-same.signed",
+      "expect": "reject",
+      "reason": "equal",
+      "photo": null
+    },
+    {
+      "name": "revision-equal-same",
+      "file": "cases/revision-equal-same.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 7,
+      "floor": 1,
+      "stored": "cases/revision-equal-same.signed",
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "revision-equal-nostored",
+      "file": "cases/revision-equal-nostored.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 7,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": null
+    },
+    {
+      "name": "photo-ok-webp",
+      "file": "cases/photo-ok-webp.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/hero-coffee-800.webp",
+        "kind": "webp",
+        "expect": "ok"
+      }
+    },
+    {
+      "name": "photo-ok-jpg",
+      "file": "cases/photo-ok-jpg.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/hero-coffee-800.jpg",
+        "kind": "jpg",
+        "expect": "ok"
+      }
+    },
+    {
+      "name": "photo-hash",
+      "file": "cases/photo-hash.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-hash.webp",
+        "kind": "webp",
+        "expect": "photo-hash"
+      }
+    },
+    {
+      "name": "photo-dims",
+      "file": "cases/photo-dims.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/hero-coffee-800.webp",
+        "kind": "webp",
+        "expect": "photo-dims"
+      }
+    },
+    {
+      "name": "photo-anim",
+      "file": "cases/photo-anim.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-anim.webp",
+        "kind": "webp",
+        "expect": "photo-anim"
+      }
+    },
+    {
+      "name": "photo-size",
+      "file": "cases/photo-size.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-size.webp",
+        "kind": "webp",
+        "expect": "photo-size"
+      }
+    },
+    {
+      "name": "base64-noncanonical",
+      "file": "cases/base64-noncanonical.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "reject",
+      "reason": "sigline",
+      "photo": null
+    },
+    {
+      "name": "photo-webp-nopad-end",
+      "file": "cases/photo-webp-nopad-end.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-webp-nopad-end.webp",
+        "kind": "webp",
+        "expect": "ok"
+      }
+    },
+    {
+      "name": "photo-webp-trailing",
+      "file": "cases/photo-webp-trailing.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-webp-trailing.webp",
+        "kind": "webp",
+        "expect": "photo-dims"
+      }
+    },
+    {
+      "name": "photo-vp8x-animflag",
+      "file": "cases/photo-vp8x-animflag.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-vp8x-animflag.webp",
+        "kind": "webp",
+        "expect": "photo-anim"
+      }
+    },
+    {
+      "name": "photo-anim-only-anim",
+      "file": "cases/photo-anim-only-anim.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-anim-only-anim.webp",
+        "kind": "webp",
+        "expect": "photo-anim"
+      }
+    },
+    {
+      "name": "photo-anim-only-anmf",
+      "file": "cases/photo-anim-only-anmf.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-anim-only-anmf.webp",
+        "kind": "webp",
+        "expect": "photo-anim"
+      }
+    },
+    {
+      "name": "photo-vp8l",
+      "file": "cases/photo-vp8l.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-vp8l.webp",
+        "kind": "webp",
+        "expect": "ok"
+      }
+    },
+    {
+      "name": "photo-jpeg-fill",
+      "file": "cases/photo-jpeg-fill.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-jpeg-fill.jpg",
+        "kind": "jpg",
+        "expect": "ok"
+      }
+    },
+    {
+      "name": "photo-jpeg-sof-at-eof",
+      "file": "cases/photo-jpeg-sof-at-eof.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-jpeg-sof-at-eof.jpg",
+        "kind": "jpg",
+        "expect": "ok"
+      }
+    },
+    {
+      "name": "photo-empty",
+      "file": "cases/photo-empty.signed",
+      "now": "2026-11-02T12:00:00Z",
+      "hwm": 1,
+      "floor": 1,
+      "stored": null,
+      "expect": "show",
+      "reason": null,
+      "photo": {
+        "file": "photos/photo-empty.webp",
+        "kind": "webp",
+        "expect": "photo-size"
+      }
+    }
+  ]
+}

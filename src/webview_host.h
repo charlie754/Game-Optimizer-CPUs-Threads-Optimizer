@@ -47,15 +47,16 @@ struct WebSponsor;
 // different kinds of number and the name says so - it was WebSponsorNaturalSize until the panel
 // stopped having a natural width.
 //
-// The panel is ONE ROW OF THREE GROUPS - Ko-fi, the GitHub pill, and the disease-research copy
-// beside the GOATPROJECT lockup - and it FILLS whatever width it is given
-// (`.shell.is-open { width: 100% }`). So there is no natural width any more, only a floor:
-// kSponsorCssMinWidth, the narrowest host at which the three groups still fit. Below it the row
-// overflows its end edge and `.shell { overflow: hidden }` cuts the right-hand group off in
-// silence, which is why WM_GETMINMAXINFO has to keep the window above it.
+// The panel is ONE ROW OF THREE GROUPS - Ko-fi, the GitHub pill, and the GOAT Cam banner (two
+// copy lines beside the espresso plate with its App Store QR) - and it FILLS whatever width it
+// is given (`.shell.is-open { width: 100% }`). So there is no natural width any more, only a
+// floor: kSponsorCssMinWidth, the narrowest host at which the three groups still fit. Below it
+// the row overflows its end edge and `.shell { overflow: hidden }` cuts the right-hand group -
+// the plate and its QR - off in silence, which is why WM_GETMINMAXINFO has to keep the window
+// above it.
 //
-// The height does NOT vary with the width - every item in the row is the Ko-fi button's height
-// and the row never wraps - so one constant is right at every window size.
+// The height does NOT vary with the width - the plate is a fixed height, Ko-fi and Star sit
+// centred beside it, and the row never wraps - so one constant is right at every window size.
 //
 // Both figures come from the generated header, where they were MEASURED by rendering the page
 // at a range of widths (tools\measure-panel.py), so they track the plugin rather than a

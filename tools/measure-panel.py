@@ -18,12 +18,15 @@
 # NOT. So this script renders the SAME page at a range of host widths and asserts, at EVERY one:
 #
 #   1. nothing overflows and the three groups do not collide;
-#   2. all four items are still the same height, and that height is still the Ko-fi button's;
-#   3. the gap between the statement and the lockup is STRICTLY SMALLER than the gaps between
-#      the three groups - which is the acceptance test for "Statement and GoatProject as 1
-#      group", and is not something anyone can eyeball reliably at 8px against 24px;
+#   2. the GOAT Cam plate is the tallest item and sets the row's height; Ko-fi and Star are one
+#      height with each other ("same height as Ko-fi"), and every item is centred in the row;
+#   3. the gap between the statement and the GOAT Cam plate is STRICTLY SMALLER than the gaps
+#      between the three groups - which is the acceptance test for "statement and banner as 1
+#      group", and is not something anyone can eyeball reliably at 10px against 20px;
 #   4. the gap above the row equals the gap below it - the acceptance test for "buttons too
-#      close to panel upside edge".
+#      close to panel upside edge". Both are 0 now: the plate fills the band;
+#   5. nothing on the plate runs off it: the 72px App Store QR at full size, the photo layer,
+#      the viewfinder, the wordmark - and the wordmark and viewfinder stay clear of the QR.
 #
 # and then SWEEPS DOWNWARD to find the width at which it FIRST breaks. That width plus one is
 # SHELL_MIN_W / kSponsorCssMinWidth: the floor WM_GETMINMAXINFO has to keep the window above.
@@ -39,41 +42,39 @@
 #
 # WHAT IT ALSO CHECKS, BEYOND THE BOX
 # -----------------------------------
-# 1. EQUAL HEIGHT, which is the operator's standing requirement for this layout - "align all
-#    height same as Ko-fi button". Two separate things have to be true and only one of them is
-#    obvious:
+# 1. THE HEIGHT CONTRACT. The row used to be keyed to the Ko-fi button. The GOAT Cam plate is
+#    now the ruler - it is 74 css px because its App Store QR is 72 - and the band it sets is
+#    kSponsorCssHeight, the same band the GDI strip reserves. Three things have to be true:
 #
-#      (a) the four items are all the same height. `align-items: stretch` does this for free, so
-#          on its own this check is nearly vacuous - it passes whatever the height turns out to
-#          be.
-#      (b) that shared height is the KO-FI BUTTON'S OWN height. stretch equalises to the
-#          TALLEST item, so if the statement or the lockup is even 1px taller than Ko-fi then
-#          Ko-fi is the one being stretched and the ruler has silently changed. Nothing about
-#          the rendered panel looks different when this goes wrong; the row is simply keyed to
-#          the wrong element from then on.
+#      (a) the plate is the TALLEST item at its NATURAL height. If the headline ever wraps to
+#          more lines than the plate's height holds (v1's two-line copy did at five lines, 76.44px,
+#          under a 146px column; banner v2's one line takes two in its 136px column, 32.38px) it
+#          outgrows the plate, the row grows past the band, and the host cuts the panel's top
+#          off. This is the check that catches it.
+#      (b) Ko-fi and Star are the same height as each other - the operator's standing "same
+#          height as Ko-fi" - now that they no longer set the row.
+#      (c) every item is CENTRED in the row: `align-items: center` does that, and this says it
+#          happened.
 #
-#    (b) is measured by turning stretch off for one layout pass - `align-self: flex-start` on
-#    every row child AND every group child, since the statement and the lockup are one level
-#    deeper now - reading each item's NATURAL height, and putting it back.
+#    Natural heights are read by turning alignment off for one layout pass - `align-self:
+#    flex-start` on every row child and every child of the banner - and putting it back.
 #
 # 2. OVERFLOW. A row can be wider than the shell that holds it, and `.shell { overflow: hidden }`
 #    will CLIP it in silence. A clipped button still renders, still takes clicks on the part you
 #    can see, and looks like a styling choice. So every probed element is asked for scrollWidth
 #    vs clientWidth (and scrollHeight vs clientHeight) and any overflow is a FAILURE.
 #
-#    .goat-lockup IS DELIBERATELY EXCLUDED FROM THAT VERDICT and always has been. It reports
-#    scrollWidth over clientWidth - 213 against 190 in this layout - because of the plugin's own
-#    meteor layer, `position: absolute; inset: -22% -12%`, which is deliberately larger than its
-#    box and sits behind `overflow: clip`. It reads the same way in the plugin's own vertical
-#    stack and is not a symptom of anything this script or the generator does. The same is true
-#    of its scrollHeight, for the -22% on the vertical axis.
+#    Banner v2's plate CLIPS NOTHING - the photo is clipped in its own layer, .gc-photo - so the
+#    plate itself is in that verdict now (it was excluded in v1, whose meteor layer overran it by
+#    design). .gc-photo is the one box left out: its frame is a cover crop, larger than the layer
+#    on purpose, and the layer's own `overflow: hidden` is what trims it.
 #
-# 3. WHAT `overflow: clip` HIDES, which is the reason 2 is not enough. clip does not create a
-#    scroll container, so an element clipped by it reports NO scrollWidth or scrollHeight
-#    overflow at all - the check in 2 is blind to it by construction. Three things inside the
-#    lockup can be cut off with no trace: the 5.4em mark, the wordmark block, and the two nowrap
-#    strings inside the wordmark. Those are checked directly, against the boxes that contain
-#    them, rather than through a scroll metric that cannot see them.
+# 3. WHAT A SCROLL METRIC CANNOT SAY, which is why 2 is not enough. An absolutely positioned
+#    child that runs past its parent shows in scrollWidth only on some axes and some ancestors,
+#    and a child that merely overlaps a sibling shows nowhere. So the QR, the photo layer, the
+#    viewfinder and the wordmark are checked directly against the plate's padding box, the
+#    wordmark and viewfinder against the QR, and the QR must come out at its full 72 css px,
+#    because a squeezed code is a code that does not scan.
 #
 # HOW, WITHOUT INSTALLING ANYTHING
 # --------------------------------
@@ -109,66 +110,64 @@ BROWSERS = [
 # an amount nobody can attribute.
 #
 #   .shell              the card the whole panel is drawn inside - this is the panel's box
-#   .body__pad          the shell's content box, after its 13px padding. The top/bottom gap
-#                       check is measured against THIS, because its padding is the gap.
+#   .body__pad          the shell's content box. The top/bottom gap check is measured against
+#                       THIS, because its padding is the gap (0 and 0 now).
 #   .go-row             the single flex row (Game Optimizer's wrapper, not the plugin's)
-#   .kofi .gh           groups 1 and 2, the two buttons
-#   .go-group--goat     GROUP 3 - the statement and the lockup, together. This wrapper is the
-#                       whole of "Statement and GoatProject as 1 group": it is one flex item, so
-#                       space-between spreads THREE things and not four.
-#   .go-item--copy      the statement's wrapper, inside group 3
-#   .go-item--lock      the GOATPROJECT lockup's wrapper, inside group 3. Also carries the
-#                       plugin's own `goat` class, because seven of their rules are
-#                       `.goat .goat-lockup...`
-#   .goat__copy         the statement itself
-#   .goat-lockup        the lockup <a> itself
-#   .gh__inner          the dark pill inside .gh. It must fill .gh once .gh is stretched, or a
-#                       band of bare #262626 opens under the label
-#   .goat-lockup__mark  the seal. 5.4em tall, so it is what the lockup's font-size buys
-#   .goat-lockup__word  the wordmark column: name over tagline
-#   .goat-lockup__name  "Goatproject", white-space: nowrap
-#   .goat-lockup__tag   "The People's Compute Commons", white-space: nowrap - the widest thing
-#                       in the lockup and therefore what sets the whole item's width
+#   .kofi .gh           groups 1 and 2, the two buttons, drawn at the generator's BTN_ZOOM
+#   .goat--strip        GROUP 3 - the master's GOAT Cam banner in its strip variant: the
+#                       statement beside the plate, laid out by the master's own sheet
+#   .goat__copy         the statement: two copy lines, wrapping to four in a 160px column
+#   .goat-lockup        the PLATE - the espresso <a>, the only link in the banner, and the ruler
+#   .gh__inner          the dark pill inside .gh. It must fill .gh, or a band of bare #262626
+#                       opens under the label
+#   .gc-photo           the coffee photo, grid column 1
+#   .gc-vf              the viewfinder brackets, inset over the photo; must stay clear of the QR
+#   .goat-lockup__word  the wordmark column: "GOAT Cam" over the two-line tagline
+#   .goat-lockup__name  "GOAT Cam", white-space: nowrap
+#   .goat-lockup__tag   "iPhone app" / "On the App Store", white-space: nowrap
+#   .gc-qr              the App Store QR tile. Must be its full 72 css px, inside the plate
 SELECTORS = [".shell", ".body__pad", ".go-row",
-             ".kofi", ".gh", ".go-group--goat", ".go-item--copy", ".go-item--lock",
-             ".goat__copy", ".goat-lockup",
-             ".gh__inner", ".goat-lockup__mark", ".goat-lockup__word",
-             ".goat-lockup__name", ".goat-lockup__tag"]
+             ".kofi", ".gh", ".goat--strip", ".goat__copy", ".goat-lockup",
+             ".gh__inner", ".gc-photo", ".gc-vf", ".goat-lockup__word",
+             ".goat-lockup__name", ".goat-lockup__tag", ".gc-qr"]
 
-# The four items whose heights must match, in the order they are laid out. This list IS the
-# operator's standing requirement: these four must all be the same height, and that height must
-# be .kofi's.
-ITEMS = [".kofi", ".gh", ".go-item--copy", ".go-item--lock"]
-RULER = ".kofi"
+# The four row-level items, in layout order. The PLATE is the ruler: its natural height is the
+# row's height, and nothing else may be taller. Ko-fi and Star must match each other.
+ITEMS = [".kofi", ".gh", ".goat__copy", ".goat-lockup"]
+RULER = ".goat-lockup"
+BUTTONS = (".kofi", ".gh")
+
+# The QR's rendered size in css px. [M] The master sheet's `var(--gc-qr, 72px)`; the generator
+# refuses a sheet where it is anything else. A tile that renders smaller has been squeezed.
+QR_CSS = 72.0
 
 # THE THREE GROUPS, in layout order. `.go-row` is `justify-content: space-between`, so these are
 # the three things it spreads - and the gaps BETWEEN them are what must be larger than the gap
 # INSIDE group 3.
-GROUPS = [".kofi", ".gh", ".go-group--goat"]
+GROUPS = [".kofi", ".gh", ".goat--strip"]
 # The pair inside group 3. The gap between these two is the one that has to be tighter.
-PAIR = (".go-item--copy", ".go-item--lock")
+PAIR = (".goat__copy", ".goat-lockup")
 
-# The layout MUST contain these. A page without .go-group--goat is a pre-change page - the
-# four-item row, the two-group layout, or the plugin's vertical stack - and measuring it would
-# hand back numbers for a panel the app no longer ships.
-REQUIRED = [".shell", ".body__pad", ".go-row", ".kofi", ".gh", ".go-group--goat",
-            ".go-item--copy", ".go-item--lock"]
+# The layout MUST contain these. A page without .goat--strip is a pre-change page - the
+# GOATPROJECT row, or the plugin's vertical stack - and measuring it would hand back numbers for
+# a panel the app no longer ships.
+REQUIRED = [".shell", ".body__pad", ".go-row", ".kofi", ".gh", ".goat--strip",
+            ".goat__copy", ".goat-lockup", ".gc-qr"]
 
 # Overflow is checked on these. .shell is here because it is the element that actually carries
 # `overflow: hidden` and therefore the one that does the clipping; .go-row because that is where
-# a too-wide group shows up first; the group and the two item wrappers because they are this
-# script's own boxes and a mis-set width shows up there before anywhere else.
+# a too-wide group shows up first; the banner and its copy because a mis-set width shows up there
+# before anywhere else.
 #
-# .goat-lockup IS NOT HERE ON PURPOSE - see the header. Its scroll overflow is the plugin's
-# meteor layer and is pre-existing.
-OVERFLOW_CHECK = [".shell", ".body__pad", ".go-row", ".go-group--goat",
-                  ".go-item--copy", ".go-item--lock", ".kofi", ".gh"]
+# .goat-lockup IS HERE as of banner v2 - its plate clips nothing, so nothing may overrun it.
+# .gc-photo is not, on purpose - see the header.
+OVERFLOW_CHECK = [".shell", ".body__pad", ".go-row", ".goat--strip", ".goat-lockup",
+                  ".goat__copy", ".kofi", ".gh"]
 
-# Elements whose computed padding the probe reports, so a content-box fit can be checked.
-# clientWidth/clientHeight are the PADDING box, not the content box, so the padding has to come
-# back separately or every fit check inside a padded element is wrong by 20px.
-PAD_OF = [".goat-lockup", ".go-item--copy", ".gh", ".body__pad"]
-
+# Elements whose computed padding AND border the probe reports, so a fit against a padding box or
+# a content box can be checked. clientWidth/clientHeight are the PADDING box, so these have to
+# come back separately or every fit check inside a padded element is wrong.
+PAD_OF = [".goat-lockup", ".gh", ".body__pad"]
 # Sub-pixel tolerance. Layout arithmetic here lands on thirds of a pixel (14.69, 47.375), and a
 # difference under 1px cannot be seen and cannot clip a glyph.
 TOL = 1.0
@@ -292,9 +291,9 @@ MEASURE_PAGE = (SHELL_DECL == "max-content")
 #
 # THE NATURAL PASS PUTS ITSELF BACK. `align-self: flex-start` is injected into the shadow root as
 # its own <style>, the four items are re-read, and the style is removed again - so the boxes
-# reported alongside it are the real, stretched ones and the naturals are a separate map. Doing
+# reported alongside it are the real, laid-out ones and the naturals are a separate map. Doing
 # it the other way round would report a panel nobody ships. It targets `.go-row>*` AND
-# `.go-group>*`, because the statement and the lockup are one level deeper than they used to be
+# `.goat--strip>*`, because the statement and the plate are one level deeper than the buttons
 # and a selector that misses them would report `null` and silently skip the check.
 probe_js = (
     "var SEL=" + json.dumps(SELECTORS) + ";"
@@ -306,6 +305,7 @@ probe_js = (
     "var SCAN_HI=" + str(SCAN_HI) + ",SCAN_LO=" + str(SCAN_LO) + ";"
     "var MEASURE_PAGE=" + ("true" if MEASURE_PAGE else "false") + ";"
     "var TOL=" + repr(TOL) + ",GM=" + repr(GROUP_MARGIN) + ";"
+    "var RULER=" + json.dumps(RULER) + ",BTNS=" + json.dumps(list(BUTTONS)) + ";"
     "var host=document.getElementById('h');"
     "var sh=host.shadowRoot;"
     "function q(s){return sh.querySelector(s);}"
@@ -330,7 +330,9 @@ probe_js = (
     "if(!e){o.pad[s]=null;return;}"
     "var c=getComputedStyle(e);"
     "o.pad[s]=[parseFloat(c.paddingTop)||0,parseFloat(c.paddingBottom)||0,"
-    "parseFloat(c.paddingLeft)||0,parseFloat(c.paddingRight)||0];"
+    "parseFloat(c.paddingLeft)||0,parseFloat(c.paddingRight)||0,"
+    "parseFloat(c.borderTopWidth)||0,parseFloat(c.borderBottomWidth)||0,"
+    "parseFloat(c.borderLeftWidth)||0,parseFloat(c.borderRightWidth)||0];"
     "});"
     # The gaps, measured off the rendered boxes rather than read out of the CSS. A `gap`
     # declaration is what was asked for; the distance between two boxes is what happened.
@@ -347,8 +349,7 @@ probe_js = (
     "else{o.gaps.top=null;o.gaps.bottom=null;}"
     # Natural (unstretched) heights, then put it back.
     "var st=document.createElement('style');"
-    "st.textContent='.go-row>*,.go-group>*{align-self:flex-start!important}"
-    ".go-item--lock{align-items:center!important}';"
+    "st.textContent='.go-row>*,.goat--strip>*{align-self:flex-start!important}';"
     "sh.appendChild(st);"
     "ITEMS.forEach(function(s){var e=q(s);o.natural[s]=e?e.getBoundingClientRect().height:null;});"
     "st.remove();"
@@ -363,7 +364,11 @@ probe_js = (
     "if(row.scrollWidth>row.clientWidth)return 'row-overflow';"
     "var rb=row.getBoundingClientRect();"
     "var g=[];for(var i=0;i<GROUPS.length;i++){var e=q(GROUPS[i]);if(!e)return 'missing';g.push(e.getBoundingClientRect());}"
-    "if(g[g.length-1].right>rb.right+TOL)return 'group-past-row';"
+    # SUB-PIXEL, NOT TOL. scrollWidth is an INTEGER, so a row that needs 847.41px reports no
+    # overflow at 847 and the sweep would call 847 the floor while the --measure route says 848.
+    # [M] 2026-10-25: exactly that - 0.41px past the row at 847. The floor is a fit, not a
+    # visibility judgement, so the last group may not pass the row's edge at all.
+    "if(g[g.length-1].right>rb.right+0.01)return 'group-past-row';"
     "for(var i=1;i<g.length;i++){if(g[i].left<g[i-1].right-TOL)return 'groups-overlap';}"
     "var inter=[];for(var i=1;i<g.length;i++)inter.push(g[i].left-g[i-1].right);"
     "var pa=q(PAIR[0]),pb=q(PAIR[1]);"
@@ -371,10 +376,16 @@ probe_js = (
     "var tight=pb.getBoundingClientRect().left-pa.getBoundingClientRect().right;"
     "var mn=Math.min.apply(null,inter);"
     "if(!(tight<mn-GM))return 'grouping-lost';"
-    "var hs=[],ruler=null;"
+    # The height contract, cheaply: Ko-fi and Star one height, nothing taller than the plate,
+    # everything centred on the row.
+    "var b0=q(BTNS[0]),b1=q(BTNS[1]),pl=q(RULER);"
+    "if(!b0||!b1||!pl)return 'missing';"
+    "if(Math.abs(b0.getBoundingClientRect().height-b1.getBoundingClientRect().height)>TOL)return 'buttons-differ';"
+    "var ph=pl.getBoundingClientRect().height,rc=(rb.top+rb.bottom)/2;"
     "for(var i=0;i<ITEMS.length;i++){var e=q(ITEMS[i]);if(!e)return 'missing';"
-    "var h=e.getBoundingClientRect().height;hs.push(h);if(ITEMS[i]==='.kofi')ruler=h;}"
-    "if(Math.max.apply(null,hs)-Math.min.apply(null,hs)>TOL)return 'heights-differ';"
+    "var bb=e.getBoundingClientRect();"
+    "if(bb.height>ph+TOL)return 'taller-than-plate';"
+    "if(Math.abs((bb.top+bb.bottom)/2-rc)>TOL)return 'not-centred';}"
     "return null;"
     "}"
     "function M(tag){"
@@ -502,10 +513,12 @@ if not MEASURE_PAGE:
 # THE PER-WIDTH TABLE, AND THE FOUR ASSERTIONS AT EVERY ONE OF THEM
 # ---------------------------------------------------------------------------------------------
 print("PER-WIDTH CHECKS - every column is asserted, not just printed")
-print("  %6s %9s %8s %8s %8s %8s %8s %7s %7s %6s"
-      % ("host", "shell", "gap1", "gap2", "tight", "outerL", "outerR", "top", "bottom", "hmax-hmin"))
-print("  %6s %9s %8s %8s %8s %8s %8s %7s %7s %6s"
-      % ("-" * 6, "-" * 9, "-" * 8, "-" * 8, "-" * 8, "-" * 8, "-" * 8, "-" * 7, "-" * 7, "-" * 9))
+print("  %6s %9s %8s %8s %8s %8s %8s %7s %7s %7s %7s"
+      % ("host", "shell", "gap1", "gap2", "tight", "outerL", "outerR", "top", "bottom", "plateH",
+         "btnsH"))
+print("  %6s %9s %8s %8s %8s %8s %8s %7s %7s %7s %7s"
+      % ("-" * 6, "-" * 9, "-" * 8, "-" * 8, "-" * 8, "-" * 8, "-" * 8, "-" * 7, "-" * 7, "-" * 7,
+         "-" * 7))
 
 shell_h_seen = set()
 for run in runs:
@@ -524,9 +537,8 @@ for run in runs:
     inter = [g for g in gaps["inter"] if g is not None]
     tight = gaps["tight"]
     heights = [box[s][1] for s in ITEMS if box.get(s)]
-    spread = (max(heights) - min(heights)) if len(heights) == len(ITEMS) else float("nan")
 
-    print("  %6d %9.2f %8.2f %8.2f %8.2f %8.2f %8.2f %7.2f %7.2f %6.3f"
+    print("  %6d %9.2f %8.2f %8.2f %8.2f %8.2f %8.2f %7.2f %7.2f %7.2f %7.2f"
           % (w, box[".shell"][0], inter[0] if inter else -1,
              inter[1] if len(inter) > 1 else -1,
              -1 if tight is None else tight,
@@ -534,7 +546,7 @@ for run in runs:
              gaps["outer_right"] if gaps["outer_right"] is not None else -1,
              gaps["top"] if gaps["top"] is not None else -1,
              gaps["bottom"] if gaps["bottom"] is not None else -1,
-             spread))
+             box[RULER][1], box[BUTTONS[0]][1]))
 
     is_floor_probe = (FLOOR is not None and w == FLOOR - 1)
     if is_floor_probe:
@@ -577,10 +589,10 @@ for run in runs:
 
     # --- REQUEST 2c: THE GROUPING. the pair's gap must be tighter than the gaps around it ------
     if tight is None or len(inter) < 2:
-        fail("FAILURE (%s): the gaps did not come back, so whether the statement and the lockup "
+        fail("FAILURE (%s): the gaps did not come back, so whether the statement and the plate "
              "read as one group is UNVERIFIED." % tag)
     elif not tight < min(inter) - GROUP_MARGIN:
-        fail("FAILURE (%s): the statement<->lockup gap is %.2fpx against inter-group gaps of "
+        fail("FAILURE (%s): the statement<->plate gap is %.2fpx against inter-group gaps of "
              "%.2f and %.2f. It has to be STRICTLY SMALLER (by at least %.1fpx, or nobody can "
              "see it) or the two do not read as one group - which is the whole of the operator's "
              "second request." % (tag, tight, inter[0], inter[1], GROUP_MARGIN))
@@ -596,82 +608,116 @@ for run in runs:
              "in tools\\gen-sponsor-html.py's GO_LAYOUT_CSS."
              % (tag, gaps["top"], gaps["bottom"], abs(gaps["top"] - gaps["bottom"])))
 
-    # --- EQUAL HEIGHT, and that the height is the Ko-fi button's ------------------------------
-    if len(heights) != len(ITEMS):
-        fail("FAILURE (%s): only %d of the %d row items could be measured, so the equal-height "
-             "requirement cannot be checked at all." % (tag, len(heights), len(ITEMS)))
-    elif spread > TOL:
-        laid = dict((s, box[s][1]) for s in ITEMS)
-        worst = max(laid, key=lambda k: laid[k])
-        least = min(laid, key=lambda k: laid[k])
-        fail("FAILURE (%s): the four row items are NOT the same height - they spread %.3fpx, "
-             "from %s at %.3f to %s at %.3f."
-             % (tag, spread, least, laid[least], worst, laid[worst]))
+    # --- THE HEIGHT CONTRACT: the plate is the ruler; Ko-fi and Star match; all centred -------
+    nat = dict((s, natural[s]) for s in ITEMS if natural.get(s) is not None)
+    if len(heights) != len(ITEMS) or len(nat) != len(ITEMS):
+        fail("FAILURE (%s): only %d of the %d row items (and %d natural heights) could be "
+             "measured, so the height contract is UNVERIFIED."
+             % (tag, len(heights), len(ITEMS), len(nat)))
     else:
-        nat = dict((s, natural[s]) for s in ITEMS if natural.get(s) is not None)
-        if len(nat) != len(ITEMS):
-            fail("FAILURE (%s): the natural (unstretched) heights did not come back, so whether "
-                 "the shared height is the Ko-fi button's is UNVERIFIED." % tag)
-        else:
-            tallest = max(nat, key=lambda k: nat[k])
-            if nat[tallest] > nat[RULER] + TOL:
-                fail("FAILURE (%s): %s is the TALLEST item at its natural height %.3fpx, over "
-                     "%s's %.3fpx. align-items:stretch equalises to the tallest, so the row is "
-                     "keyed to %s and the Ko-fi button is the thing being stretched - the "
-                     "opposite of what was asked."
-                     % (tag, tallest, nat[tallest], RULER, nat[RULER], tallest))
-            common = max(box[s][1] for s in ITEMS)
-            if abs(common - nat[RULER]) > TOL:
-                fail("FAILURE (%s): the row is %.3fpx tall but %s's own natural height is "
-                     "%.3fpx (off by %.3f). The four items match each other but they do not "
-                     "match the Ko-fi button."
-                     % (tag, common, RULER, nat[RULER], abs(common - nat[RULER])))
+        tallest = max(nat, key=lambda k: nat[k])
+        if nat[tallest] > nat[RULER] + TOL:
+            fail("FAILURE (%s): %s is the TALLEST item at its natural height %.3fpx, over the "
+                 "plate's %.3fpx. The row grows past the band and the host cuts the panel's top "
+                 "off. If it is .goat__copy, the headline has wrapped to more lines than the "
+                 "band holds - its column is too narrow for these fonts."
+                 % (tag, tallest, nat[tallest], nat[RULER]))
+        if abs(box[".go-row"][1] - box[RULER][1]) > TOL:
+            fail("FAILURE (%s): the row is %.3fpx tall but the plate is %.3fpx - the row is keyed "
+                 "to something other than the plate." % (tag, box[".go-row"][1], box[RULER][1]))
+        b0, b1 = BUTTONS
+        if abs(box[b0][1] - box[b1][1]) > TOL:
+            fail("FAILURE (%s): %s is %.3fpx tall and %s is %.3fpx - the two buttons are not one "
+                 "height." % (tag, b0, box[b0][1], b1, box[b1][1]))
+        rc = (box[".go-row"][3] + box[".go-row"][5]) / 2.0
+        for s in ITEMS:
+            c_ = (box[s][3] + box[s][5]) / 2.0
+            if abs(c_ - rc) > TOL:
+                fail("FAILURE (%s): %s is centred at %.2f against the row's %.2f - off by %.2fpx."
+                     % (tag, s, c_, rc, c_ - rc))
 
-    # --- WHAT overflow:clip HIDES -------------------------------------------------------------
-    # The scroll-metric check above cannot see any of this: .goat-lockup is `overflow: clip`,
+    # --- WHAT A SCROLL METRIC CANNOT SAY ------------------------------------------------------
+    # Direct box comparisons, because a scroll metric can miss an absolute child and never sees an
+    # overlap. (In v1 the plate was `overflow: clip`,
     # which does not create a scroll container, so content cut off inside it reports nothing at
-    # all. These are direct box-against-box comparisons instead.
-    lp = pad.get(".goat-lockup") or [0.0, 0.0, 0.0, 0.0]
-    cp = pad.get(".go-item--copy") or [0.0, 0.0, 0.0, 0.0]
+    # all. These are direct box-against-box comparisons against the plate's PADDING box - the
+    # clip edge - instead.
+    lp = pad.get(".goat-lockup") or [0.0] * 8
+    pl_ = box.get(".goat-lockup")
 
-    def fits(what, inner, outer, axis, outer_pad=(0.0, 0.0), _tag=tag, _box=box):
+    def inside_plate(what, s, _tag=tag, _box=box, _pl=pl_, _lp=lp):
+        bi = _box.get(s)
+        if bi is None or _pl is None:
+            fail("FAILURE (%s): %s - %s or the plate is missing, so the fit is UNVERIFIED."
+                 % (_tag, what, s))
+            return
+        # padding box = border box less the border, in viewport coordinates
+        L, T = _pl[2] + _lp[6], _pl[3] + _lp[4]
+        R, B = _pl[4] - _lp[7], _pl[5] - _lp[5]
+        over = max(L - bi[2], T - bi[3], bi[4] - R, bi[5] - B)
+        if over > TOL:
+            fail("FAILURE (%s): %s - %s reaches %.3fpx past the plate's clip edge (box %.2f,%.2f "
+                 "- %.2f,%.2f against %.2f,%.2f - %.2f,%.2f), over the plate's border or past "
+                 "it, where no scroll metric reliably shows it."
+                 % (_tag, what, s, over, bi[2], bi[3], bi[4], bi[5], L, T, R, B))
+
+    def fits(what, inner, outer, axis, _tag=tag, _box=box):
         bi, bo = _box.get(inner), _box.get(outer)
         if bi is None or bo is None:
             fail("FAILURE (%s): %s - %s or %s is missing, so the fit is UNVERIFIED."
                  % (_tag, what, inner, outer))
             return
         i_ = bi[0] if axis == "w" else bi[1]
-        o_ = (bo[0] if axis == "w" else bo[1]) - outer_pad[0] - outer_pad[1]
+        o_ = bo[0] if axis == "w" else bo[1]
         if i_ > o_ + TOL:
             fail("FAILURE (%s): %s - %s is %.3fpx against %.3fpx of room inside %s, so %.3fpx is "
                  "being cut off with no scroll metric to show it."
                  % (_tag, what, inner, i_, o_, outer, i_ - o_))
 
-    fits("the seal fits the lockup's height", ".goat-lockup__mark", ".goat-lockup", "h",
-         (lp[0], lp[1]))
-    fits("the wordmark fits the lockup's height", ".goat-lockup__word", ".goat-lockup", "h",
-         (lp[0], lp[1]))
-    fits("'Goatproject' fits the wordmark", ".goat-lockup__name", ".goat-lockup__word", "w")
+    inside_plate("the App Store QR is inside the plate", ".gc-qr")
+    inside_plate("the photo layer is inside the plate", ".gc-photo")
+    inside_plate("the viewfinder is inside the plate", ".gc-vf")
+    inside_plate("the wordmark is inside the plate", ".goat-lockup__word")
+    # Nothing may sit ON the QR: a bracket or a glyph over a module is a code that may not scan.
+    _qb = box.get(".gc-qr")
+    for _s in (".goat-lockup__word", ".gc-vf"):
+        _b = box.get(_s)
+        if _b is None or _qb is None:
+            fail("FAILURE (%s): %s or the QR is missing, so whether they overlap is UNVERIFIED."
+                 % (tag, _s))
+        elif _b[4] > _qb[2] - 1.0 and _b[2] < _qb[4] and _b[5] > _qb[3] and _b[3] < _qb[5]:
+            fail("FAILURE (%s): %s (right edge %.2f) runs into the QR (left edge %.2f) - it must "
+                 "stay at least 1px clear." % (tag, _s, _b[4], _qb[2]))
+    fits("'GOAT Cam' fits the wordmark", ".goat-lockup__name", ".goat-lockup__word", "w")
     fits("the nowrap tagline fits the wordmark", ".goat-lockup__tag", ".goat-lockup__word", "w")
-    fits("the statement fits its wrapper", ".goat__copy", ".go-item--copy", "h", (cp[0], cp[1]))
+    qb = box.get(".gc-qr")
+    if qb is None:
+        fail("FAILURE (%s): the QR tile is missing." % tag)
+    elif abs(qb[0] - QR_CSS) > 0.5 or abs(qb[1] - QR_CSS) > 0.5:
+        fail("FAILURE (%s): the App Store QR renders %.2f x %.2f css px, not %g x %g - a squeezed "
+             "code is a code that may not scan." % (tag, qb[0], qb[1], QR_CSS, QR_CSS))
 
     # Not a fit but a FILL, and the opposite comparison. .gh is display:block in the plugin with
-    # a 1px frame and one in-flow child that paints the dark pill; stretched to the Ko-fi height
-    # as a block, the frame grows and the pill does not, and an 11px band of bare #262626 opens
-    # under the label. GO_LAYOUT_CSS makes .gh a flex container so the pill stretches with it.
-    # This is the check that says it worked - it is invisible to every overflow metric, because
-    # nothing overflows: the button is simply the right size and half empty.
-    gp = pad.get(".gh") or [0.0, 0.0, 0.0, 0.0]
+    # a 1px frame and one in-flow child that paints the dark pill; given the Ko-fi height as a
+    # block, the frame grows and the pill does not, and a band of bare #262626 opens under the
+    # label. GO_LAYOUT_CSS makes .gh a flex container so the pill stretches with it. This is the
+    # check that says it worked - it is invisible to every overflow metric, because nothing
+    # overflows: the button is simply the right size and half empty.
+    gp = pad.get(".gh") or [0.0] * 8
     bg, bi_ = box.get(".gh"), box.get(".gh__inner")
     if bg is None or bi_ is None:
-        fail("FAILURE (%s): .gh or .gh__inner is missing, so whether the pill fills the stretched "
+        fail("FAILURE (%s): .gh or .gh__inner is missing, so whether the pill fills the "
              "button is UNVERIFIED." % tag)
     else:
-        room = bg[1] - gp[0] - gp[1]
-        if bi_[1] < room - TOL:
-            fail("FAILURE (%s): .gh__inner is %.3fpx inside a %.3fpx .gh content box, so %.3fpx "
-                 "of bare #262626 frame is showing under the label. .gh needs to be a flex "
-                 "container for its pill to stretch with it." % (tag, bi_[1], room, room - bi_[1]))
+        # Compared on rendered boxes only, because .gh is ZOOMED and computed padding comes back
+        # in its own unzoomed px. The plugin's frame is `padding: 1px` (gp[0] / gp[1]), so the
+        # pill may sit at most that much inside a side at any zoom <= 1.
+        frame = gp[0] + gp[1] + gp[4] + gp[5]
+        if bg[1] - bi_[1] > frame + TOL:
+            fail("FAILURE (%s): .gh__inner is %.3fpx inside a %.3fpx .gh, so %.3fpx of bare "
+                 "#262626 frame is showing under the label (the frame itself is %.2fpx). .gh needs "
+                 "to be a flex container for its pill to stretch with it."
+                 % (tag, bi_[1], bg[1], bg[1] - bi_[1] - frame, frame))
 
     shell_h_seen.add(round(box[".shell"][1], 3))
 
@@ -679,8 +725,9 @@ for run in runs:
 # THE HEIGHT IS ONE NUMBER, OR IT IS NOT A CONSTANT
 # ---------------------------------------------------------------------------------------------
 # kSponsorCssHeight is a single compile-time value, so the panel's height must not depend on how
-# wide the window is. It does not, because .go-item--copy is a pinned width and the row never
-# wraps - but "it does not" is an assumption until the sweep has measured it at both ends.
+# wide the window is. It does not, because the plate is a fixed height, the copy column a fixed
+# width and the row never wraps - but "it does not" is an assumption until the sweep has measured
+# it at both ends.
 # WHAT THE FLOOR IS MADE OF. The sweep says where it breaks; this says WHY, which is the only
 # thing that tells a reader which item to shrink when it breaks too high. Printed once, at the
 # narrowest width measured, because the item widths are pinned and do not move with the window.
@@ -688,27 +735,33 @@ if runs:
     _first = runs[0]
     print("")
     print("ROW COMPOSITION at w=%d - what the floor is made of" % _first["w"])
-    for s in (".kofi", ".gh", ".go-group--goat", ".go-item--copy", ".go-item--lock", ".go-row",
+    for s in (".kofi", ".gh", ".goat--strip", ".goat__copy", ".goat-lockup", ".gc-photo",
+              ".gc-vf", ".goat-lockup__word", ".gc-qr", ".go-row",
               ".body__pad", ".shell"):
         _b = _first["box"].get(s)
         print("  %-20s %8s" % (s, "absent" if _b is None else "%.2f" % _b[0]))
 
-# The equal-height numbers themselves, once, so the assertion above has a printed witness. The
-# per-width table can only carry the SPREAD; which item is which height, and what each one's
-# unstretched height is, is the thing a reader needs to see when it goes wrong.
+# The heights themselves, once, so the assertions above have a printed witness: which item is
+# which height as laid out, and what each one's natural height is.
 if runs:
     _last = runs[-1]
     print("")
-    print("EQUAL HEIGHT at w=%d - all four items must match the Ko-fi button" % _last["w"])
-    print("  %-20s %-14s %-14s" % ("item", "as laid out", "natural"))
-    print("  %-20s %-14s %-14s" % ("-" * 20, "-" * 14, "-" * 14))
+    print("ROW HEIGHT at w=%d - the plate is the ruler; Ko-fi and Star match; all centred"
+          % _last["w"])
+    print("  %-20s %-14s %-14s %-14s" % ("item", "as laid out", "natural", "centre - row"))
+    print("  %-20s %-14s %-14s %-14s" % ("-" * 20, "-" * 14, "-" * 14, "-" * 14))
+    _rb = _last["box"].get(".go-row")
+    _rc = (_rb[3] + _rb[5]) / 2.0 if _rb else 0.0
     for s in ITEMS:
         _b, _n = _last["box"].get(s), _last["natural"].get(s)
-        print("  %-20s %-14s %-14s"
+        print("  %-20s %-14s %-14s %-14s"
               % (s, "absent" if _b is None else "%.3f" % _b[1],
-                 "absent" if _n is None else "%.3f" % _n))
-    print("  -> the row's height is the RULER's own natural height; every other item is either")
-    print("     stretched up to it or was brought down to it. Asserted at every width above.")
+                 "absent" if _n is None else "%.3f" % _n,
+                 "absent" if _b is None else "%+.3f" % ((_b[3] + _b[5]) / 2.0 - _rc)))
+    _q = _last["box"].get(".gc-qr")
+    if _q:
+        print("  .gc-qr               %.3f x %.3f   (must be %g x %g)" % (_q[0], _q[1], QR_CSS,
+                                                                        QR_CSS))
 
 print("")
 if len(shell_h_seen) == 1:
@@ -721,20 +774,18 @@ elif len(shell_h_seen) > 1:
          % " / ".join("%.3f" % h for h in sorted(shell_h_seen)))
 
 # ---------------------------------------------------------------------------------------------
-# THE ONE OVERFLOW THAT IS EXPECTED, SAID OUT LOUD
+# THE PLATE IS IN THE OVERFLOW VERDICT NOW, SAID OUT LOUD
 # ---------------------------------------------------------------------------------------------
 if runs:
     lf = runs[-1]["flow"].get(".goat-lockup")
     if lf:
         print("")
         print("no overflow on any of: %s" % ", ".join(OVERFLOW_CHECK))
-        print("  .goat-lockup is EXCLUDED from that verdict on purpose: it reports scrollWidth %d"
-              % lf[0])
-        print("  against clientWidth %d and scrollHeight %d against clientHeight %d, which is the"
-              % (lf[1], lf[2], lf[3]))
-        print("  PLUGIN'S OWN meteor layer - `position:absolute; inset:-22% -12%` behind")
-        print("  `overflow:clip`, deliberately larger than its box. It reads the same way in the")
-        print("  plugin's vertical stack. The things clip WOULD hide are checked directly, above.")
+        print("  the plate reads scrollWidth %d / clientWidth %d, scrollHeight %d / clientHeight %d:"
+              % (lf[0], lf[1], lf[2], lf[3]))
+        print("  banner v2 clips its photo in .gc-photo, so the plate itself has nothing to hide.")
+        print("  .gc-photo alone is left out: its frame is a cover crop, larger than the layer on")
+        print("  purpose. The QR, the viewfinder and the wordmark are checked directly, above.")
 
 # ---------------------------------------------------------------------------------------------
 # WHAT TO WRITE DOWN, AND WHETHER THE SHIPPED HEADER ALREADY SAYS IT
@@ -815,7 +866,9 @@ if failures:
 
 print("")
 print("ALL CHECKS PASSED at every width measured: the panel fills its host, the three groups")
-print("never collide or overflow, the statement<->lockup gap is strictly tighter than the two")
-print("inter-group gaps, the gap above the row equals the gap below it, all four items are the")
-print("Ko-fi button's height, nothing is clipped inside overflow:clip, and the floor is inside")
-print("the %dpx the smallest allowed window can offer." % SHELL_W_CEILING)
+print("never collide or overflow, the statement<->plate gap is strictly tighter than the two")
+print("inter-group gaps, the gap above the row equals the gap below it, the GOAT Cam plate is")
+print("the tallest item and sets the row, Ko-fi and Star are one height, every item is centred,")
+print("the App Store QR is its full %g css px inside the plate with nothing over it, nothing" % QR_CSS)
+print("runs off the plate, and the floor is inside the %dpx the smallest allowed window can offer."
+      % SHELL_W_CEILING)

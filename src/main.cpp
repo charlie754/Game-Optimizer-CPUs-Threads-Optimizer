@@ -40,6 +40,7 @@
 #include "theme.h"
 #include "envwarning.h"
 #include "settings_warning.h"
+#include "banner_host.h"
 
 namespace cd {
 // Implemented in tray.cpp. It is not in ui.h - the header is frozen - but the Explorer
@@ -822,6 +823,13 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ENDSESSION:
         if (wp) StopEngineOnce();
         return 0;
+
+    case WM_POWERBROADCAST:
+        if (wp == PBT_APMRESUMEAUTOMATIC) {
+            BannerHostResumed();
+            return TRUE;
+        }
+        break;
 
     case WM_DESTROY:
         PostQuitMessage(0);

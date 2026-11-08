@@ -29,11 +29,30 @@ else, and clears every mask the moment the game exits.
   previous values in a restore file.
 - **No injection, no overlay.** One native exe, no .NET runtime. Nothing needs elevation except
   the optional AMD 3D V-Cache setting, which asks for it once.
-- **Local config only.** No account, no telemetry, and the app itself makes no network
-  requests.
-- **One optional runtime dependency: WebView2.** It renders the sponsor strip at the
-  bottom of the Settings window and nothing else. If it is absent the strip is drawn
-  with GDI instead and nothing else changes — the app always starts. It is never
+- **Local config, no account, no analytics — and one network request: the sponsor banner.**
+  Since 0.6.0 the sponsor strip at the bottom of the Settings window shows a promotion that is
+  published online, so the content can change without a new release. **Opening the Settings
+  window is enough to trigger it — no click is needed — and a normal launch (without `--tray`)
+  opens Settings by itself.** While the strip is visible the app may send HTTPS GET requests to
+  `https://goatcam.dagoat.io/banner/v1.signed` and, only when that signed file names them, to at
+  most the two photo files it names. It sends no identifier, no cookies and no query string, but
+  the server can see the connection's IP address, the time, a User-Agent made of the
+  app name and version (`GameOptimizer`, `0.6.0`) and the standard HTTPS/WinHTTP headers — in other words, that this app
+  version had its Settings window open. The file is used only after its ECDSA P-256 signature
+  verifies against a public key compiled into the app; unsigned, expired or older content is
+  ignored. When the strip is shown, a check runs if at least 6 hours have passed since the last
+  one; while the strip stays shown the next check is 24 hours after a success, and failures back
+  off for 6, 6, 12, then 24 hours. Closing Settings — or starting with `--tray`, as *Start with
+  Windows* does — stops the timer and cancels any request in flight, so nothing is fetched
+  while the app sits in the tray. **There is no setting to turn it off:** to stop it, block
+  `goatcam.dagoat.io` in your firewall or keep the Settings window closed (deleting
+  `WebView2Loader.dll` does not stop it). The cache is `%LOCALAPPDATA%\GameOptimizer\banner`: the
+  signed file (at most 16 KiB), its photos (at most 300,000 bytes each) and a small record of the
+  current set. Offline, blocked or invalid content falls back to the built-in Goat Project /
+  dagoat.io banner, which needs no network.
+- **One optional runtime dependency: WebView2.** It renders the sponsor strip at the bottom of
+  the Settings window and nothing else. If it is absent, the strip is drawn with GDI instead;
+  the app always starts and the same signed-content and fallback rules apply. The strip is not
   touched while the app sits in the tray. See `NOTICE.md` and the file table below.
 
 **Runs on:** Windows 10 or 11, x64. The manifest declares no older Windows, and there is no
@@ -149,7 +168,7 @@ registry value for AMD's own driver and service.
 | File | What it is |
 |---|---|
 | `GameOptimizer.exe` | **The app. Double-click this one.** |
-| `WebView2Loader.dll` | Microsoft's WebView2 loader. **Keep it in the same folder as the exe** — that is the first place the app looks for it. It is optional: without it the Settings window draws its sponsor strip with GDI instead and nothing else changes. |
+| `WebView2Loader.dll` | Microsoft's WebView2 loader. **Keep it in the same folder as the exe** — that is the first place the app looks for it. It is optional: without it the Settings window draws its sponsor strip with GDI instead; the app still starts and the strip keeps the same signed-content and fallback behavior. |
 | `README.md` | This file. |
 | `LICENSE` | MIT, for Game Optimizer itself. |
 | `NOTICE.md` | What is bundled, where it came from, and what is not third-party. |
