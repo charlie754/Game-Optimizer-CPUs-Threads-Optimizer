@@ -138,10 +138,12 @@ struct IWvWebMessageArgs : public IUnknown {
     virtual HRESULT STDMETHODCALLTYPE TryGetWebMessageAsString(LPWSTR*) = 0;
 };
 
+// ICoreWebView2NavigationCompletedEventArgs (IID 0x30d68b7d_20d9_4752_a9ca_ec8448fbb5c1,
+// bindings.rs line 23312): IsSuccess, WebErrorStatus, NavigationId - in that order.
 struct IWvNavigationCompletedArgs : public IUnknown {
-    virtual HRESULT STDMETHODCALLTYPE get_NavigationId(UINT64*) = 0;
     virtual HRESULT STDMETHODCALLTYPE get_IsSuccess(BOOL*) = 0;
     virtual HRESULT STDMETHODCALLTYPE get_WebErrorStatus(INT*) = 0;
+    virtual HRESULT STDMETHODCALLTYPE get_NavigationId(UINT64*) = 0;
 };
 
 // ICoreWebView2. Every slot up to add_NewWindowRequested is listed; the ones this file never
@@ -254,20 +256,24 @@ typedef HRESULT(STDAPICALLTYPE* PFN_CreateEnv)(PCWSTR browserFolder, PCWSTR user
 // ===========================================================================
 PFN_CreateEnv ResolveCreateEnv() {
     static PFN_CreateEnv fn = nullptr;
-    static bool tried = false;
-    if (tried) return fn;
-    tried = true;
+    if (fn != nullptr) return fn;
 
     HMODULE mod = nullptr;
 
     const std::wstring exe = GetExePath();
     const size_t slash = exe.find_last_of(L'\\');
     if (slash != std::wstring::npos) {
-        const std::wstring beside = exe.substr(0, slash + 1) + kLoaderDll;
+        const std::wstring dir = exe.substr(0, slash + 1);
+        const std::wstring beside = dir + kLoaderDll;
         mod = ::LoadLibraryExW(beside.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
         if (mod == nullptr) {
-            LogLine(L"[sponsor] no loader beside the exe (%s), gle=%lu", beside.c_str(),
-                    ::GetLastError());
+            const DWORD besideErr = ::GetLastError();
+            const std::wstring repoCopy = dir + L"..\\third_party\\webview2\\x64\\" + kLoaderDll;
+            mod = ::LoadLibraryExW(repoCopy.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+            if (mod == nullptr) {
+                LogLine(L"[sponsor] no loader beside the exe (%s), gle=%lu", beside.c_str(),
+                        besideErr);
+            }
         }
     }
     if (mod == nullptr) {
@@ -373,6 +379,7 @@ struct WebSponsor {
     LONG ref = 1;            // one reference for the owner; handlers add their own
     bool closed = false;     // WebSponsorDestroy has run; pending callbacks must do nothing
     bool reported = false;   // `ready` is called exactly once
+    bool firstSuccessfulNavigation = false;
 
     HWND parent = nullptr;
     HWND host = nullptr;
@@ -388,6 +395,7 @@ struct WebSponsor {
     int bannerToken = 0;
 
 #if defined(CD_WEBVIEW_HARNESS)
+    bool forceFirstNavigationFailure = false;
     bool testCaptureDone = false;
     bool testCaptureOk = false;
     bool testScriptDone = false;
@@ -445,6 +453,8 @@ struct WebSponsor {
 };
 
 #if defined(CD_WEBVIEW_HARNESS)
+
+bool g_forceFirstNavigationFailure = false;
 
 const GUID kIID_HarnessCapturePreviewHandler =
     { 0x697e05e9, 0x3d8f, 0x45fa, { 0x96, 0xf4, 0x8f, 0xfe, 0x1e, 0xde, 0xda, 0xf5 } };
@@ -850,15 +860,24 @@ public:
         if (o->closed) return S_OK;
         BOOL success = FALSE;
         if (args == nullptr || FAILED(args->get_IsSuccess(&success)) || !success) {
-            // NavigateToString can leave a late failed about:blank completion behind the
-            // document it accepted. Once the old v0.5.9 readiness point has fired, that stale
-            // completion must not tear down a live page; before readiness, it is a real failure.
-            if (o->reported) return S_OK;
+            // A failed completion is stale only after a real page navigation has succeeded.
+            // `reported` is not the gate: ControllerHandler used to report ready immediately
+            // after NavigateToString, which could hide a genuine first-load failure.
+            if (o->firstSuccessfulNavigation) return S_OK;
+            std::wstring source;
+            LPWSTR sourceRaw = nullptr;
+            if (sender != nullptr && SUCCEEDED(sender->get_Source(&sourceRaw)) && sourceRaw != nullptr) {
+                source.assign(sourceRaw);
+                ::CoTaskMemFree(sourceRaw);
+            }
+            LogLine(L"[sponsor] banner navigation failure before first success source=%ls",
+                    source.empty() ? L"<unknown>" : source.c_str());
             LogLine(L"[sponsor] banner page navigation failed - using the GDI strip");
             o->Teardown();
             o->Report(false);
             return S_OK;
         }
+        o->firstSuccessfulNavigation = true;
         PostBannerModel(o);
         if (o->controller != nullptr) o->controller->put_IsVisible(TRUE);
         if (o->host != nullptr) {
@@ -1059,7 +1078,17 @@ HRESULT STDMETHODCALLTYPE ControllerHandler::Invoke(HRESULT hr, IWvController* c
               owner->rc.bottom - owner->rc.top);
     controller->put_Bounds(client);
     const std::wstring page = BuildPage();
-    const HRESULT nhr = web->NavigateToString(page.c_str());
+    HRESULT nhr = S_OK;
+#if defined(CD_WEBVIEW_HARNESS)
+    if (owner->forceFirstNavigationFailure) {
+        owner->forceFirstNavigationFailure = false;
+        nhr = web->Navigate(L"file:///__game_optimizer_first_navigation_failure__.html");
+    } else {
+        nhr = web->NavigateToString(page.c_str());
+    }
+#else
+    nhr = web->NavigateToString(page.c_str());
+#endif
     if (FAILED(nhr)) {
         LogLine(L"[sponsor] NavigateToString failed, hr=0x%08lx - GDI strip",
                 static_cast<unsigned long>(nhr));
@@ -1068,9 +1097,6 @@ HRESULT STDMETHODCALLTYPE ControllerHandler::Invoke(HRESULT hr, IWvController* c
         return S_OK;
     }
 
-    controller->put_IsVisible(TRUE);
-    ::ShowWindow(owner->host, SW_SHOWNA);
-    owner->Report(true);
     return S_OK;
 }
 
@@ -1181,6 +1207,13 @@ std::wstring UserDataFolder() {
     if (dir.empty()) return std::wstring();
     std::wstring full = dir + L"\\webview2";
     ::CreateDirectoryW(full.c_str(), nullptr);
+#if defined(CD_WEBVIEW_HARNESS)
+    // The F1 negative case and the real capture must not race the same WebView2 profile while
+    // the first controller is being torn down.
+    full += g_forceFirstNavigationFailure ? L"\\harness-force-" : L"\\harness-normal-";
+    full += std::to_wstring(::GetCurrentProcessId());
+    ::CreateDirectoryW(full.c_str(), nullptr);
+#endif
     return full;
 }
 
@@ -1225,6 +1258,10 @@ WebSponsor* WebSponsorCreate(HWND parent, const RECT& rc, WebSponsorReadyFn read
     w->rc = rc;
     w->ready = ready;
     w->user = user;
+#if defined(CD_WEBVIEW_HARNESS)
+    w->forceFirstNavigationFailure = g_forceFirstNavigationFailure;
+    g_forceFirstNavigationFailure = false;
+#endif
 
     // Created hidden. It is shown only once the page is actually rendering, so a failed
     // creation never leaves a hole where the strip should be.
@@ -1288,6 +1325,10 @@ HWND WebSponsorWindow(const WebSponsor* w) {
 }
 
 #if defined(CD_WEBVIEW_HARNESS)
+void WebSponsorForceFirstNavigationFailureForTest() {
+    g_forceFirstNavigationFailure = true;
+}
+
 bool WebSponsorCapturePreviewForTest(WebSponsor* w, const wchar_t* path) {
     if (w == nullptr || w->closed || w->webview == nullptr || path == nullptr || *path == L'\0') {
         return false;

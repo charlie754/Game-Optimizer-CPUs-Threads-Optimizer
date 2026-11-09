@@ -14226,6 +14226,35 @@ void Test_AO7_ResumeAfterExpiry() {
     cd::BannerHostSetModelForTest(nullptr);
 }
 
+void Test_AO8_WebViewNavigationCompletedAbiAndReadinessGate() {
+    Case("AO8 ICoreWebView2NavigationCompletedEventArgs vtable order and readiness gate");
+    std::ifstream in("src\\webview_host.cpp", std::ios::binary);
+    if (!in) in.open("..\\src\\webview_host.cpp", std::ios::binary);
+    const std::string src((std::istreambuf_iterator<char>(in)),
+                          std::istreambuf_iterator<char>());
+    CHECK(!src.empty());
+
+    const size_t structPos = src.find("struct IWvNavigationCompletedArgs");
+    const size_t structEnd = structPos == std::string::npos ? std::string::npos
+                                                            : src.find("};", structPos);
+    CHECK(structPos != std::string::npos && structEnd != std::string::npos);
+    if (structPos != std::string::npos && structEnd != std::string::npos) {
+        const std::string body = src.substr(structPos, structEnd - structPos);
+        const size_t posIsSuccess = body.find("get_IsSuccess");
+        const size_t posWebError  = body.find("get_WebErrorStatus");
+        const size_t posNavId     = body.find("get_NavigationId");
+        CHECK(posIsSuccess != std::string::npos);
+        CHECK(posWebError  != std::string::npos);
+        CHECK(posNavId     != std::string::npos);
+        CHECK(posIsSuccess < posWebError);
+        CHECK(posWebError  < posNavId);
+    }
+
+    // No harness-only readiness bypass or swallowed about:blank completion.
+    CHECK(src.find("ignoring implicit failed navigation") == std::string::npos);
+    CHECK(src.find("if (!forcedNavigation) owner->Report(true)") == std::string::npos);
+}
+
 int main() {
     std::printf("Game Optimizer unit tests\n");
     std::printf("=======================\n");
@@ -14623,6 +14652,7 @@ int main() {
     Test_AO4_SponsorLinkAllowList();
     Test_AO5_PageMessageJson();
     Test_AO7_ResumeAfterExpiry();
+    Test_AO8_WebViewNavigationCompletedAbiAndReadinessGate();
 
     std::printf("\n== AM. The WebView2 page's QR hover report (GOAT Cam banner v2) ==\n");
     Test_AM1_TheQrMessageAcceptsOnlyItsTwoForms();

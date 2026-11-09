@@ -351,6 +351,26 @@ bool VerifyTagEmBaseline(const cd::SponsorHarnessLayout& layout) {
     return true;
 }
 
+bool VerifySloganUnderBadge(const cd::SponsorHarnessLayout& layout) {
+    if (!RectValid(layout.badge)) return false;
+    for (int i = 0; i < 2; ++i) {
+        if (!RectValid(layout.tagline[i]) || layout.tagline[i].top < layout.badge.bottom ||
+            std::abs(layout.tagline[i].left - layout.badge.left) > 2) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool VerifyBracketPlateMargin(const cd::SponsorHarnessLayout& layout, int dpi) {
+    if (!RectValid(layout.brackets) || !RectValid(layout.plate)) return false;
+    const int required = MulDiv(4, dpi, 96);
+    return layout.brackets.left - layout.plate.left >= required &&
+           layout.brackets.top - layout.plate.top >= required &&
+           layout.plate.right - layout.brackets.right >= required &&
+           layout.plate.bottom - layout.brackets.bottom >= required;
+}
+
 bool AlphaOpaque(const Capture& capture) {
     for (size_t i = 3; i < capture.pixels.size(); i += 4) {
         if (capture.pixels[i] != 255) return false;
@@ -725,6 +745,8 @@ bool CaptureAll(const fs::path& output, const ob::Model& online, bool live) {
                     const bool g1 = VerifyPlateRightEdge(layout, size.cx);
                     const bool g3 = VerifyQrMargin(layout, dpi);
                     const bool g4 = VerifyTagEmBaseline(layout);
+                    const bool b2 = VerifySloganUnderBadge(layout);
+                    const bool b3 = VerifyBracketPlateMargin(layout, dpi);
                     std::printf("check dpi=%d G1-plate-right=%s right-gap=%ld\n", dpi,
                                 g1 ? "PASS" : "FAIL",
                                 static_cast<long>(size.cx - layout.plate.right));
@@ -738,9 +760,25 @@ bool CaptureAll(const fs::path& output, const ob::Model& online, bool live) {
                                 dpi, g4 ? "PASS" : "FAIL", layout.tagBaseline[0],
                                 layout.tagEmBaseline[0], layout.tagBaseline[1],
                                 layout.tagEmBaseline[1]);
+                    std::printf("check dpi=%d B2-slogan-under-badge=%s badge=%ld,%ld,%ld,%ld tag0=%ld,%ld,%ld,%ld tag1=%ld,%ld,%ld,%ld\n",
+                                dpi, b2 ? "PASS" : "FAIL",
+                                layout.badge.left, layout.badge.top, layout.badge.right, layout.badge.bottom,
+                                layout.tagline[0].left, layout.tagline[0].top,
+                                layout.tagline[0].right, layout.tagline[0].bottom,
+                                layout.tagline[1].left, layout.tagline[1].top,
+                                layout.tagline[1].right, layout.tagline[1].bottom);
+                    std::printf("check dpi=%d B3-bracket-plate-margin=%s left=%ld top=%ld right=%ld bottom=%ld required=%d\n",
+                                dpi, b3 ? "PASS" : "FAIL",
+                                layout.brackets.left - layout.plate.left,
+                                layout.brackets.top - layout.plate.top,
+                                layout.plate.right - layout.brackets.right,
+                                layout.plate.bottom - layout.brackets.bottom,
+                                MulDiv(4, dpi, 96));
                     if (!g1) Fail("G1 online plate right edge");
                     if (!g3) Fail("G3 online QR tile margin");
                     if (!g4) Fail("G4 online em baseline");
+                    if (!b2) Fail("B2 slogan is not under the badge");
+                    if (!b3) Fail("B3 viewfinder is too close to the plate edge");
                 }
                 const bool captionRight = CaptionRightAligned(capture, size.cx, layout);
                 std::printf("C5-caption-right dpi=%d mode=%s state=%s=%s copy-right-gap=%ld\n",

@@ -1650,7 +1650,7 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, FontSet& F, Layout& L,
                             TextWidth(dc, F.osd, badgeText, 0));
         const int pillW = padX + dot + gapX + tw + padX;
         const int pillH = padY + F.osdPx + padY;
-        L.osdPill.left = L.vf.left + L.vfIn + L.vfArm + Dp(6, dpi);
+        L.osdPill.left = L.vf.left + L.vfIn + Dp(1, dpi);
         L.osdPill.top  = L.btn[2].top + Dp(1, dpi);
         L.osdPill.right  = L.osdPill.left + pillW;
         L.osdPill.bottom = L.osdPill.top + pillH;
@@ -1664,10 +1664,43 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, FontSet& F, Layout& L,
         // A signed badge is optional art. In the 0.5.9-sized native slot the live wordmark can
         // occupy the same top-left screen area; keep the badge out rather than drawing over it.
         L.badge = {};
-        L.osdOn = !IntersectRect(&hit, &L.osdPill, &L.text) &&
-                  L.osdPill.left >= L.btn[2].left && L.osdPill.top >= L.btn[2].top &&
-                  L.osdPill.right <= L.btn[2].right && L.osdPill.bottom <= L.btn[2].bottom;
-        if (L.osdOn) L.badge = L.osdPill;
+        const bool onlineBanner = current != nullptr && current->online;
+        const RECT& badgeClearanceText = onlineBanner ? L.wordmark : L.text;
+        const bool pillInsidePlate = L.osdPill.left >= L.btn[2].left &&
+                                     L.osdPill.top >= L.btn[2].top &&
+                                     L.osdPill.right <= L.btn[2].right &&
+                                     L.osdPill.bottom <= L.btn[2].bottom;
+        L.osdOn = onlineBanner ? pillInsidePlate
+                               : (!IntersectRect(&hit, &badgeClearanceText, &L.osdPill) &&
+                                  pillInsidePlate);
+        if (L.osdOn) {
+            L.badge = L.osdPill;
+            if (onlineBanner) {
+                // The signed slogan belongs under the signed badge, not under the wordmark.
+                // Keep the wordmark's measured position unchanged and move only the two rows.
+                const int tagTop = L.osdPill.bottom + Dp(2, dpi);
+                for (int i = 0; i < L.tagLines; ++i) {
+                    const int top = tagTop + i * (L.tagline[i].bottom - L.tagline[i].top);
+                    const int height = L.tagline[i].bottom - L.tagline[i].top;
+                    const int width = L.tagline[i].right - L.tagline[i].left;
+                    const int delta = top - L.tagline[i].top;
+                    L.tagPt[i].x = L.osdPill.left;
+                    L.tagPt[i].y += delta;
+                    L.tagline[i] = { L.osdPill.left, top,
+                                     L.osdPill.left + width, top + height };
+                    L.tagBaseline[i] += delta;
+                    L.tagEmBaseline[i] = L.tagBaseline[i];
+                }
+                L.text = L.wordmark;
+                for (int i = 0; i < L.tagLines; ++i) {
+                    RECT united{};
+                    UnionRect(&united, &L.text, &L.tagline[i]);
+                    L.text = united;
+                }
+                L.scrim = L.text;
+                InflateRect(&L.scrim, Dp(14, dpi), Dp(7, dpi));
+            }
+        }
     }
 }
 
@@ -1676,9 +1709,15 @@ void ComputeLayout(HDC dc, int dpi, const RECT& client, FontSet& F, Layout& L,
 // longer fits is omitted as a whole; never leave its dot behind.
 bool BadgeFits(const Layout& L, double contentScale) {
     if (!L.osdOn) return false;
-    const RECT content = ScaleRectAboutCenter(L.text, contentScale);
+    const RECT wordmark = ScaleRectAboutCenter(L.wordmark, contentScale);
     RECT overlap{};
-    return !IntersectRect(&overlap, &L.osdPill, &content);
+    if (IntersectRect(&overlap, &L.osdPill, &wordmark)) return false;
+    for (const RECT& row : L.tagline) {
+        if (row.right <= row.left || row.bottom <= row.top) continue;
+        const RECT scaled = ScaleRectAboutCenter(row, contentScale);
+        if (IntersectRect(&overlap, &L.osdPill, &scaled)) return false;
+    }
+    return true;
 }
 
 // ===========================================================================
@@ -2433,7 +2472,18 @@ void PaintOnlineGoat(HDC dc, BYTE* bits, SponsorState* st, int dpi, double now,
     const HFONT emphasisFont = F.onlineNow != nullptr ? F.onlineNow : F.now;
     for (int i = 0; i < 2; ++i) {
         if (L.tagText[i].empty()) continue;
-        DrawTaglinePart(dc, L.tagPt[i].x, L.tagBaseline[i], L.tagText[i],
+        int tagX = L.tagPt[i].x;
+        int tagBaseline = L.tagBaseline[i];
+        if (L.osdOn && L.badge.right > L.badge.left && L.badge.bottom > L.badge.top &&
+            contentScale > 1.0) {
+            const int rowHeight = L.tagline[i].bottom - L.tagline[i].top;
+            const int targetTop = L.badge.bottom + MulDiv(2, dpi, 96) + i * rowHeight;
+            const int targetX = L.badge.left;
+            tagX = RoundI(stageCx + (targetX - stageCx) / contentScale);
+            const int targetBaseline = targetTop + L.tagBaseline[i] - L.tagline[i].top;
+            tagBaseline = RoundI(stageCy + (targetBaseline - stageCy) / contentScale);
+        }
+        DrawTaglinePart(dc, tagX, tagBaseline, L.tagText[i],
                         model.banner, F, tagFont, emphasisFont, tagCol, L.tagTrack);
     }
     GdiFlush();
@@ -3170,6 +3220,20 @@ bool SponsorGetLayoutForTest(HWND hwnd, SponsorHarnessLayout* out) {
     // The live badge is optional art. Keep the pill, dot, and text as one unit; omit all of it
     // only when the hover-scaled text block no longer fits beside the viewfinder.
     out->badge = BadgeFits(L, contentScale) ? L.badge : RECT{};
+    if (out->badge.right > out->badge.left && out->badge.bottom > out->badge.top &&
+        st->goat.active) {
+        for (int i = 0; i < 2; ++i) {
+            if (L.tagline[i].right <= L.tagline[i].left || L.tagline[i].bottom <= L.tagline[i].top)
+                continue;
+            const int rowHeight = L.tagline[i].bottom - L.tagline[i].top;
+            const int top = out->badge.bottom + MulDiv(2, st->dpi, 96) + i * rowHeight;
+            const int width = RoundI((L.tagline[i].right - L.tagline[i].left) * contentScale);
+            const int height = RoundI(rowHeight * contentScale);
+            out->tagline[i] = {out->badge.left, top, out->badge.left + width, top + height};
+            out->tagBaseline[i] = top + RoundI((L.tagBaseline[i] - L.tagline[i].top) * contentScale);
+            out->tagEmBaseline[i] = out->tagBaseline[i];
+        }
+    }
     out->stage = ScaleRectAboutCenter(L.stage, st->goat.active ? 1.0 + sponsor_motion::kStageScale : 1.0);
     RECT clippedStage{};
     if (IntersectRect(&clippedStage, &out->stage, &L.btn[2])) out->stage = clippedStage;

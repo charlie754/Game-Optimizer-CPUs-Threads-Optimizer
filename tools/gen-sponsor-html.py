@@ -501,8 +501,13 @@ GO_LAYOUT_CSS = """
 .go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__tag{gap:1px;text-transform:none;white-space:normal}
 .go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__tag>span{overflow:visible;white-space:nowrap}
 .go-row>.goat-mount>.goat--strip.goat--online{--gc-qr:64px}
-.go-row>.goat-mount>.goat--strip.goat--online .gc-vf{--gc-vf-t:0px;--gc-vf-r:0px;--gc-vf-b:0px;--gc-vf-l:0px}
-.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-vf{inset:3px}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active){transform:none}
+.go-row>.goat-mount>.goat--strip.goat--online .gc-vf{--gc-vf-t:4px;--gc-vf-r:4px;--gc-vf-b:4px;--gc-vf-l:4px}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-vf{inset:7px}
+.go-row>.goat-mount>.goat--strip.goat--online .gc-badge{position:absolute;top:7px;left:128px}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__word{left:128px;top:21px;width:auto;max-width:none;transform:none}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__word::before{content:none}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__tag{display:flex;flex-direction:column;gap:0;text-shadow:0 0 2px rgba(20,13,8,.96),0 0 5px rgba(20,13,8,.85),0 0 9px rgba(20,13,8,.6)}
 .go-row>.goat-mount>.goat--strip.goat--online .gc-photo{--gc-scrim:none}
 .go-row>.goat-mount>.goat--strip.goat--online .gc-photo::after{background:none;transform:none}
 .go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-stage{transform:translate(-50%%,-50%%) scale(.798);transition:transform 420ms var(--gc-in)}
@@ -590,7 +595,13 @@ def const_template(name):
 
 css = const_template("CSS")
 lock = const_string("GOAT_LOCKUP_CSS")
-online_fix = const_string("GOAT_ONLINE_FIX_CSS")
+try:
+    online_fix = const_string("GOAT_ONLINE_FIX_CSS")
+except ValueError:
+    # The current Maps widget folded this sheet into CSS. Keep generation compatible with both
+    # source shapes; the Game Optimizer GO_LAYOUT_CSS below remains the last local override.
+    online_fix = ""
+    print("online fix   : folded into CSS (no separate GOAT_ONLINE_FIX_CSS)")
 cup = const_string("SVG_CUP")
 star = const_string("SVG_STAR")
 

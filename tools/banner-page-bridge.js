@@ -37,6 +37,21 @@
         return panels[0];
     }
 
+    // The signed renderer positions steam from the photo viewport. The strip's photo is a
+    // cropped, transformed frame, so keep the wisp in that same frame and anchor its bottom
+    // near the signed steamAt point. This is deliberately host glue; the copied renderer stays
+    // byte-identical.
+    function moveSteamIntoPhotoFrame(root) {
+        var photos = root.querySelectorAll ? root.querySelectorAll('.gc-photo') : [];
+        for (var i = 0; i < photos.length; ++i) {
+            var frame = photos[i].querySelector('.gc-photo__frame');
+            var steam = photos[i].querySelector('.gc-steam');
+            if (!frame || !steam) continue;
+            if (steam.parentNode !== frame) frame.appendChild(steam);
+            steam.style.translate = '-50% -120%';
+        }
+    }
+
     function bindBannerEvents(root) {
         var plate = root.querySelector('.goat-lockup');
         if (!plate) return;
@@ -71,6 +86,7 @@
         var root = mount.firstElementChild;
         if (!root) return;
         adaptPanel(root);
+        moveSteamIntoPhotoFrame(root);
         goatcamQrBridge(root);
         bindBannerEvents(root);
     }

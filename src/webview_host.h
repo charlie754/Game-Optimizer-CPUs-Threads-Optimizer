@@ -101,6 +101,7 @@ HWND WebSponsorWindow(const WebSponsor* w);
 #if defined(CD_WEBVIEW_HARNESS)
 // Harness-only seams. These are compiled out of the product ABI and exist so the real
 // WebView2 object can be exercised without making the harness duplicate its COM vtables.
+void WebSponsorForceFirstNavigationFailureForTest();
 bool WebSponsorCapturePreviewForTest(WebSponsor* w, const wchar_t* path);
 bool WebSponsorCaptureDoneForTest(const WebSponsor* w, bool* ok);
 bool WebSponsorExecuteScriptForTest(WebSponsor* w, const wchar_t* script);

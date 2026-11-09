@@ -15,7 +15,7 @@ cl /nologo /utf-8 /EHsc /std:c++17 /W3 /permissive- /DUNICODE /D_UNICODE /DCD_WE
    "%ROOT%\src\sponsor.cpp" "%ROOT%\src\theme.cpp" "%ROOT%\src\util.cpp" ^
    "%ROOT%\src\qr_magnifier.cpp" ^
    /link /SUBSYSTEM:CONSOLE user32.lib gdi32.lib shell32.lib comctl32.lib ole32.lib ^
-   advapi32.lib shlwapi.lib psapi.lib winhttp.lib windowscodecs.lib bcrypt.lib msimg32.lib
+   advapi32.lib shlwapi.lib psapi.lib winhttp.lib windowscodecs.lib bcrypt.lib msimg32.lib gdiplus.lib
 set RC=%ERRORLEVEL%
 if not "%RC%"=="0" ( popd & exit /b %RC% )
 if not exist "%ROOT%\third_party\webview2\x64\WebView2Loader.dll" (

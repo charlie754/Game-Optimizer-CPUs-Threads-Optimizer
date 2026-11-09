@@ -3616,14 +3616,22 @@ void LayoutPage(SettingsState* st, HWND hwnd, Geom& g, PosBatch* put, HDC measur
     }
 
     const int spTop = ch - footerH - GAP - spH;
-    if (spH > 0 && spW > 0 && st->web != nullptr) {
+    if (st->web != nullptr) {
         // The host window IS the panel - same rectangle, no margin, transparent behind it.
-        // It is moved even when the GDI strip is the one on screen (webLate): the host is
-        // hidden then, and this only stops it sitting where it was created for the one frame
-        // before SponsorWebReady re-runs this layout.
-        RECT wr;
-        ::SetRect(&wr, spLeft, spTop, spLeft + spW, spTop + spH);
-        WebSponsorMove(st->web, wr);
+        // Parked at the WebView2 panel's own rectangle even when the GDI strip is the one on
+        // screen (webLate): the host is hidden then, and keeping its full panel bounds stops
+        // a late navigation from rendering into the 45px GDI strip slot before SponsorWebReady
+        // re-runs this layout.
+        const SIZE webMin = WebSponsorMinSize(dpi);
+        int wW = cw - 2 * GAP;
+        int wH = static_cast<int>(webMin.cy);
+        if (wH > avail) wH = avail > 0 ? avail : 0;
+        if (wW > 0 && wH > 0) {
+            const int wLeft = webBand ? spLeft : GAP;
+            RECT wr;
+            ::SetRect(&wr, wLeft, ch - footerH - GAP - wH, wLeft + wW, ch - footerH - GAP);
+            WebSponsorMove(st->web, wr);
+        }
     }
     // THE FALLBACK IS PARKED AT ITS OWN RECTANGLE, NEVER THE PANEL'S. When the GDI strip is the
     // band, this is the same rectangle the block above computed, so nothing moved. When the
