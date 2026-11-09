@@ -504,12 +504,15 @@ GO_LAYOUT_CSS = """
 .go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active){transform:none}
 .go-row>.goat-mount>.goat--strip.goat--online .gc-vf{--gc-vf-t:4px;--gc-vf-r:4px;--gc-vf-b:4px;--gc-vf-l:4px}
 .go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-vf{inset:7px}
-.go-row>.goat-mount>.goat--strip.goat--online .gc-badge{position:absolute;top:7px;left:128px}
-.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__word{left:128px;top:21px;width:auto;max-width:none;transform:none}
-.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__word::before{content:none}
-.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__tag{display:flex;flex-direction:column;gap:0;text-shadow:0 0 2px rgba(20,13,8,.96),0 0 5px rgba(20,13,8,.85),0 0 9px rgba(20,13,8,.6)}
+.go-row>.goat-mount>.goat--strip.goat--online .gc-badge{position:absolute;top:6px;left:16px;z-index:2}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__word{position:absolute;left:16px;top:22px;width:auto;max-width:none;transform:none;z-index:2;display:flex;flex-direction:column;align-items:flex-start;gap:2px}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__word::before{content:"";position:absolute;z-index:-1;inset:-18px -8px -6px -8px;background:rgba(14,9,6,.55);border-radius:8px;border:1px solid rgba(240,192,122,.22);box-shadow:0 3px 10px rgba(0,0,0,.45);pointer-events:none}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__name{font-size:15px;line-height:1;margin:0}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup__tag{display:flex;flex-direction:column;gap:0;margin:0;text-shadow:0 0 2px rgba(20,13,8,.96),0 0 5px rgba(20,13,8,.85)}
 .go-row>.goat-mount>.goat--strip.goat--online .gc-photo{--gc-scrim:none}
 .go-row>.goat-mount>.goat--strip.goat--online .gc-photo::after{background:none;transform:none}
+.go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-steam{opacity:1;transition:opacity 250ms ease}
+.go-row>.goat-mount>.goat--strip.goat--online .gc-steam path{stroke:rgba(255,255,255,.95);stroke-width:6;filter:drop-shadow(0 0 2px rgba(255,255,255,.8))}
 .go-row>.goat-mount>.goat--strip.goat--online .goat-lockup:is(:hover,:focus-visible,.is-active) .gc-stage{transform:translate(-50%%,-50%%) scale(.798);transition:transform 420ms var(--gc-in)}
 
 /* DaGoat remains the legacy page banner beside its copy, matching 71ea5ed/GDI proportions;

@@ -48,7 +48,10 @@
             var steam = photos[i].querySelector('.gc-steam');
             if (!frame || !steam) continue;
             if (steam.parentNode !== frame) frame.appendChild(steam);
-            steam.style.translate = '-50% -120%';
+            steam.style.left = '13.1%';
+            steam.style.top = '56.8%';
+            steam.style.bottom = 'auto';
+            steam.style.translate = '-50% -100%';
         }
     }
 
